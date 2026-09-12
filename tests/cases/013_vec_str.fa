@@ -1,0 +1,10 @@
+fn main() -> i64:
+    let v = Vec<str>["苹果", "香蕉"]
+    v.push("橙子")
+    print(len(v))
+    print(v.get(0), v.get(1), v.get(2))
+    let joined = ""
+    for x in v:
+        joined = joined + x + "/"
+    print(joined)
+    return 0

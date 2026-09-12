@@ -1,0 +1,14 @@
+fn main() -> i64:
+    let i = 0
+    let total = 0
+    while i < 100:
+        total = total + i
+        i = i + 1
+    print(total)
+    let n = 10
+    while true:
+        n = n - 1
+        if n <= 0:
+            break
+    print(n)
+    return 0

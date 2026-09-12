@@ -1,0 +1,2191 @@
+"""FA: AST -> 线性 IR。
+
+约定（务必与 asmgen / runtime 保持一致）
+----------------------------------------
+* 标量值用虚拟寄存器（Temp）表示；聚合类型（struct/arr/enum）的值统一用「指向存储的指针」表示。
+* 所有权：表达式产生的引用类型值是 **owned**；语句结束时未被移动的临时引用会被 rc_dec。
+  变量持有 owned 引用，作用域结束时释放；函数形参是 **borrowed**，不释放；
+  返回值在 return 时 rc_inc（调用方负责释放）。
+"""
+
+from __future__ import annotations
+from typing import List, Optional, Tuple, Any
+from .ast import *
+from . import types as T
+from .types import (Type, TYPES, VOID, BOOL, CHAR, STR, ANY, PYOBJ, JOBJ,
+                    ptr_to, vec_of, map_of, arr_of, K_STR, K_VEC, K_MAP,
+                    K_PY, K_JOBJ, K_NONE)
+from .ir import Temp, Const, Sym, StrConst, Label, Instr, IRFunc, IRModule
+from .sema import Sema, VarSym, FnSym, BUILTIN_FNS
+
+I64 = TYPES["i64"]
+F64 = TYPES["f64"]
+U8 = TYPES["u8"]
+
+
+class FaCodegenError(Exception):
+    pass
+
+
+class VarLoc:
+    __slots__ = ("kind", "val", "ty", "borrowed", "sym", "is_ptr")
+
+    def __init__(self, kind, val, ty, borrowed=False, sym=None, is_ptr=False):
+        self.kind = kind        # 'temp' | 'mem'
+        self.val = val
+        self.ty = ty
+        self.borrowed = borrowed
+        self.sym = sym
+        self.is_ptr = is_ptr    # True: 值本身就是地址（如 self 指针）
+
+
+class ScopeCtx:
+    def __init__(self, parent=None):
+        self.vars: dict = {}
+        self.drops: List[Tuple[VarLoc, Any]] = []
+        self.defers: List[Expr] = []
+        self.parent = parent
+
+    def lookup(self, name):
+        s = self
+        while s:
+            if name in s.vars:
+                return s.vars[name]
+            s = s.parent
+        return None
+
+
+def is_agg(ty: Type) -> bool:
+    return ty.kind in ("struct", "arr", "enum")
+
+
+def vec_esz(ty: Type) -> int:
+    """Vec 元素的实际存储宽度（字节）。
+
+    整数 / bool / char 的窄类型紧凑存放（1/2/4 字节），省内存也省带宽；
+    浮点与结构体保持 8 字节，避免动到 BITCAST 与装箱逻辑。
+    """
+    if ty is not None and ty.kind in ("int", "bool", "char") and ty.size in (1, 2, 4):
+        return ty.size
+    return 8
+
+
+def elem_kind(ty: Type, sema) -> int:
+    """容器元素/映射键值的运行时 kind 编码"""
+    if ty is None:
+        return K_NONE
+    if ty.kind == "str":
+        return K_STR
+    if ty.kind == "vec":
+        return K_VEC
+    if ty.kind == "map":
+        return K_MAP
+    if ty.kind == "pyobj":
+        return K_PY
+    if ty.kind == "jobj":
+        return K_JOBJ
+    if ty.kind == "struct":
+        if ty.desc_id >= 0:
+            return 1000 + ty.desc_id
+        if ty.size <= 8:
+            return K_NONE
+        return 6                      # 装箱的纯数据结构体（无内部引用）
+    return K_NONE
+
+
+class FnGen:
+    def __init__(self, sema: Sema, mod: IRModule, fnsym: FnSym,
+                 body: Block, params: List[Param], self_type: Optional[str] = None):
+        self.sema = sema
+        self.mod = mod
+        self.fnsym = fnsym
+        self.body = body
+        self.params = params
+        self.self_type = self_type
+        self.ir: List[Instr] = []
+        self.ntemp = 0
+        self.nlabel = 0
+        self.fn: Optional[IRFunc] = None
+        self.scope: Optional[ScopeCtx] = None
+        self.owned: List[Tuple[Temp, Type]] = []     # 语句内产生的 owned 临时引用
+        self.owned_ids: set = set()
+        self.loop_stack: List[Tuple[str, str]] = []  # (continue_label, break_label)
+        self.temp_tys: dict = {}
+        # 目标驱动代码生成：调用方（赋值/let）可以把「结果该写到哪个 Temp」作为提示传进来，
+        # 让 x = x + 1 直接生成 add 而不是「算到临时寄存器再搬回去」。
+        # 只有最外层表达式节点能取走提示；进入任何子表达式前必须先清空。
+        self.hint: Optional[Temp] = None
+
+    # ------------------------------------------------------------ 基础设施
+    def err(self, msg, node=None):
+        line = getattr(node, "line", 0)
+        raise FaCodegenError(f"行 {line}: {msg}")
+
+    def new_temp(self, ty: Type = None) -> Temp:
+        self.ntemp += 1
+        t = Temp(self.ntemp, ty)
+        self.temp_tys[t.id] = ty
+        return t
+
+    def new_label(self, p="L") -> str:
+        self.nlabel += 1
+        return f".{self.fn.name}_{p}{self.nlabel}"
+
+    def dst_or_new(self, ty: Type) -> Temp:
+        """取走目标提示（若类型完全匹配），否则新建临时变量。
+
+        只用于「先把所有操作数算完、最后才写目标」的指令形态
+        （BIN / UN / CALL / LOAD）。调用前必须保证子表达式已经求值完毕。
+        """
+        h = self.hint
+        self.hint = None
+        if (h is not None and ty is not None and h.ty == ty
+                and not is_agg(ty) and not T.t_is_refcounted(ty)):
+            return h
+        return self.new_temp(ty)
+
+    def take_hint(self) -> Optional[Temp]:
+        """取出并清空提示（用于「本节点不用提示」的分支，避免泄漏给子表达式）"""
+        h, self.hint = self.hint, None
+        return h
+
+    def hint_or_new(self, h: Optional[Temp], ty: Type) -> Temp:
+        """手上有提示且类型完全匹配就用提示，否则新建临时变量"""
+        if (h is not None and ty is not None and h.ty == ty
+                and not is_agg(ty) and not T.t_is_refcounted(ty)):
+            return h
+        return self.new_temp(ty)
+
+    def emit(self, op, dst=None, args=None, extra=None, ty=None, line=0) -> Instr:
+        ins = Instr(op, dst, args, extra, ty, line)
+        self.ir.append(ins)
+        return ins
+
+    def push_scope(self):
+        self.scope = ScopeCtx(self.scope)
+        return self.scope
+
+    def pop_scope(self):
+        sc = self.scope
+        # defer 先执行（后进先出）
+        for d in reversed(sc.defers):
+            self.gen_expr(d)
+        # 再释放本作用域拥有的引用
+        for loc, ty in reversed(sc.drops):
+            self.emit_drop(loc, ty)
+        self.scope = sc.parent
+
+    # ------------------------------------------------------------ 入口
+    def gen(self) -> IRFunc:
+        ret = self.fnsym.ret
+        sret = is_agg(ret)
+        ptemps = []
+        if sret:
+            p = self.new_temp(ptr_to(ret))
+            p.fixed = "rdi"
+            ptemps.append(p)
+        # 方法：self 指针占用第一个整数寄存器（sret 时退到 rsi）
+        self_temp = None
+        if self.self_type is not None:
+            st = (self.sema.structs.get(self.self_type)
+                  or self.sema.enums.get(self.self_type))
+            self_temp = self.new_temp(ptr_to(st) if st else ptr_to(I64))
+            self_temp.fixed = "rsi" if sret else "rdi"
+            ptemps.append(self_temp)
+        for i, pty in enumerate(self.fnsym.params):
+            t = self.new_temp(pty)
+            ptemps.append(t)
+        # 前 6 个整数参数寄存器
+        ireg = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+        if sret or self_temp is not None:
+            ireg = ["rsi", "rdx", "rcx", "r8", "r9"]
+        # 按 SysV 规则逐个形参分配：整数用 ireg，浮点用 xmm0-xmm7，
+        # 放不下的按原顺序进栈槽（槽号从 0 开始，即 [rbp+16+8*slot]）
+        nint = nfp = nstack = 0
+        for t in ptemps:
+            if t is self_temp or (sret and t is ptemps[0]):
+                continue                      # sret 指针 / self 已固定
+            if t.ty is not None and t.ty.is_float:
+                if nfp < 8:
+                    t.fixed = f"xmm{nfp}"
+                else:
+                    t.fixed = f"stack:{nstack}"
+                    nstack += 1
+                nfp += 1
+            else:
+                if nint < len(ireg):
+                    t.fixed = ireg[nint]
+                else:
+                    t.fixed = f"stack:{nstack}"
+                    nstack += 1
+                nint += 1
+        self.fn = IRFunc(self.fnsym.symbol, ptemps, ret, sret=sret)
+        self.fn.varargs = self.fnsym.varargs
+        self.fn.extern = self.fnsym.extern
+
+        sc = self.push_scope()
+        # self / 形参落地
+        off = 0
+        if self.self_type is not None:
+            st = self.sema.structs.get(self.self_type) or self.sema.enums.get(self.self_type)
+            loc = VarLoc("temp", ptemps[1] if sret else ptemps[0], st,
+                         borrowed=True, is_ptr=True)   # self 本身是指针
+            sc.vars["self"] = loc
+            off = 1
+        for i, p in enumerate(self.params):
+            if p.name == "self":
+                continue                       # self 已在上面绑定
+            pty = self.fnsym.params[i if off == 0 else i - 1]
+            src = ptemps[i + off + (1 if sret else 0)]
+            sym = VarSym(p.name, pty, mutable=True, is_param=True)
+            if is_agg(pty) or sym.addr_taken:
+                slot = self.emit_alloca(pty.size)
+                self.emit_copy(slot, src if is_agg(pty) else src, pty)
+                loc = VarLoc("mem", slot, pty, borrowed=True, sym=sym)
+            else:
+                loc = VarLoc("temp", src, pty, borrowed=True, sym=sym)
+            sc.vars[p.name] = loc
+
+        self.gen_block(self.body)
+
+        # 函数体结尾兜底 return
+        if not self.ir or self.ir[-1].op != "RET":
+            if ret.kind == "void":
+                self.emit("RET")
+            else:
+                z = self.const_zero(ret)
+                self.emit("RET", args=[z])
+        self.pop_scope()
+        self.fn.instrs = self.ir
+        return self.fn
+
+    # ------------------------------------------------------------ 内存辅助
+    def emit_alloca(self, size: int, align: int = 8) -> Temp:
+        d = self.new_temp(ptr_to(U8))
+        self.emit("ALLOCA", d, extra=(max(size, 1), align))
+        return d
+
+    def const(self, v, ty: Type = None) -> Const:
+        return Const(v, ty or I64)
+
+    def const_zero(self, ty: Type):
+        if ty.is_float:
+            return Const(0.0, ty)
+        return Const(0, ty or I64)
+
+    def emit_copy(self, dstptr: Temp, srcptr: Temp, ty: Type):
+        """按字节复制聚合值"""
+        self.emit("MEMCPY", args=[dstptr, srcptr], extra=ty.size, ty=ty)
+
+    # ------------------------------------------------------------ 引用计数
+    def mark_owned(self, v, ty: Type):
+        """登记一个「本语句拥有的」引用；同一个临时值只登记一次（防重复释放）。"""
+        if isinstance(v, Temp) and T.t_is_refcounted(ty):
+            if v.id in self.owned_ids:
+                return
+            self.owned_ids.add(v.id)
+            self.owned.append((v, ty))
+
+    def take_owned(self, v, ty: Type) -> bool:
+        """若 v 是本语句拥有的临时值，则接管其所有权（不再在语句末尾释放）。"""
+        if isinstance(v, Temp) and v.id in self.owned_ids:
+            self.owned = [x for x in self.owned if x[0].id != v.id]
+            self.owned_ids.discard(v.id)
+            return True
+        return False
+
+    def emit_rcinc(self, v, ty: Type):
+        k = ty.rc_kind
+        if k != K_NONE:
+            self.emit("RCINC", args=[v], extra=k)
+        elif ty.kind == "struct" and ty.is_refcounted:
+            self.emit("CALL", None, [Sym(f"__fa_drop_inc_{ty.name}"), v])
+        elif ty.kind == "arr" and T.t_is_refcounted(ty.elem):
+            self.emit_drop_array(v, ty)
+
+    def emit_drop(self, loc: VarLoc, ty: Type):
+        if not T.t_is_refcounted(ty):
+            return
+        if loc.kind == "temp":
+            self.emit_rcdec_val(loc.val, ty)
+        else:
+            if ty.kind in ("str", "vec", "map", "pyobj", "jobj"):
+                v = self.new_temp(ty)
+                self.emit("LOAD", v, [loc.val], extra=0, ty=ty)
+                self.emit_rcdec_val(v, ty)
+            else:
+                self.emit_rcdec_val(loc.val, ty)
+
+    def emit_rcdec_val(self, v, ty: Type):
+        k = ty.rc_kind
+        if k != K_NONE:
+            self.emit("RCDEC", args=[v], extra=k)
+        elif ty.kind == "struct":
+            self.emit("CALL", None, [Sym(f"__fa_drop_{ty.name}"), v])
+        elif ty.kind == "arr":
+            self.emit_drop_array(v, ty)
+        elif ty.kind == "enum":
+            self.emit("CALL", None, [Sym(f"__fa_drop_{ty.name}"), v])
+
+    def emit_drop_array(self, ptr: Temp, ty: Type):
+        """释放数组中每个引用元素"""
+        ek = elem_kind(ty.elem, self.sema)
+        if ek == K_NONE and not T.t_is_refcounted(ty.elem):
+            return
+        i = self.new_temp(I64)
+        self.emit("MOV", i, [self.const(0)], ty=I64)
+        top = self.new_label("arrdrop")
+        end = self.new_label("arrdropE")
+        self.emit("LABEL", extra=top)
+        c = self.new_temp(BOOL)
+        self.emit("CMP", c, [i, self.const(ty.count)], extra="<", ty=I64)
+        self.emit("BR", args=[c], extra=(top + "_body", end))
+        self.emit("LABEL", extra=top + "_body")
+        scale = max(ty.elem.size, 8) if ty.elem.kind == "struct" else ty.elem.size
+        if ty.elem.kind == "struct" and ty.elem.size > 8:
+            scale = 8
+        off = self.new_temp(I64)
+        self.emit("BIN", off, [i, self.const(scale)], extra="*", ty=I64)
+        a = self.new_temp(ty.elem)
+        self.emit("LOAD", a, [ptr], extra=off, ty=ty.elem)
+        self.emit_rcdec_val(a, ty.elem)
+        self.emit("BIN", i, [i, self.const(1)], extra="+", ty=I64)
+        self.emit("JMP", extra=top)
+        self.emit("LABEL", extra=end)
+
+    def flush_owned(self):
+        for v, ty in self.owned:
+            self.emit_rcdec_val(v, ty)
+        self.owned.clear()
+        self.owned_ids.clear()
+
+    # ------------------------------------------------------------ 语句
+    def gen_block(self, b: Block):
+        sc = self.push_scope()
+        for s in b.stmts:
+            self.gen_stmt(s)
+        self.pop_scope()
+
+    def gen_stmt(self, s: Stmt):
+        self.owned = []
+        if isinstance(s, Block):
+            if getattr(s, "flat", False):
+                for x in s.stmts:
+                    self.gen_stmt(x)
+            else:
+                self.gen_block(s)
+        elif isinstance(s, Let):
+            self.gen_let(s)
+        elif isinstance(s, Assign):
+            self.gen_assign(s)
+        elif isinstance(s, Return):
+            self.gen_return(s)
+        elif isinstance(s, If):
+            self.gen_if(s)
+        elif isinstance(s, While):
+            self.gen_while(s)
+        elif isinstance(s, For):
+            self.gen_for(s)
+        elif isinstance(s, ForC):
+            self.gen_for_c(s)
+        elif isinstance(s, Loop):
+            self.gen_loop(s)
+        elif isinstance(s, Break):
+            if not self.loop_stack:
+                self.err("break 不在循环内", s)
+            self.emit("JMP", extra=self.loop_stack[-1][1])
+        elif isinstance(s, Continue):
+            if not self.loop_stack:
+                self.err("continue 不在循环内", s)
+            self.emit("JMP", extra=self.loop_stack[-1][0])
+        elif isinstance(s, Defer):
+            self.scope.defers.append(s.call)
+        elif isinstance(s, ExprStmt):
+            self.gen_expr(s.expr)
+        elif isinstance(s, Match):
+            self.gen_match(s)
+        elif isinstance(s, Asm):
+            self.emit("ASM", extra=s.code)
+        else:
+            self.err(f"未支持语句 {type(s).__name__}", s)
+        self.flush_owned()
+
+    def gen_let(self, s: Let):
+        ty = s.sym.ty
+        if s.init is None:
+            if is_agg(ty):
+                slot = self.emit_alloca(ty.size)
+                self.emit("ZERO", args=[slot], extra=ty.size)
+                loc = VarLoc("mem", slot, ty, sym=s.sym)
+            else:
+                t = self.new_temp(ty)
+                self.emit("MOV", t, [self.const_zero(ty)], ty=ty)
+                loc = VarLoc("temp", t, ty, sym=s.sym)
+            self.scope.vars[s.name] = loc
+            self.scope.drops.append((loc, ty))
+            return
+        if is_agg(ty):
+            v = self.gen_expr(s.init)
+            slot = self.emit_alloca(ty.size)
+            self.emit("MEMCPY", args=[slot, v], extra=ty.size, ty=ty)
+            loc = VarLoc("mem", slot, ty, sym=s.sym)
+        else:
+            t = self.new_temp(ty)
+            if not T.t_is_refcounted(ty) and s.init.ty == ty:
+                # 目标驱动：让初值表达式直接算进变量自己的寄存器
+                self.hint = t
+                v = self.gen_expr(s.init)
+                self.hint = None
+                if v is not t:
+                    self.emit("MOV", t, [v], ty=ty)
+                loc = VarLoc("temp", t, ty, sym=s.sym)
+                self.scope.vars[s.name] = loc
+                self.scope.drops.append((loc, ty))
+                return
+            v = self.gen_expr(s.init)
+            self.emit("MOV", t, [self.coerce(v, s.init.ty, ty)], ty=ty)
+            loc = VarLoc("temp", t, ty, sym=s.sym)
+            if T.t_is_refcounted(ty):
+                # 若初值就是本语句新建的临时引用，直接接管所有权；
+                # 否则（来自变量/字段等「借用」来源）需要 rc_inc 取得自己的一份。
+                if not self.take_owned(v, s.init.ty):
+                    self.emit_rcinc(v, s.init.ty)
+        self.scope.vars[s.name] = loc
+        self.scope.drops.append((loc, ty))
+
+    def gen_assign(self, s: Assign):
+        tgt = s.target
+        vty = s.value.ty
+        if isinstance(tgt, NameRef):
+            loc = self.scope.lookup(tgt.name)
+            if loc is None:
+                self.err(f"未定义变量 '{tgt.name}'", s)
+            # 目标驱动：标量、非引用计数、类型完全匹配时，让右值直接算进变量自己的寄存器，
+            # 省掉「算到新临时寄存器再搬回去」的那条 MOV（循环里每次迭代都能省 1~2 条）。
+            use_hint = (loc.kind == "temp" and not is_agg(loc.ty)
+                        and not T.t_is_refcounted(loc.ty) and loc.ty == vty)
+            if use_hint:
+                self.hint = loc.val
+            raw = self.gen_expr(s.value)
+            self.hint = None
+            if use_hint:
+                if raw is not loc.val:
+                    self.emit("MOV", loc.val, [raw], ty=loc.ty)
+                return
+            v = self.coerce(raw, vty, loc.ty)
+            if T.t_is_refcounted(loc.ty):
+                self.emit_rcinc(v, loc.ty)
+                if loc.kind == "temp":
+                    self.emit_rcdec_val(loc.val, loc.ty)
+                else:
+                    old = self.new_temp(loc.ty)
+                    self.emit("LOAD", old, [loc.val], extra=0, ty=loc.ty)
+                    self.emit_rcdec_val(old, loc.ty)
+            if loc.kind == "temp":
+                self.emit("MOV", loc.val, [v], ty=loc.ty)
+            else:
+                if is_agg(loc.ty):
+                    self.emit("MEMCPY", args=[loc.val, v], extra=loc.ty.size, ty=loc.ty)
+                else:
+                    self.emit("STORE", args=[loc.val, v], extra=0, ty=loc.ty)
+            return
+        # 复合左值：字段 / 下标 / 解引用
+        ptr, off, fty = self.gen_addr(tgt)
+        v = self.coerce(self.gen_expr(s.value), vty, fty)
+        if T.t_is_refcounted(fty):
+            self.emit_rcinc(v, fty)
+            old = self.new_temp(fty)
+            self.emit("LOAD", old, [ptr], extra=off, ty=fty)
+            self.emit_rcdec_val(old, fty)
+        if is_agg(fty):
+            base = self.new_temp(ptr_to(fty))
+            self.emit("LEA", base, [ptr], extra=off)
+            self.emit("MEMCPY", args=[base, v], extra=fty.size, ty=fty)
+        else:
+            self.emit("STORE", args=[ptr, v], extra=off, ty=fty)
+
+    def gen_return(self, s: Return):
+        ret = self.fnsym.ret
+        if s.value is None:
+            self.flush_owned()
+            self.emit("RET")
+            return
+        v = self.gen_expr(s.value)
+        if is_agg(ret):
+            dstp = self.fn.params[0]
+            self.emit("MEMCPY", args=[dstp, v], extra=ret.size, ty=ret)
+        else:
+            v = self.coerce(v, s.value.ty, ret)
+            if T.t_is_refcounted(ret):
+                self.emit_rcinc(v, s.value.ty)     # 返回值 owned 转移给调用方
+            self.emit("RET", args=[v], ty=ret)
+        self.flush_owned()
+        if is_agg(ret):
+            self.emit("RET", args=[self.fn.params[0]])
+        return
+
+    def gen_if(self, s: If):
+        pairs = [(s.cond, s.body)] + list(s.elifs)
+        end = self.new_label("ifend")
+        self.gen_if_chain(pairs, s.orelse, end)
+
+    def gen_if_chain(self, pairs, orelse, end):
+        for i, (cond, body) in enumerate(pairs):
+            c = self.gen_cond(cond)
+            cur = self.new_label("ifbody")
+            nxt = self.new_label("elif")
+            self.emit("BR", args=[c], extra=(cur, nxt))
+            self.emit("LABEL", extra=cur)
+            self.gen_block(body)
+            self.emit("JMP", extra=end)
+            self.emit("LABEL", extra=nxt)
+        if orelse is not None:
+            self.gen_block(orelse)
+        self.emit("LABEL", extra=end)
+
+    def gen_for_c(self, s):
+        """for (init; cond; step) { body } —— 展开为
+            init; goto cond;
+            body: { body }
+            cont: step;
+            cond: if (cond) goto body;
+        """
+        self.push_scope()
+        if s.init is not None:
+            self.gen_stmt(s.init)
+        cond_lbl = self.new_label("fcond")
+        body_lbl = self.new_label("fbody")
+        cont_lbl = self.new_label("fcont")
+        end_lbl = self.new_label("fend")
+        self.emit("JMP", extra=cond_lbl)
+        self.emit("LABEL", extra=body_lbl)
+        self.loop_stack.append((cont_lbl, end_lbl))   # (continue, break)
+        self.gen_block(s.body)
+        self.loop_stack.pop()
+        self.emit("LABEL", extra=cont_lbl)
+        if s.step is not None:
+            self.gen_stmt(s.step)
+        self.emit("LABEL", extra=cond_lbl)
+        if s.cond is not None:
+            c = self.gen_cond(s.cond)
+            self.emit("BR", args=[c], extra=(body_lbl, end_lbl))
+        else:
+            self.emit("JMP", extra=body_lbl)
+        self.emit("LABEL", extra=end_lbl)
+        self.pop_scope()
+
+    def gen_while(self, s: While):
+        top = self.new_label("while")
+        body = self.new_label("wbody")
+        end = self.new_label("wend")
+        self.emit("LABEL", extra=top)
+        c = self.gen_cond(s.cond)
+        self.emit("BR", args=[c], extra=(body, end))
+        self.emit("LABEL", extra=body)
+        self.loop_stack.append((top, end))
+        self.gen_block(s.body)
+        self.loop_stack.pop()
+        self.emit("JMP", extra=top)
+        self.emit("LABEL", extra=end)
+
+    def gen_loop(self, s: Loop):
+        top = self.new_label("loop")
+        end = self.new_label("loopE")
+        self.emit("LABEL", extra=top)
+        self.loop_stack.append((top, end))
+        self.gen_block(s.body)
+        self.loop_stack.pop()
+        self.emit("JMP", extra=top)
+        self.emit("LABEL", extra=end)
+
+    def gen_for(self, s: For):
+        it = s.iter
+        ity = it.ty
+        top = self.new_label("for")
+        body = self.new_label("fbody")
+        end = self.new_label("fend")
+        idx = self.new_temp(I64)
+        limit = self.new_temp(I64)
+        vloc = None
+        if isinstance(it, Range) or ity.kind == "range":
+            if isinstance(it, Range):
+                se, ee = it.start, it.end
+            else:
+                se, ee = it.left, it.right
+            start = self.gen_expr(se) if se is not None else self.const(0)
+            stop = self.gen_expr(ee) if ee is not None else self.const(0)
+            inc = getattr(it, "inclusive", False) or getattr(it, "op", None) == "..="
+            if inc:                       # 0..=n 等价于 0..n+1
+                one = self.new_temp(I64)
+                self.emit("BIN", one, [self.coerce(stop, I64, I64), self.const(1)],
+                          extra="+", ty=I64)
+                stop = one
+            self.emit("MOV", idx, [self.coerce(start, I64, I64)], ty=I64)
+            self.emit("MOV", limit, [self.coerce(stop, I64, I64)], ty=I64)
+        else:
+            obj = self.gen_expr(it)
+            n = self.new_temp(I64)
+            if ity.kind == "vec":
+                self.emit("CALL", n, [Sym("fa_vec_len"), obj], ty=I64)
+            elif ity.kind == "str":
+                self.emit("CALL", n, [Sym("fa_str_len"), obj], ty=I64)
+            elif ity.kind == "arr":
+                n = self.const(ity.count)
+            elif ity.kind == "map":
+                self.emit("CALL", n, [Sym("fa_map_len"), obj], ty=I64)
+            else:
+                self.err(f"暂不支持遍历 {ity}", s)
+            self.emit("MOV", idx, [self.const(0)], ty=I64)
+            self.emit("MOV", limit, [n], ty=I64)
+        self.emit("LABEL", extra=top)
+        c = self.new_temp(BOOL)
+        self.emit("CMP", c, [idx, limit], extra="<", ty=I64)
+        self.emit("BR", args=[c], extra=(body, end))
+        self.emit("LABEL", extra=body)
+        sc = self.push_scope()
+        vty = s.sym.ty
+        vt = self.new_temp(vty)
+        if isinstance(it, Range) or ity.kind == "range":
+            self.emit("MOV", vt, [idx], ty=vty)
+        elif ity.kind == "vec":
+            obj = self.gen_expr(it)
+            r = self.new_temp(vty)
+            self.emit("CALL", r, [Sym("fa_vec_get"), obj, idx], ty=vty)
+            # fa_vec_get 返回借用引用（未 inc），不能登记为 owned
+            self.emit("MOV", vt, [self.coerce(r, vty, vty)], ty=vty)
+        elif ity.kind == "str":
+            obj = self.gen_expr(it)
+            r = self.new_temp(vty)
+            self.emit("CALL", r, [Sym("fa_str_byte"), obj, idx], ty=I64)
+            self.emit("MOV", vt, [self.coerce(r, I64, vty)], ty=vty)
+        elif ity.kind == "map":
+            obj = self.gen_expr(it)
+            r = self.new_temp(vty)
+            self.emit("CALL", r, [Sym("fa_map_key_at"), obj, idx], ty=vty)
+            self.emit("MOV", vt, [self.coerce(r, vty, vty)], ty=vty)
+        elif ity.kind == "arr":
+            ptr, off, _ = self.gen_addr(it)
+            i8 = self.new_temp(I64)
+            self.emit("BIN", i8, [idx, self.const(max(ity.elem.size, 1))], extra="*", ty=I64)
+            t2 = self.new_temp(I64)
+            self.emit("BIN", t2,
+                      [i8, self.const(off if isinstance(off, int) else 0)],
+                      extra="+", ty=I64)
+            r = self.new_temp(vty)
+            self.emit("LOAD", r, [ptr], extra=t2, ty=vty)
+            self.emit("MOV", vt, [r], ty=vty)
+        sc.vars[s.var] = VarLoc("temp", vt, vty)
+        self.loop_stack.append((top, end))
+        self.gen_block(s.body)
+        self.loop_stack.pop()
+        self.pop_scope()
+        self.emit("BIN", idx, [idx, self.const(1)], extra="+", ty=I64)
+        self.emit("JMP", extra=top)
+        self.emit("LABEL", extra=end)
+
+    def gen_match(self, s: Match):
+        subj = self.gen_expr(s.subject)
+        sty = s.subject.ty
+        end = self.new_label("matchend")
+        for arm in s.arms:
+            body_lbl = self.new_label("arm")
+            skip_lbl = self.new_label("armskip")
+            if isinstance(arm.pattern, str):        # 通配 _
+                pass
+            else:
+                if sty.kind == "enum" and getattr(arm.pattern, "is_variant", False):
+                    tag = self.new_temp(I64)
+                    self.emit("LOAD", tag, [subj], extra=0, ty=I64)
+                    c = self.new_temp(BOOL)
+                    self.emit("CMP", c,
+                              [tag, self.const(arm.pattern.variant_index)],
+                              extra="==", ty=I64)
+                else:
+                    pv = self.gen_expr(arm.pattern)
+                    c = self.new_temp(BOOL)
+                    if sty == STR:
+                        r = self.new_temp(I64)
+                        self.emit("CALL", r, [Sym("fa_str_eq"), subj, pv], ty=I64)
+                        self.emit("CMP", c, [r, self.const(1)], extra="==", ty=I64)
+                    else:
+                        self.emit("CMP", c,
+                                  [self.coerce(subj, sty, I64),
+                                   self.coerce(pv, arm.pattern.ty, I64)],
+                                  extra="==", ty=I64)
+                self.emit("BR", args=[c], extra=(body_lbl, skip_lbl))
+                self.emit("LABEL", extra=body_lbl)
+            self.gen_block(arm.body)
+            self.emit("JMP", extra=end)
+            self.emit("LABEL", extra=skip_lbl)      # 不匹配 -> 试下一个分支
+        self.emit("LABEL", extra=end)
+
+    # ------------------------------------------------------------ 条件
+    def gen_cond(self, e: Expr) -> Temp:
+        """生成布尔条件（Temp of BOOL）"""
+        v = self.gen_expr(e)
+        t = e.ty
+        if t.kind == "bool":
+            if isinstance(v, Const):
+                r = self.new_temp(BOOL)
+                self.emit("MOV", r, [v], ty=BOOL)
+                return r
+            return v
+        if t.kind == "int":
+            c = self.new_temp(BOOL)
+            self.emit("CMP", c, [self.coerce(v, t, I64), self.const(0)], extra="!=", ty=I64)
+            return c
+        if t.kind == "ptr":
+            c = self.new_temp(BOOL)
+            self.emit("CMP", c, [v, self.const(0)], extra="!=", ty=I64)
+            return c
+        self.err(f"类型 {t} 不能作为条件", e)
+
+    # ------------------------------------------------------------ 表达式
+    def gen_expr(self, e: Expr):
+        if isinstance(e, NumLit):
+            k = getattr(e, "kind", "") or ""
+            if k.startswith("f"):                    # f32 / f64
+                # 标量浮点一律按双精度参与运算（f32 仅用于结构体布局与 C 签名）
+                return Const(float(e.value), F64)
+            return Const(int(e.value), I64)
+        if isinstance(e, CharLit):
+            return Const(ord(e.value), CHAR)
+        if isinstance(e, BoolLit):
+            return Const(1 if e.value else 0, BOOL)
+        if isinstance(e, NilLit):
+            return Const(0, ptr_to(U8))
+        if isinstance(e, StrLit):
+            return self.gen_string(e)
+        if isinstance(e, NameRef):
+            return self.gen_nameref(e)
+        if isinstance(e, Binary):
+            return self.gen_binary(e)
+        if isinstance(e, Unary):
+            return self.gen_unary(e)
+        if isinstance(e, Cast):
+            return self.gen_cast(e)
+        if isinstance(e, Call):
+            return self.gen_call(e)
+        if isinstance(e, MethodCall):
+            return self.gen_method(e)
+        if isinstance(e, Index):
+            return self.gen_index(e)
+        if isinstance(e, Field):
+            return self.gen_field(e)
+        if isinstance(e, ArrayLit):
+            return self.gen_arraylit(e)
+        if isinstance(e, StructLit):
+            return self.gen_structlit(e)
+        if isinstance(e, AddrOf):
+            return self.gen_addrof(e)
+        if isinstance(e, Deref):
+            v = self.gen_expr(e.operand)
+            return self.load_ptr(v, e.ty, 0)
+        if isinstance(e, NewExpr):
+            return self.gen_new(e)
+        if isinstance(e, SizeOf):
+            return Const(self.sema.resolve_type(e.operand).size, I64)
+        if isinstance(e, Range):
+            self.err("range 只能用于 for 循环", e)
+        if isinstance(e, Ctor):
+            return self.gen_ctor(e)
+        if isinstance(e, RawExpr):
+            self.emit("ASM", extra=e.code)
+            return self.new_temp(ANY)
+        self.err(f"未支持表达式 {type(e).__name__}", e)
+
+    def var_loc(self, name: str, node) -> VarLoc:
+        loc = self.scope.lookup(name) if self.scope else None
+        if loc is None:
+            self.err(f"未定义变量 '{name}'", node)
+        return loc
+
+    def gen_nameref(self, e: NameRef):
+        if e.name in self.sema.globals:
+            g = self.sema.globals[e.name]
+            t = self.new_temp(g.ty)
+            self.emit("LOAD", t, [Sym(g.name)], extra=0, ty=g.ty)
+            return t
+        if e.name in self.sema.consts:
+            return self.gen_expr(self.sema.consts[e.name])
+        if e.resolved == "ns":
+            return Const(0, I64)
+        if isinstance(e.resolved, FnSym):
+            t = self.new_temp(ptr_to(U8))
+            self.emit("LEA_SYM", t, extra=e.resolved.symbol)
+            return t
+        loc = self.var_loc(e.name, e)
+        if is_agg(loc.ty):
+            return loc.val
+        if loc.kind == "temp":
+            return loc.val
+        t = self.new_temp(loc.ty)
+        self.emit("LOAD", t, [loc.val], extra=0, ty=loc.ty)
+        return t
+
+    def gen_string(self, e: StrLit):
+        parts = e.parts
+        if not parts:
+            return self.make_str("")
+        # 首段
+        if parts[0][0] == "lit":
+            cur = self.make_str(parts[0][1])
+            rest = parts[1:]
+        else:
+            cur = self.make_str("")
+            rest = parts
+        for kind, val in rest:
+            if kind == "lit":
+                s2 = self.make_str(val)
+            else:
+                s2 = self.gen_to_str(self.gen_expr(val), val.ty)
+            r = self.new_temp(STR)
+            self.emit("CALL", r, [Sym("fa_str_concat"), cur, s2], ty=STR)
+            # 只有 fa_str_concat 的返回值是 +1（owned）；
+            # cur / s2 可能是静态串或「借用」来的变量，绝不能在这里登记释放。
+            self.mark_owned(r, STR)
+            cur = r
+        return cur
+
+    def make_str(self, s: str) -> Temp:
+        idx = self.mod.add_string(s)
+        t = self.new_temp(STR)
+        self.emit("STRCONST", t, extra=idx, ty=STR)
+        return t
+
+    def gen_to_str(self, v, ty: Type) -> Temp:
+        r = self.new_temp(STR)
+        if ty == STR:
+            self.emit("MOV", r, [v], ty=STR)
+            return r
+        if ty.kind == "float":
+            self.emit("CALL", r, [Sym("fa_str_of_f64"), self.coerce(v, ty, F64)], ty=STR)
+        elif ty.kind == "int":
+            self.emit("CALL", r, [Sym("fa_str_of_i64"), self.coerce(v, ty, I64)], ty=STR)
+        elif ty.kind == "bool":
+            self.emit("CALL", r, [Sym("fa_str_of_bool"), v], ty=STR)
+        elif ty == CHAR:
+            self.emit("CALL", r, [Sym("fa_str_of_char"), v], ty=STR)
+        elif ty.kind == "ptr":
+            self.emit("CALL", r, [Sym("fa_str_of_ptr"), v], ty=STR)
+        elif ty.kind == "vec" or ty.kind == "map":
+            self.emit("CALL", r, [Sym("fa_container_to_str"), v,
+                                  self.const(1 if ty.kind == "vec" else 2)], ty=STR)
+        elif ty.kind == "pyobj":
+            self.emit("CALL", r, [Sym("fa_py_to_str"), v], ty=STR)
+        elif ty.kind == "jobj":
+            self.emit("CALL", r, [Sym("fa_jvm_to_str"), v], ty=STR)
+        elif ty.kind == "struct" or ty.kind == "arr" or ty.kind == "enum":
+            self.emit("CALL", r, [Sym("fa_str_of_ptr"), v], ty=STR)
+        else:
+            self.emit("CALL", r, [Sym("fa_str_of_ptr"), v], ty=STR)
+        self.mark_owned(r, STR)
+        return r
+
+    def gen_binary(self, e: Binary):
+        op = e.op
+        hint = self.take_hint()      # 先收下提示：子表达式一律不许抢
+        lt, rt = e.left.ty, e.right.ty
+        # 短路逻辑
+        if op in ("and", "or"):
+            a = self.gen_expr(e.left)
+            r = self.new_temp(BOOL)
+            self.emit("MOV", r, [self.coerce(a, lt, BOOL)], ty=BOOL)
+            l2 = self.new_label("sc")
+            end = self.new_label("sce")
+            self.emit("BR", args=[r],
+                      extra=(end if op == "or" else l2, l2 if op == "or" else end))
+            self.emit("LABEL", extra=l2)
+            b = self.gen_expr(e.right)
+            self.emit("MOV", r, [self.coerce(b, rt, BOOL)], ty=BOOL)
+            self.emit("LABEL", extra=end)
+            return r
+        # 字符串
+        if lt == STR and rt == STR:
+            a = self.gen_expr(e.left)
+            b = self.gen_expr(e.right)
+            if op == "+":
+                r = self.new_temp(STR)
+                self.emit("CALL", r, [Sym("fa_str_concat"), a, b], ty=STR)
+                self.mark_owned(r, STR)
+                return r
+            rr = self.new_temp(I64)
+            fn = {"==": "fa_str_eq", "!=": "fa_str_eq", "<": "fa_str_cmp",
+                  "<=": "fa_str_cmp", ">": "fa_str_cmp", ">=": "fa_str_cmp"}[op]
+            self.emit("CALL", rr, [Sym(fn), a, b], ty=I64)
+            c = self.new_temp(BOOL)
+            if op == "!=":
+                self.emit("CMP", c, [rr, self.const(0)], extra="==", ty=I64)
+            elif op == "==":
+                self.emit("CMP", c, [rr, self.const(1)], extra="==", ty=I64)
+            else:
+                self.emit("CMP", c, [rr, self.const(0)], extra=op, ty=I64)
+            self.mark_owned(a, lt)
+            self.mark_owned(b, rt)
+            return c
+        # 指针算术
+        if lt.kind == "ptr" and rt.kind == "int" and op in ("+", "-"):
+            a = self.gen_expr(e.left)
+            b = self.coerce(self.gen_expr(e.right), rt, I64)
+            scale = max(lt.inner.size, 1) if lt.inner else 1
+            off = self.new_temp(I64)
+            self.emit("BIN", off, [b, self.const(scale)], extra="*", ty=I64)
+            r = self.new_temp(lt)
+            self.emit("BIN", r, [a, off], extra=op, ty=I64)
+            return r
+        if lt.kind == "ptr" and rt.kind == "ptr" and op == "-":
+            a = self.gen_expr(e.left)
+            b = self.gen_expr(e.right)
+            d = self.new_temp(I64)
+            self.emit("BIN", d, [a, b], extra="-", ty=I64)
+            scale = max(lt.inner.size, 1) if lt.inner else 1
+            r = self.new_temp(I64)
+            self.emit("BIN", r, [d, self.const(scale)], extra="/", ty=I64)
+            return r
+        # 比较
+        if op in ("==", "!=", "<", "<=", ">", ">="):
+            a = self.gen_expr(e.left)
+            b = self.gen_expr(e.right)
+            if lt.is_float or rt.is_float:
+                a = self.coerce(a, lt, F64)
+                b = self.coerce(b, rt, F64)
+                c = self.new_temp(BOOL)
+                self.emit("CMP", c, [a, b], extra=op, ty=F64)
+                return c
+            wt = lt if lt.size >= rt.size else rt
+            if wt.size < 8:
+                wt = I64
+            a = self.coerce(a, lt, wt)
+            b = self.coerce(b, rt, wt)
+            c = self.new_temp(BOOL)
+            self.emit("CMP", c, [a, b], extra=op, ty=wt)
+            return c
+        # 算术
+        a = self.gen_expr(e.left)
+        b = self.gen_expr(e.right)
+        if lt.is_float or rt.is_float:
+            a = self.coerce(a, lt, F64)
+            b = self.coerce(b, rt, F64)
+            fop = {"+": "+", "-": "-", "*": "*", "/": "/", "%": "%",
+                   "**": "^"}[op]
+            if op == "**":
+                r = self.hint_or_new(hint, F64)
+                self.emit("CALL", r, [Sym("pow"), a, b], ty=F64)
+                return r
+            r = self.hint_or_new(hint, F64)
+            self.emit("BIN", r, [a, b], extra=fop, ty=F64)
+            return r
+        wt = e.ty if e.ty.kind == "int" else I64
+        if wt.size < 8:
+            wt = I64
+        a = self.coerce(a, lt, wt)
+        b = self.coerce(b, rt, wt)
+        if op == "**":
+            r = self.hint_or_new(hint, I64)
+            self.emit("CALL", r, [Sym("fa_ipow"), a, b], ty=I64)
+            return r
+        r = self.hint_or_new(hint, wt)
+        self.emit("BIN", r, [a, b], extra=op, ty=wt)
+        if e.ty.kind == "int" and e.ty.size < wt.size:
+            r2 = self.new_temp(e.ty)
+            self.emit("CONV", r2, [r], extra=wt, ty=e.ty)
+            return r2
+        return r
+
+    def gen_unary(self, e: Unary):
+        op = e.op
+        hint = self.take_hint()
+        if op == "&":
+            return self.gen_addrof1(e.operand)
+        if op == "*":
+            v = self.gen_expr(e.operand)
+            return self.load_ptr(v, e.ty, 0)
+        v = self.gen_expr(e.operand)
+        t = e.operand.ty
+        if op == "-":
+            if t.is_float:
+                r = self.hint_or_new(hint, F64)
+                self.emit("UN", r, [self.coerce(v, t, F64)], extra="-", ty=F64)
+                return r
+            r = self.hint_or_new(hint, I64)
+            self.emit("UN", r, [self.coerce(v, t, I64)], extra="-", ty=I64)
+            return r
+        if op == "+":
+            return v
+        if op == "!":
+            r = self.hint_or_new(hint, BOOL)
+            self.emit("UN", r, [self.coerce(v, t, BOOL)], extra="!", ty=BOOL)
+            return r
+        if op == "~":
+            r = self.hint_or_new(hint, I64)
+            self.emit("UN", r, [self.coerce(v, t, I64)], extra="~", ty=I64)
+            return r
+        self.err(f"未知一元运算符 '{op}'", e)
+
+    def gen_cast(self, e: Cast):
+        v = self.gen_expr(e.operand)
+        return self.coerce(v, e.operand.ty, e.ty)
+
+    def gen_addrof(self, e: AddrOf):
+        return self.gen_addrof1(e.operand)
+
+    def gen_addrof1(self, operand: Expr) -> Temp:
+        if isinstance(operand, NameRef):
+            loc = self.var_loc(operand.name, operand)
+            if loc.kind == "mem":
+                return loc.val
+            # 温度量：溢出到栈
+            slot = self.emit_alloca(loc.ty.size)
+            self.emit("STORE", args=[slot, loc.val], extra=0, ty=loc.ty)
+            slot_ty = slot
+            loc.kind = "mem"
+            loc.val = slot
+            return slot_ty
+        ptr, off, ty = self.gen_addr(operand)
+        if off == 0:
+            return ptr
+        r = self.new_temp(ptr_to(ty))
+        self.emit("LEA", r, [ptr], extra=off)
+        return r
+
+    def gen_addr(self, e: Expr) -> Tuple[Temp, Any, Type]:
+        """返回 (基址指针 Temp, 偏移(常量或Temp), 类型)"""
+        if isinstance(e, NameRef):
+            loc = self.var_loc(e.name, e)
+            if loc.kind == "mem":
+                return loc.val, 0, loc.ty
+            if getattr(loc, "is_ptr", False):
+                return loc.val, 0, loc.ty      # 值本身就是地址，无需落栈
+            slot = self.emit_alloca(loc.ty.size)
+            self.emit("STORE", args=[slot, loc.val], extra=0, ty=loc.ty)
+            loc.kind = "mem"
+            loc.val = slot
+            return slot, 0, loc.ty
+        if isinstance(e, Field):
+            ot = e.obj.ty
+            if ot.kind in ("struct", "enum"):
+                base, off0, _ = self.gen_addr(e.obj)
+                fo = ot.fields[e.index][2]
+                if ot.kind == "enum":
+                    fo += 8
+                off = off0 + fo
+                return base, off, ot.fields[e.index][1]
+            self.err(f"类型 {ot} 不支持字段取址", e)
+        if isinstance(e, Index):
+            ot = e.obj.ty
+            if ot.kind == "arr":
+                base, off0, _ = self.gen_addr(e.obj)
+                idx = self.coerce(self.gen_expr(e.index), e.index.ty, I64)
+                self.bounds_check(idx, self.const(ot.count), e)
+                sc = max(ot.elem.size, 1)
+                o = self.new_temp(I64)
+                self.emit("BIN", o, [idx, self.const(sc)], extra="*", ty=I64)
+                if isinstance(off0, int) and off0:
+                    o2 = self.new_temp(I64)
+                    self.emit("BIN", o2, [o, self.const(off0)], extra="+", ty=I64)
+                    return base, o2, ot.elem
+                return base, o, ot.elem
+            if ot.kind == "ptr":
+                p = self.gen_expr(e.obj)
+                idx = self.coerce(self.gen_expr(e.index), e.index.ty, I64)
+                sc = max(ot.inner.size, 1) if ot.inner else 1
+                o = self.new_temp(I64)
+                self.emit("BIN", o, [idx, self.const(sc)], extra="*", ty=I64)
+                return p, o, ot.inner
+            self.err(f"类型 {ot} 不支持下标取址", e)
+        if isinstance(e, Deref):
+            p = self.gen_expr(e.operand)
+            return p, 0, e.ty
+        if isinstance(e, Unary) and e.op == "*":
+            p = self.gen_expr(e.operand)
+            return p, 0, e.ty
+        self.err(f"表达式不可取址", e)
+
+    def bounds_check(self, idx: Temp, limit, node):
+        ok = self.new_temp(BOOL)
+        ge = self.new_temp(BOOL)
+        lt = self.new_temp(BOOL)
+        self.emit("CMP", ge, [idx, self.const(0)], extra=">=", ty=I64)
+        self.emit("CMP", lt, [idx, limit], extra="<", ty=I64)
+        self.emit("BIN", ok, [ge, lt], extra="and", ty=BOOL)
+        l_ok = self.new_label("bok")
+        l_bad = self.new_label("bbad")
+        self.emit("BR", args=[ok], extra=(l_ok, l_bad))
+        self.emit("LABEL", extra=l_bad)
+        msg = self.make_str("下标越界 (index out of range)")
+        self.emit("CALL", None, [Sym("fa_panic"), msg])
+        self.emit("LABEL", extra=l_ok)
+
+    def load_ptr(self, ptr, ty: Type, off) -> Temp:
+        if is_agg(ty):
+            return ptr
+        r = self.new_temp(ty)
+        self.emit("LOAD", r, [ptr], extra=off, ty=ty)
+        return r
+
+    def gen_index(self, e: Index):
+        ptr, off, ty = self.gen_addr(e)
+        return self.load_ptr(ptr, ty, off)
+
+    def gen_field(self, e: Field):
+        # 枚举变体构造器：Color.Green -> 生成带 tag 的枚举值
+        if getattr(e, "is_variant", False):
+            ot = e.ty
+            slot = self.emit_alloca(ot.size)
+            self.emit("STORE", args=[slot, self.const(e.variant_index)],
+                      extra=0, ty=I64)
+            return slot
+        ot = e.obj.ty
+        if ot.kind in ("struct", "enum"):
+            ptr, off, ty = self.gen_addr(e)
+            if is_agg(ty):
+                base = self.new_temp(ptr_to(ty))
+                self.emit("LEA", base, [ptr], extra=off)
+                return base
+            return self.load_ptr(ptr, ty, off)
+        if ot.kind in ("arr", "vec", "str") and e.name == "len":
+            n = self.new_temp(I64)
+            obj = self.gen_expr(e.obj)
+            if ot.kind == "arr":
+                return self.const(ot.count)
+            if ot.kind == "vec":
+                self.emit("CALL", n, [Sym("fa_vec_len"), obj], ty=I64)
+            else:
+                self.emit("CALL", n, [Sym("fa_str_len"), obj], ty=I64)
+            return n
+        self.err(f"不支持的字段访问 {ot}.{e.name}", e)
+
+    def gen_arraylit(self, e: ArrayLit):
+        ty = e.ty
+        slot = self.emit_alloca(max(ty.size, 1))
+        for i, el in enumerate(e.elems):
+            v = self.gen_expr(el)
+            if is_agg(el.ty):
+                d = self.new_temp(ptr_to(el.ty))
+                self.emit("LEA", d, [slot], extra=i * max(el.ty.size, 1))
+                self.emit("MEMCPY", args=[d, v], extra=el.ty.size, ty=el.ty)
+            else:
+                self.emit("STORE", args=[slot, self.coerce(v, el.ty, ty.elem)],
+                          extra=i * max(ty.elem.size, 1), ty=ty.elem)
+                if T.t_is_refcounted(ty.elem):
+                    self.emit_rcinc(v, ty.elem)
+        return slot
+
+    def gen_structlit(self, e: StructLit):
+        st = e.resolved
+        slot = self.emit_alloca(st.size)
+        for fname, fty, off in st.fields:
+            expr = dict(e.fields).get(fname)
+            if expr is None:
+                continue
+            v = self.gen_expr(expr)
+            if is_agg(fty):
+                d = self.new_temp(ptr_to(fty))
+                self.emit("LEA", d, [slot], extra=off)
+                self.emit("MEMCPY", args=[d, v], extra=fty.size, ty=fty)
+            else:
+                self.emit("STORE", args=[slot, self.coerce(v, expr.ty, fty)],
+                          extra=off, ty=fty)
+                if T.t_is_refcounted(fty):
+                    self.emit_rcinc(v, expr.ty)
+        return slot
+
+    def gen_new(self, e: NewExpr):
+        """new expr -> 在堆上放一份拷贝，返回指针"""
+        v = self.gen_expr(e.operand)
+        ty = e.operand.ty
+        p = self.new_temp(ptr_to(ty))
+        self.emit("CALL", p, [Sym("fa_alloc"), self.const(max(ty.size, 8))], ty=ptr_to(ty))
+        if is_agg(ty):
+            self.emit("MEMCPY", args=[p, v], extra=ty.size, ty=ty)
+        else:
+            self.emit("STORE", args=[p, v], extra=0, ty=ty)
+            if T.t_is_refcounted(ty):
+                self.emit_rcinc(v, ty)
+        return p
+
+    def gen_ctor(self, e: Ctor):
+        """Vec<T>(...) / Map<K,V>() / Vec<T>[...]"""
+        if e.name == "Vec":
+            et = self.sema.resolve_type(e.targs[0])
+            k = elem_kind(et, self.sema)
+            v = self.new_temp(vec_of(et))
+            self.emit("CALL", v, [Sym("fa_vec_new"), self.const(k),
+                                  self.const(vec_esz(et)),
+                                  self.const(1 if (et.kind == "int" and et.is_signed) else 0)],
+                      ty=vec_of(et))
+            self.mark_owned(v, vec_of(et))
+            for a in e.args:
+                av = self.gen_expr(a)
+                if et.size > 8 and et.kind == "struct":
+                    box = self.new_temp(ptr_to(et))
+                    self.emit("CALL", box, [Sym("fa_alloc"), self.const(et.size)], ty=ptr_to(et))
+                    self.emit("MEMCPY", args=[box, av], extra=et.size, ty=et)
+                    self.emit("CALL", None, [Sym("fa_vec_push"), v, box])
+                else:
+                    # fa_vec_push 内部已按元素 kind 做 rc_inc
+                    cv = self.coerce(av, a.ty, et if et.kind != "struct" else I64)
+                    if et.is_float:
+                        cv = self.bitcast(cv, I64)
+                    self.emit("CALL", None, [Sym("fa_vec_push"), v, cv])
+            return v
+        if e.name == "Map":
+            kt = self.sema.resolve_type(e.targs[0])
+            vt = self.sema.resolve_type(e.targs[1])
+            m = self.new_temp(map_of(kt, vt))
+            self.emit("CALL", m, [Sym("fa_map_new"),
+                                  self.const(elem_kind(kt, self.sema)),
+                                  self.const(elem_kind(vt, self.sema))], ty=map_of(kt, vt))
+            self.mark_owned(m, map_of(kt, vt))
+            return m
+        self.err(f"未知构造器 '{e.name}'", e)
+
+    # ------------------------------------------------------------ 调用
+    def gen_call(self, e: Call):
+        callee = e.callee
+        if isinstance(callee, NameRef):
+            if callee.name in BUILTIN_FNS:
+                return self.gen_builtin(callee.name, e)
+            fs = self.sema.fns.get(callee.name)
+            if fs is None:
+                self.err(f"未定义函数 '{callee.name}'", e)
+            return self.gen_call_fs(fs, e)
+        if isinstance(callee, Field):
+            # 枚举变体构造 Enum.Variant(...)
+            ot = callee.obj.ty
+            if isinstance(callee.obj, NameRef) and ot.kind == "enum":
+                return self.gen_enum_ctor(ot, callee.name, e.args, e)
+        v = self.gen_expr(callee)
+        return self.gen_call_ptr(v, e, callee.ty)
+
+    def gen_call_fs(self, fs: FnSym, e: Call):
+        args = []
+        hint = self.take_hint()
+        ret = fs.ret
+        if is_agg(ret):
+            slot = self.emit_alloca(ret.size)
+            args.append(slot)
+        for i, a in enumerate(e.args):
+            if i < len(fs.params):
+                pty = fs.params[i]
+                av = self.gen_expr(a)
+                args.append(av if is_agg(pty) else self.coerce(av, a.ty, pty))
+            else:
+                # 可变参数：按 C 的默认实参提升（float -> double，str -> char*）
+                av = self.gen_expr(a)
+                if a.ty is not None and a.ty.is_float and a.ty.size < 8:
+                    av = self.coerce(av, a.ty, F64)
+                elif a.ty == STR:
+                    av = self.call1("fa_str_cstr", av, ptr_to(U8))
+                args.append(av)
+        if is_agg(ret):
+            self.emit("CALL", None, [Sym(fs.symbol)] + args, extra=fs)
+            return slot
+        if ret.kind == "void":
+            self.emit("CALL", None, [Sym(fs.symbol)] + args, extra=fs)
+            return self.const(0, VOID)
+        r = self.hint_or_new(hint, ret)
+        self.emit("CALL", r, [Sym(fs.symbol)] + args, extra=fs, ty=ret)
+        if T.t_is_refcounted(ret):
+            self.mark_owned(r, ret)
+        return r
+
+    def gen_call_ptr(self, ptrv, e: Call, fnty: Type):
+        args = []
+        for i, a in enumerate(e.args):
+            av = self.gen_expr(a)
+            args.append(av)
+        ret = fnty.ret if fnty.kind == "fn" else ANY
+        if ret.kind == "void":
+            self.emit("CALLPTR", None, [ptrv] + args)
+            return self.const(0, VOID)
+        r = self.new_temp(ret)
+        self.emit("CALLPTR", r, [ptrv] + args, ty=ret)
+        return r
+
+    def gen_enum_ctor(self, ety: Type, vname: str, args: List[Expr], node):
+        slot = self.emit_alloca(ety.size)
+        vi = None
+        for name, flaid, i in ety.variants:
+            if name == vname:
+                vi, vfields = i, flaid
+                break
+        if vi is None:
+            self.err(f"枚举 {ety.name} 没有变体 '{vname}'", node)
+        self.emit("STORE", args=[slot, self.const(vi)], extra=0, ty=I64)
+        for i, a in enumerate(args):
+            fty = vfields[i][1] if i < len(vfields) else ANY
+            v = self.gen_expr(a)
+            off = 8 + (vfields[i][2] if i < len(vfields) else 0)
+            if is_agg(fty):
+                d = self.new_temp(ptr_to(fty))
+                self.emit("LEA", d, [slot], extra=off)
+                self.emit("MEMCPY", args=[d, v], extra=fty.size, ty=fty)
+            else:
+                self.emit("STORE", args=[slot, self.coerce(v, a.ty, fty)],
+                          extra=off, ty=fty)
+                if T.t_is_refcounted(fty):
+                    self.emit_rcinc(v, a.ty)
+        return slot
+
+    def gen_method(self, e: MethodCall):
+        ot = e.obj.ty
+        # 命名空间（py / java）
+        if ot.kind == "ns":
+            return self.gen_ns_method(ot.name, e)
+        fs = e.resolved
+        if isinstance(fs, FnSym):
+            args = []
+            objv = self.gen_expr(e.obj)
+            if is_agg(ot):
+                args.append(objv)
+            else:
+                args.append(objv)
+            for i, a in enumerate(e.args):
+                pty = fs.params[i + 1] if (i + 1) < len(fs.params) else ANY
+                av = self.gen_expr(a)
+                args.append(av if is_agg(pty) else self.coerce(av, a.ty, pty))
+            ret = fs.ret
+            if is_agg(ret):
+                slot = self.emit_alloca(ret.size)
+                self.emit("CALL", None, [Sym(fs.symbol), slot] + args, extra=fs)
+                return slot
+            if ret.kind == "void":
+                self.emit("CALL", None, [Sym(fs.symbol)] + args, extra=fs)
+                return self.const(0, VOID)
+            r = self.new_temp(ret)
+            self.emit("CALL", r, [Sym(fs.symbol)] + args, extra=fs, ty=ret)
+            if T.t_is_refcounted(ret):
+                self.mark_owned(r, ret)
+            return r
+        if e.resolved == "builtin-method":
+            return self.gen_builtin_method(e)
+        self.err(f"未解析的方法调用 .{e.name}", e)
+
+    def emit_bounds_check(self, bad: Temp):
+        """bad 为真时跳到运行时报错（下标越界）"""
+        ok = self.new_label("bok")
+        self.emit("BR", args=[bad], extra=(self.new_label("bbad"), ok))
+        # 用一条 JMP 串联：BR 的真分支先落到报错调用
+        lbl_bad = self.ir[-1].extra[0]
+        self.emit("LABEL", extra=lbl_bad)
+        self.emit("CALL", None, [Sym("fa_bounds_error")])
+        self.emit("LABEL", extra=ok)
+
+    def bitcast(self, v, to_ty: Type):
+        """同一 64 位数据的类型重解释（i64 <-> f64），用于容器这类按 uint64_t 存取的 ABI"""
+        r = self.new_temp(to_ty)
+        self.emit("BITCAST", r, [v], ty=to_ty)
+        return r
+
+    def gen_builtin_method(self, e: MethodCall):
+        ot = e.obj.ty
+        obj = self.gen_expr(e.obj)
+        name = e.name
+        # ---- str
+        if ot == STR:
+            if name in ("repeat", "count"):
+                a = self.gen_expr(e.args[0])
+                if name == "count":
+                    sub = self.gen_to_str(a, e.args[0].ty)
+                    return self.call2("fa_str_count", obj, sub, I64)
+                n = self.coerce(a, e.args[0].ty, I64)
+                r = self.call2("fa_str_repeat", obj, n, STR)
+                self.mark_owned(r, STR)
+                return r
+            fnmap = {"len": ("fa_str_len", I64), "at": ("fa_str_byte", I64),
+                     "bytes": ("fa_str_len", I64), "to_i64": ("fa_str_to_i64", I64),
+                     "to_f64": ("fa_str_to_f64", F64),
+                     "slice": ("fa_str_slice", STR), "trim": ("fa_str_trim", STR),
+                     "upper": ("fa_str_upper", STR), "lower": ("fa_str_lower", STR),
+                     "split": ("fa_str_split", vec_of(STR)),
+                     "chars": ("fa_str_chars", vec_of(CHAR)),
+                     "repeat": ("fa_str_repeat", STR),
+                     "count": ("fa_str_count", I64),
+                     "lines": ("fa_str_lines", vec_of(STR)),
+                     "trim_start": ("fa_str_trim_start", STR),
+                     "trim_end": ("fa_str_trim_end", STR)}
+            if name in ("find", "contains", "starts_with", "ends_with", "eq", "replace"):
+                if name == "find":
+                    a = self.gen_expr(e.args[0])
+                    r = self.new_temp(I64)
+                    self.emit("CALL", r, [Sym("fa_str_find"), obj,
+                                          self.gen_to_str(a, e.args[0].ty)], ty=I64)
+                    return r
+                if name == "contains":
+                    a = self.gen_expr(e.args[0])
+                    r = self.new_temp(I64)
+                    self.emit("CALL", r, [Sym("fa_str_find"), obj,
+                                          self.gen_to_str(a, e.args[0].ty)], ty=I64)
+                    c = self.new_temp(BOOL)
+                    self.emit("CMP", c, [r, self.const(0)], extra=">=", ty=I64)
+                    return c
+                if name == "starts_with":
+                    a = self.gen_expr(e.args[0])
+                    r = self.new_temp(I64)
+                    self.emit("CALL", r, [Sym("fa_str_starts"), obj,
+                                          self.gen_to_str(a, e.args[0].ty)], ty=I64)
+                    c = self.new_temp(BOOL)
+                    self.emit("CMP", c, [r, self.const(1)], extra="==", ty=I64)
+                    return c
+                if name == "ends_with":
+                    a = self.gen_expr(e.args[0])
+                    r = self.new_temp(I64)
+                    self.emit("CALL", r, [Sym("fa_str_ends"), obj,
+                                          self.gen_to_str(a, e.args[0].ty)], ty=I64)
+                    c = self.new_temp(BOOL)
+                    self.emit("CMP", c, [r, self.const(1)], extra="==", ty=I64)
+                    return c
+                if name == "eq":
+                    a = self.gen_expr(e.args[0])
+                    r = self.new_temp(I64)
+                    self.emit("CALL", r, [Sym("fa_str_eq"), obj,
+                                          self.gen_to_str(a, e.args[0].ty)], ty=I64)
+                    c = self.new_temp(BOOL)
+                    self.emit("CMP", c, [r, self.const(1)], extra="==", ty=I64)
+                    return c
+                if name == "replace":
+                    a = self.gen_expr(e.args[0])
+                    b = self.gen_expr(e.args[1])
+                    r = self.new_temp(STR)
+                    self.emit("CALL", r, [Sym("fa_str_replace"), obj,
+                                          self.gen_to_str(a, e.args[0].ty),
+                                          self.gen_to_str(b, e.args[1].ty)], ty=STR)
+                    self.mark_owned(r, STR)
+                    return r
+            if name in fnmap:
+                fn, rt = fnmap[name]
+                args = [obj]
+                if name == "slice":
+                    args.append(self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64))
+                    args.append(self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, I64))
+                if name == "split":
+                    args.append(self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty))
+                if name == "at":
+                    args.append(self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64))
+                r = self.new_temp(rt)
+                self.emit("CALL", r, [Sym(fn)] + args, ty=rt)
+                if rt != I64:
+                    self.mark_owned(r, rt)
+                return r
+            if name == "cstr":
+                r = self.new_temp(ptr_to(U8))
+                self.emit("CALL", r, [Sym("fa_str_cstr"), obj], ty=ptr_to(U8))
+                return r
+            if name == "to_str":
+                r = self.new_temp(STR)
+                self.emit("MOV", r, [obj], ty=STR)
+                return r
+        # ---- vec
+        if ot.kind == "vec":
+            et = ot.elem
+            if name == "len":
+                r = self.new_temp(I64)
+                self.emit("LOAD", r, [obj], extra=8, ty=I64)
+                return r
+            if name == "push":
+                a = self.gen_expr(e.args[0])
+                if et.size > 8 and et.kind == "struct":
+                    box = self.new_temp(ptr_to(et))
+                    self.emit("CALL", box, [Sym("fa_alloc"), self.const(et.size)], ty=ptr_to(et))
+                    self.emit("MEMCPY", args=[box, a], extra=et.size, ty=et)
+                    self.emit("CALL", None, [Sym("fa_vec_push"), obj, box])
+                else:
+                    # fa_vec_push 内部已按元素 kind 做 rc_inc
+                    av = self.coerce(a, e.args[0].ty, et if et.kind != "struct" else I64)
+                    if et.is_float:
+                        av = self.bitcast(av, I64)
+                    self.emit("CALL", None, [Sym("fa_vec_push"), obj, av])
+                return self.const(0, VOID)
+            if name == "get":
+                i = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
+                # 内联快速路径：越界检查 + 直接取元素（省掉一次函数调用）
+                n = self.new_temp(I64)
+                self.emit("LOAD", n, [obj], extra=8, ty=I64)
+                bad = self.new_temp(BOOL)
+                self.emit("CMP", bad, [i, n], extra=">=", ty=I64)
+                self.emit_bounds_check(bad)
+                data = self.new_temp(ptr_to(I64))
+                self.emit("LOAD", data, [obj], extra=32, ty=ptr_to(I64))
+                # extra=(下标, 比例) -> 直接用 x86 比例变址 [data + i*esz]，省掉一条 imul
+                ez = vec_esz(et)
+                raw = self.new_temp(I64)
+                self.emit("LOAD", raw, [data], extra=(i, ez),
+                          ty=et if ez < 8 else I64)
+                return self.bitcast(raw, et) if et.is_float else raw
+            if name == "set":
+                i = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
+                a = self.gen_expr(e.args[1])
+                # fa_vec_set 内部完成「新值 inc + 旧值 dec」
+                av = self.coerce(a, e.args[1].ty, et if et.kind != "struct" else I64)
+                if et.is_float:
+                    av = self.bitcast(av, I64)
+                if et.kind == "struct" or T.t_is_refcounted(et):
+                    # 结构体元素 / 需要维护引用计数的元素仍然走运行时
+                    self.emit("CALL", None, [Sym("fa_vec_set"), obj, i, av])
+                    return self.const(0, VOID)
+                # 内联快速路径：越界检查 + 直接写元素
+                n = self.new_temp(I64)
+                self.emit("LOAD", n, [obj], extra=8, ty=I64)
+                bad = self.new_temp(BOOL)
+                self.emit("CMP", bad, [i, n], extra=">=", ty=I64)
+                self.emit_bounds_check(bad)
+                data = self.new_temp(ptr_to(I64))
+                self.emit("LOAD", data, [obj], extra=32, ty=ptr_to(I64))
+                ez = vec_esz(et)
+                self.emit("STORE", args=[data, av], extra=(i, ez),
+                          ty=et if ez < 8 else I64)
+                return self.const(0, VOID)
+            if name == "pop":
+                raw = self.new_temp(I64)
+                self.emit("CALL", raw, [Sym("fa_vec_pop"), obj], ty=I64)
+                r = self.bitcast(raw, et) if et.is_float else raw
+                self.mark_owned(r, et)      # fa_vec_pop 转移所有权给调用方
+                return r
+            if name == "contains":
+                v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, et)
+                if et.is_float:
+                    v = self.bitcast(v, I64)
+                r = self.new_temp(I64)
+                self.emit("CALL", r, [Sym("fa_vec_contains"), obj, v], ty=I64)
+                return r
+            if name == "resize":
+                n = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
+                v = self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, et)
+                self.emit("CALL", None, [Sym("fa_vec_resize"), obj, n, v])
+                return self.const(0, VOID)
+            if name == "sort":
+                fn = ("fa_vec_sort_f64" if et.is_float else
+                      "fa_vec_sort_str" if et == STR else "fa_vec_sort_i64")
+                self.emit("CALL", None, [Sym(fn), obj])
+                return self.const(0, VOID)
+            if name == "reverse":
+                self.emit("CALL", None, [Sym("fa_vec_reverse"), obj])
+                return self.const(0, VOID)
+            if name == "join":
+                sep = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+                r = self.call2("fa_vec_join", obj, sep, STR)
+                self.mark_owned(r, STR)
+                return r
+            if name == "sum":
+                fn = "fa_vec_sum_f64" if et.is_float else "fa_vec_sum_i64"
+                rt = F64 if et.is_float else I64
+                return self.call1(fn, obj, rt)
+            if name in ("min", "max"):
+                if et.is_float:
+                    return self.call1(f"fa_vec_{name}_f64", obj, F64)
+                if et == STR:
+                    self.err("str 容器的 min/max 暂不支持（请先 sort）", e)
+                return self.call1(f"fa_vec_{name}_i64", obj, I64)
+            if name == "index_of":
+                a = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, et)
+                if et.is_float:
+                    a = self.bitcast(a, I64)
+                return self.call2("fa_vec_index_of", obj, a, I64)
+            if name == "clear":
+                self.emit("CALL", None, [Sym("fa_vec_clear"), obj])
+                return self.const(0, VOID)
+        # ---- map
+        if ot.kind == "map":
+            kt, vt = ot.key, ot.val
+            if name == "len":
+                r = self.new_temp(I64)
+                self.emit("CALL", r, [Sym("fa_map_len"), obj], ty=I64)
+                return r
+            if name == "get":
+                k = self.gen_expr(e.args[0])
+                kk = self.coerce(k, e.args[0].ty, kt)
+                if kt.is_float:
+                    kk = self.bitcast(kk, I64)
+                raw = self.new_temp(I64)
+                self.emit("CALL", raw, [Sym("fa_map_get"), obj, kk], ty=I64)
+                return self.bitcast(raw, vt) if vt.is_float else raw
+            if name == "set":
+                k = self.gen_expr(e.args[0])
+                v = self.gen_expr(e.args[1])
+                # fa_map_set 内部完成「新键值 inc + 旧键值 dec」
+                kk = self.coerce(k, e.args[0].ty, kt)
+                vv = self.coerce(v, e.args[1].ty, vt)
+                if kt.is_float:
+                    kk = self.bitcast(kk, I64)
+                if vt.is_float:
+                    vv = self.bitcast(vv, I64)
+                self.emit("CALL", None, [Sym("fa_map_set"), obj, kk, vv])
+                return self.const(0, VOID)
+            if name == "has":
+                k = self.gen_expr(e.args[0])
+                r = self.new_temp(I64)
+                self.emit("CALL", r, [Sym("fa_map_has"), obj,
+                                      self.coerce(k, e.args[0].ty, kt)], ty=I64)
+                c = self.new_temp(BOOL)
+                self.emit("CMP", c, [r, self.const(1)], extra="==", ty=I64)
+                return c
+            if name == "del":
+                k = self.gen_expr(e.args[0])
+                self.emit("CALL", None, [Sym("fa_map_del"), obj,
+                                         self.coerce(k, e.args[0].ty, kt)])
+                return self.const(0, VOID)
+            if name == "contains":
+                v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, et)
+                r = self.new_temp(I64)
+                self.emit("CALL", r, [Sym("fa_vec_contains"), obj, v], ty=I64)
+                return r
+            if name == "resize":
+                n = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
+                v = self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, et)
+                self.emit("CALL", None, [Sym("fa_vec_resize"), obj, n, v])
+                return self.const(0, VOID)
+            if name == "sort":
+                fn = ("fa_vec_sort_f64" if et.is_float else
+                      "fa_vec_sort_str" if et == STR else "fa_vec_sort_i64")
+                self.emit("CALL", None, [Sym(fn), obj])
+                return self.const(0, VOID)
+            if name == "reverse":
+                self.emit("CALL", None, [Sym("fa_vec_reverse"), obj])
+                return self.const(0, VOID)
+            if name == "join":
+                sep = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+                r = self.call2("fa_vec_join", obj, sep, STR)
+                self.mark_owned(r, STR)
+                return r
+            if name == "sum":
+                fn = "fa_vec_sum_f64" if et.is_float else "fa_vec_sum_i64"
+                rt = F64 if et.is_float else I64
+                return self.call1(fn, obj, rt)
+            if name in ("min", "max"):
+                if et.is_float:
+                    return self.call1(f"fa_vec_{name}_f64", obj, F64)
+                if et == STR:
+                    self.err("str 容器的 min/max 暂不支持（请先 sort）", e)
+                return self.call1(f"fa_vec_{name}_i64", obj, I64)
+            if name == "index_of":
+                a = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, et)
+                if et.is_float:
+                    a = self.bitcast(a, I64)
+                return self.call2("fa_vec_index_of", obj, a, I64)
+            if name == "clear":
+                self.emit("CALL", None, [Sym("fa_map_clear"), obj])
+                return self.const(0, VOID)
+        # ---- pyobj
+        if ot.kind == "pyobj":
+            if name == "to_str":
+                r = self.new_temp(STR)
+                self.emit("CALL", r, [Sym("fa_py_to_str"), obj], ty=STR)
+                self.mark_owned(r, STR)
+                return r
+            if name == "to_i64":
+                r = self.new_temp(I64)
+                self.emit("CALL", r, [Sym("fa_py_to_i64"), obj], ty=I64)
+                return r
+            if name == "to_f64":
+                r = self.new_temp(F64)
+                self.emit("CALL", r, [Sym("fa_py_to_f64"), obj], ty=F64)
+                return r
+            if name == "attr":
+                a = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+                r = self.new_temp(PYOBJ)
+                self.emit("CALL", r, [Sym("fa_py_attr"), obj, a], ty=PYOBJ)
+                self.mark_owned(r, PYOBJ)
+                return r
+            if name == "call":
+                a = self.gen_expr(e.args[0]) if e.args else self.const(0)
+                r = self.new_temp(PYOBJ)
+                # fa_py_callv(对象, 方法名(FaStr*，直接调用对象本身时传 0), 参数 Vec)
+                self.emit("CALL", r, [Sym("fa_py_callv"), obj, self.const(0), a], ty=PYOBJ)
+                self.mark_owned(r, PYOBJ)
+                return r
+        # ---- jobj
+        if ot.kind == "jobj":
+            if name == "to_str":
+                r = self.new_temp(STR)
+                self.emit("CALL", r, [Sym("fa_jvm_to_str"), obj], ty=STR)
+                self.mark_owned(r, STR)
+                return r
+            if name == "to_i64":
+                r = self.new_temp(I64)
+                self.emit("CALL", r, [Sym("fa_jvm_to_i64"), obj], ty=I64)
+                return r
+            if name == "to_f64":
+                r = self.new_temp(F64)
+                self.emit("CALL", r, [Sym("fa_jvm_to_f64"), obj], ty=F64)
+                return r
+            if name in ("jcall_i64", "jcall_f64", "jcall_obj", "jcall_void"):
+                mname = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+                sig = self.gen_to_str(self.gen_expr(e.args[1]), e.args[1].ty)
+                n = len(e.args) - 2
+                arr = self.emit_alloca(max(n, 1) * 8)
+                for i in range(n):
+                    a = e.args[2 + i]
+                    av = self.gen_expr(a)
+                    if a.ty is not None and a.ty.is_float:
+                        self.emit("STORE", args=[arr, self.coerce(av, a.ty, F64)],
+                                  extra=i * 8, ty=F64)
+                    else:
+                        self.emit("STORE", args=[arr, self.coerce(av, a.ty, I64)],
+                                  extra=i * 8, ty=I64)
+                fn = {"jcall_i64": "fa_jvm_call_i64", "jcall_f64": "fa_jvm_call_f64",
+                      "jcall_obj": "fa_jvm_call_obj", "jcall_void": "fa_jvm_call_void"}[name]
+                if name == "jcall_f64":
+                    r = self.new_temp(F64)
+                    self.emit("CALL", r, [Sym(fn), obj, mname, sig,
+                                          self.const(n), arr], ty=F64)
+                    return r
+                if name == "jcall_void":
+                    self.emit("CALL", None, [Sym(fn), obj, mname, sig,
+                                             self.const(n), arr])
+                    return self.const(0, VOID)
+                rt = JOBJ if name == "jcall_obj" else I64
+                r = self.new_temp(rt)
+                self.emit("CALL", r, [Sym(fn), obj, mname, sig,
+                                      self.const(n), arr], ty=rt)
+                if rt == JOBJ:
+                    self.mark_owned(r, JOBJ)
+                return r
+        # ---- 数值
+        if ot.is_num:
+            if name == "to_str":
+                return self.gen_to_str(obj, ot)
+            if name == "abs":
+                r = self.new_temp(F64 if ot.is_float else I64)
+                fn = "fabs" if ot.is_float else "labs"
+                self.emit("CALL", r, [Sym(fn), self.coerce(obj, ot, F64 if ot.is_float else I64)],
+                          ty=F64 if ot.is_float else I64)
+                return r
+        if ot.kind == "arr" and name == "len":
+            return self.const(ot.count)
+        self.err(f"未实现的内建方法 .{name}（类型 {ot}）", e)
+
+    # ------------------------------------------------------------ 内建函数
+    def gen_builtin(self, name: str, e: Call):
+        if name in ("print", "println"):
+            for i, a in enumerate(e.args):
+                if i:
+                    sp = self.make_str(" ")
+                    self.emit("CALL", None, [Sym("fa_print_str"), sp])
+                v = self.gen_expr(a)
+                if a.ty == STR:
+                    self.emit("CALL", None, [Sym("fa_print_str"), v])
+                elif a.ty.kind == "float":
+                    self.emit("CALL", None, [Sym("fa_print_f64"), self.coerce(v, a.ty, F64)])
+                elif a.ty.kind == "bool":
+                    self.emit("CALL", None, [Sym("fa_print_bool"), v])
+                elif a.ty == CHAR:
+                    self.emit("CALL", None, [Sym("fa_print_char"), v])
+                elif a.ty.kind == "ptr":
+                    self.emit("CALL", None, [Sym("fa_print_ptr"), v])
+                elif a.ty.kind in ("vec", "map", "pyobj", "jobj"):
+                    s = self.gen_to_str(v, a.ty)
+                    self.emit("CALL", None, [Sym("fa_print_str"), s])
+                elif a.ty.kind in ("struct", "arr", "enum"):
+                    s = self.gen_to_str(v, a.ty)
+                    self.emit("CALL", None, [Sym("fa_print_str"), s])
+                else:
+                    self.emit("CALL", None, [Sym("fa_print_i64"),
+                                             self.coerce(v, a.ty, I64)])
+            self.emit("CALL", None, [Sym("fa_print_nl")])
+            return self.const(0, VOID)
+        if name == "write":
+            for a in e.args:
+                v = self.gen_expr(a)
+                s = v if a.ty == STR else self.gen_to_str(v, a.ty)
+                self.emit("CALL", None, [Sym("fa_print_str"), s])
+            return self.const(0, VOID)
+        if name == "len":
+            a = self.gen_expr(e.args[0])
+            t = e.args[0].ty
+            r = self.new_temp(I64)
+            if t.kind == "vec":
+                self.emit("CALL", r, [Sym("fa_vec_len"), a], ty=I64)
+            elif t == STR:
+                self.emit("CALL", r, [Sym("fa_str_len"), a], ty=I64)
+            elif t.kind == "map":
+                self.emit("CALL", r, [Sym("fa_map_len"), a], ty=I64)
+            elif t.kind == "arr":
+                return self.const(t.count)
+            elif t.kind == "ptr":
+                self.emit("CALL", r, [Sym("strlen"), a], ty=I64)
+            else:
+                self.err(f"len() 不支持 {t}", e)
+            return r
+        if name == "str":
+            v = self.gen_expr(e.args[0])
+            return self.gen_to_str(v, e.args[0].ty)
+        if name in ("i64", "to_i64"):
+            v = self.gen_expr(e.args[0])
+            return self.coerce(v, e.args[0].ty, I64) if e.args[0].ty.kind != "str" \
+                else self.call1("fa_str_to_i64", v, I64)
+        if name == "f64":
+            v = self.gen_expr(e.args[0])
+            return self.coerce(v, e.args[0].ty, F64)
+        if name == "panic":
+            v = self.gen_expr(e.args[0])
+            s = v if e.args[0].ty == STR else self.gen_to_str(v, e.args[0].ty)
+            self.emit("CALL", None, [Sym("fa_panic"), s])
+            return self.const(0, VOID)
+        if name == "assert":
+            c = self.gen_cond(e.args[0])
+            l_ok = self.new_label("asok")
+            l_bad = self.new_label("asbad")
+            self.emit("BR", args=[c], extra=(l_ok, l_bad))
+            self.emit("LABEL", extra=l_bad)
+            msg = self.gen_expr(e.args[1]) if len(e.args) > 1 else None
+            s = msg if (msg is not None and e.args[1].ty == STR) else (
+                self.gen_to_str(msg, e.args[1].ty) if msg is not None
+                else self.make_str("断言失败 (assertion failed)"))
+            self.emit("CALL", None, [Sym("fa_panic"), s])
+            self.emit("LABEL", extra=l_ok)
+            return self.const(0, VOID)
+        if name == "exit":
+            v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
+            self.emit("CALL", None, [Sym("fa_exit"), v])
+            return self.const(0, VOID)
+        if name == "sleep":
+            v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
+            self.emit("CALL", None, [Sym("fa_sleep_ms"), v])
+            return self.const(0, VOID)
+        if name == "now":
+            return self.call0("fa_now", F64)
+        if name == "read_line":
+            r = self.new_temp(STR)
+            self.emit("CALL", r, [Sym("fa_read_line")], ty=STR)
+            self.mark_owned(r, STR)
+            return r
+        if name in ("sqrt", "sin", "cos", "tan", "log", "exp", "floor", "ceil"):
+            v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, F64)
+            return self.call1(name, v, F64)
+        if name == "pow":
+            a = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, F64)
+            b = self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, F64)
+            return self.call2("pow", a, b, F64)
+        if name == "abs":
+            v = self.gen_expr(e.args[0])
+            if e.args[0].ty.is_float:
+                return self.call1("fabs", self.coerce(v, e.args[0].ty, F64), F64)
+            return self.call1("labs", self.coerce(v, e.args[0].ty, I64), I64)
+        if name in ("min", "max"):
+            a = self.gen_expr(e.args[0])
+            b = self.gen_expr(e.args[1])
+            t = e.args[0].ty
+            if t.is_float:
+                a, b, tt = self.coerce(a, t, F64), self.coerce(b, t, F64), F64
+                fn = "fmin" if name == "min" else "fmax"
+            else:
+                a, b, tt = self.coerce(a, t, I64), self.coerce(b, t, I64), I64
+                fn = "fa_imin" if name == "min" else "fa_imax"
+            return self.call2(fn, a, b, tt)
+        if name == "random":
+            return self.call0("fa_random", I64)
+        if name == "chr":
+            # 码点 -> UTF-8 字符串（1~4 字节）
+            v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
+            return self.call1("fa_str_chr", v, STR)
+        if name in ("hex", "oct", "bin"):
+            v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
+            base = {"hex": 16, "oct": 8, "bin": 2}[name]
+            r = self.new_temp(STR)
+            self.emit("CALL", r, [Sym("fa_i64_base"), v, self.const(base),
+                                  self.const(0)], ty=STR)
+            self.mark_owned(r, STR)
+            return r
+        if name == "args":
+            r = self.new_temp(vec_of(STR))
+            self.emit("CALL", r, [Sym("fa_args")], ty=vec_of(STR))
+            self.mark_owned(r, vec_of(STR))
+            return r
+        if name in ("round", "trunc"):
+            v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, F64)
+            return self.call1(name, v, F64)
+        if name in ("log2", "log10", "exp2"):
+            v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, F64)
+            return self.call1(name, v, F64)
+        if name == "hypot":
+            a = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, F64)
+            b = self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, F64)
+            return self.call2("hypot", a, b, F64)
+        if name == "sign":
+            a = self.gen_expr(e.args[0])
+            if e.args[0].ty.is_float:
+                return self.call1("fa_sign_f64",
+                                  self.coerce(a, e.args[0].ty, F64), F64)
+            return self.call1("fa_sign_i64",
+                              self.coerce(a, e.args[0].ty, I64), I64)
+        if name == "clamp":
+            a = self.gen_expr(e.args[0])
+            lo = self.gen_expr(e.args[1])
+            hi = self.gen_expr(e.args[2])
+            if e.args[0].ty.is_float:
+                return self.call3("fa_clamp_f64",
+                                  self.coerce(a, e.args[0].ty, F64),
+                                  self.coerce(lo, e.args[1].ty, F64),
+                                  self.coerce(hi, e.args[2].ty, F64), F64)
+            return self.call3("fa_clamp_i64",
+                              self.coerce(a, e.args[0].ty, I64),
+                              self.coerce(lo, e.args[1].ty, I64),
+                              self.coerce(hi, e.args[2].ty, I64), I64)
+        if name in ("keys", "values"):
+            m = self.gen_expr(e.args[0])
+            mt = e.args[0].ty
+            if mt.kind != "map":
+                self.err(f"{name}() 需要 Map", e)
+            et = mt.key if name == "keys" else mt.val
+            k = elem_kind(et, self.sema)
+            v = self.new_temp(vec_of(et))
+            self.emit("CALL", v, [Sym("fa_vec_new"), self.const(k),
+                                  self.const(vec_esz(et)),
+                                  self.const(1 if (et.kind == "int" and et.is_signed) else 0)],
+                      ty=vec_of(et))
+            self.mark_owned(v, vec_of(et))
+            n = self.new_temp(I64)
+            self.emit("CALL", n, [Sym("fa_map_len"), m], ty=I64)
+            i = self.new_temp(I64)
+            self.emit("MOV", i, [self.const(0)], ty=I64)
+            top = self.new_label("keys")
+            body = self.new_label("kbody")
+            end = self.new_label("kend")
+            self.emit("LABEL", extra=top)
+            c = self.new_temp(BOOL)
+            self.emit("CMP", c, [i, n], extra="<", ty=I64)
+            self.emit("BR", args=[c], extra=(body, end))
+            self.emit("LABEL", extra=body)
+            raw = self.new_temp(I64)
+            fn = "fa_map_key_at" if name == "keys" else "fa_map_val_at"
+            self.emit("CALL", raw, [Sym(fn), m, i], ty=I64)
+            self.emit("CALL", None, [Sym("fa_vec_push"), v, raw])
+            self.emit("BIN", i, [i, self.const(1)], extra="+", ty=I64)
+            self.emit("JMP", extra=top)
+            self.emit("LABEL", extra=end)
+            return v
+        if name == "file_read":
+            v = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+            r = self.new_temp(STR)
+            self.emit("CALL", r, [Sym("fa_file_read"), v], ty=STR)
+            self.mark_owned(r, STR)
+            return r
+        if name == "file_write":
+            p = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+            c = self.gen_to_str(self.gen_expr(e.args[1]), e.args[1].ty)
+            r = self.new_temp(I64)
+            self.emit("CALL", r, [Sym("fa_file_write"), p, c], ty=I64)
+            return r
+        if name == "cmd":
+            v = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+            r = self.new_temp(STR)
+            self.emit("CALL", r, [Sym("fa_system_capture"), v], ty=STR)
+            self.mark_owned(r, STR)
+            return r
+        if name == "env":
+            v = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+            r = self.new_temp(STR)
+            self.emit("CALL", r, [Sym("fa_env"), v], ty=STR)
+            self.mark_owned(r, STR)
+            return r
+        if name == "concat":
+            v = self.gen_expr(e.args[0])
+            return self.gen_to_str(v, e.args[0].ty)
+        if name == "push":
+            obj = self.gen_expr(e.args[0])
+            a = self.gen_expr(e.args[1])
+            et = e.args[0].ty.elem
+            self.emit("CALL", None, [Sym("fa_vec_push"), obj,
+                                     self.coerce(a, e.args[1].ty, et)])
+            return self.const(0, VOID)
+        if name == "pop":
+            obj = self.gen_expr(e.args[0])
+            r = self.new_temp(e.args[0].ty.elem)
+            self.emit("CALL", r, [Sym("fa_vec_pop"), obj], ty=e.args[0].ty.elem)
+            self.mark_owned(r, e.args[0].ty.elem)
+            return r
+        if name == "gcd":
+            a = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
+            b = self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, I64)
+            return self.call2("fa_gcd", a, b, I64)
+        self.err(f"未实现的内建函数 '{name}'", e)
+
+    def call0(self, fn, ty):
+        r = self.new_temp(ty)
+        self.emit("CALL", r, [Sym(fn)], ty=ty)
+        return r
+
+    def call1(self, fn, a, ty):
+        r = self.new_temp(ty)
+        self.emit("CALL", r, [Sym(fn), a], ty=ty)
+        return r
+
+    def call2(self, fn, a, b, ty):
+        r = self.new_temp(ty)
+        self.emit("CALL", r, [Sym(fn), a, b], ty=ty)
+        return r
+
+    def call3(self, fn, a, b, c, ty):
+        r = self.new_temp(ty)
+        self.emit("CALL", r, [Sym(fn), a, b, c], ty=ty)
+        return r
+
+    # ------------------------------------------------------------ 命名空间（py/java）
+    def gen_ns_method(self, ns: str, e: MethodCall):
+        name = e.name
+        if ns == "py":
+            self.mod.init_hooks.append(("py", None))
+            if name == "import":
+                a = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+                return self.refcall("fa_py_import", [a], PYOBJ)
+            if name == "eval":
+                a = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+                return self.refcall("fa_py_eval", [a], PYOBJ)
+            if name == "exec":
+                a = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+                r = self.new_temp(I64)
+                self.emit("CALL", r, [Sym("fa_py_exec"), a], ty=I64)
+                return r
+            if name == "call":
+                o = self.gen_expr(e.args[0])
+                m = self.gen_to_str(self.gen_expr(e.args[1]), e.args[1].ty)
+                args = self.gen_expr(e.args[2]) if len(e.args) > 2 else self.const(0)
+                return self.refcall("fa_py_callv", [o, m, args], PYOBJ)
+            if name == "from_i64":
+                v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
+                return self.refcall("fa_py_from_i64", [v], PYOBJ)
+            if name == "from_f64":
+                v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, F64)
+                return self.refcall("fa_py_from_f64", [v], PYOBJ)
+            if name == "from_str":
+                v = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+                return self.refcall("fa_py_from_str", [v], PYOBJ)
+            if name == "from_list":
+                v = self.gen_expr(e.args[0])
+                return self.refcall("fa_py_from_vec", [v], PYOBJ)
+            if name == "init":
+                r = self.new_temp(I64)
+                self.emit("CALL", r, [Sym("fa_py_init")], ty=I64)
+                return r
+            self.err(f"py 没有方法 '{name}'", e)
+        if ns in ("java", "jvm"):
+            self.mod.init_hooks.append(("java", None))
+            if name == "init":
+                a = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+                r = self.new_temp(I64)
+                self.emit("CALL", r, [Sym("fa_jvm_init"), a], ty=I64)
+                return r
+            if name == "class":
+                a = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+                return self.refcall("fa_jvm_find_class", [a], JOBJ)
+            if name in ("call_i64", "call_f64", "call_obj", "call_void"):
+                cls = self.gen_expr(e.args[0])
+                mname = self.gen_to_str(self.gen_expr(e.args[1]), e.args[1].ty)
+                sig = self.gen_to_str(self.gen_expr(e.args[2]), e.args[2].ty)
+                n = len(e.args) - 3
+                arr = self.emit_alloca(max(n, 1) * 8)
+                for i in range(n):
+                    a = e.args[3 + i]
+                    av = self.gen_expr(a)
+                    if a.ty is not None and a.ty.is_float:
+                        # jvalue 是 union：double 必须按位写入，不能转成整数
+                        self.emit("STORE", args=[arr, self.coerce(av, a.ty, F64)],
+                                  extra=i * 8, ty=F64)
+                    else:
+                        self.emit("STORE", args=[arr, self.coerce(av, a.ty, I64)],
+                                  extra=i * 8, ty=I64)
+                fn = {"call_i64": "fa_jvm_call_static_i64",
+                      "call_f64": "fa_jvm_call_static_f64",
+                      "call_obj": "fa_jvm_call_static_obj",
+                      "call_void": "fa_jvm_call_static_void"}[name]
+                if name == "call_f64":
+                    r = self.new_temp(F64)
+                    self.emit("CALL", r, [Sym(fn), cls, mname, sig,
+                                          self.const(n), arr], ty=F64)
+                    return r
+                if name == "call_void":
+                    self.emit("CALL", None, [Sym(fn), cls, mname, sig,
+                                             self.const(n), arr])
+                    return self.const(0, VOID)
+                rt = JOBJ if name == "call_obj" else I64
+                r = self.new_temp(rt)
+                self.emit("CALL", r, [Sym(fn), cls, mname, sig,
+                                      self.const(n), arr], ty=rt)
+                if rt == JOBJ:
+                    self.mark_owned(r, JOBJ)
+                return r
+            if name == "str":
+                a = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+                return self.refcall("fa_jvm_str", [a], JOBJ)
+            if name == "new":
+                cls = self.gen_expr(e.args[0])
+                sig = self.gen_to_str(self.gen_expr(e.args[1]), e.args[1].ty)
+                n = len(e.args) - 2
+                arr = self.emit_alloca(max(n, 1) * 8)
+                for i in range(n):
+                    av = self.gen_expr(e.args[2 + i])
+                    self.emit("STORE", args=[arr, self.coerce(av, e.args[2 + i].ty, I64)],
+                              extra=i * 8, ty=I64)
+                return self.refcall("fa_jvm_new_obj", [cls, sig, self.const(n), arr], JOBJ)
+            self.err(f"java 没有方法 '{name}'", e)
+        self.err(f"未知命名空间 '{ns}'", e)
+
+    def refcall(self, fn, args, ty):
+        r = self.new_temp(ty)
+        self.emit("CALL", r, [Sym(fn)] + args, ty=ty)
+        self.mark_owned(r, ty)
+        return r
+
+    # ------------------------------------------------------------ 类型转换
+    def coerce(self, v, src: Type, dst: Type):
+        if src is None or dst is None or src == dst:
+            return v
+        if dst.kind == "any" or src.kind == "any":
+            return v
+        # 字符串化（str(x) / 字符串插值上下文）
+        if dst == STR and src != STR:
+            return self.gen_to_str(v, src)
+        # C 互操作：str <-> char*
+        if src == STR and dst.kind == "ptr":
+            return self.call1("fa_str_cstr", v, dst)
+        if src.kind == "ptr" and dst == STR:
+            r = self.call1("fa_str_from_cstr", v, STR)
+            self.mark_owned(r, STR)
+            return r
+        # 字符串解析（i64("123") / f64("1.5")）
+        if src == STR and dst.kind == "int":
+            return self.call1("fa_str_to_i64", v, dst if dst.size == 8 else I64)
+        if src == STR and dst.kind == "float":
+            return self.call1("fa_str_to_f64", v, F64)
+        if src.is_num and dst.is_num:
+            r = self.new_temp(dst)
+            self.emit("CONV", r, [v], extra=src, ty=dst)
+            return r
+        if src.kind == "bool" and dst.kind in ("int", "float"):
+            r = self.new_temp(dst)
+            self.emit("CONV", r, [v], extra=src, ty=dst)
+            return r
+        if src == CHAR and dst.kind in ("int", "float"):
+            r = self.new_temp(dst)
+            self.emit("CONV", r, [v], extra=src, ty=dst)
+            return r
+        if dst.kind == "bool" and src.kind == "int":
+            c = self.new_temp(BOOL)
+            self.emit("CMP", c, [self.coerce(v, src, I64), self.const(0)],
+                      extra="!=", ty=I64)
+            return c
+        if dst.kind == "ptr" and src.kind == "int":
+            return v
+        if dst.kind == "int" and src.kind == "ptr":
+            return v
+        if dst.kind == "ptr" and src.kind == "ptr":
+            return v
+        return v
+
+
+# ---------------------------------------------------------------- 模块级
+def generate(sema: Sema) -> IRModule:
+    mod = IRModule()
+    mod.descs = sema.descs
+    for sym, body, params in getattr(sema, "fn_bodies_plain", []):
+        pass
+    for item in sema.fn_bodies:
+        if len(item) == 3:
+            sym, body, params = item
+            self_type = None
+        else:
+            sym, body, params, self_type = item
+        g = FnGen(sema, mod, sym, body, params, self_type)
+        mod.funcs.append(g.gen())
+    return mod

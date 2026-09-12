@@ -1,0 +1,14 @@
+fn main() -> i64:
+    let v = Vec<i64>[1, 2, 3]
+    v.push(4)
+    print(len(v))
+    print(v.get(0), v.get(3))
+    let s = 0
+    for x in v:
+        s = s + x
+    print(s)
+    v.set(0, 100)
+    print(v.get(0))
+    print(v.pop())
+    print(len(v))
+    return 0

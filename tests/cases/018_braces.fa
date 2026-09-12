@@ -1,0 +1,11 @@
+// C/Java 风格的大括号写法同样合法（语句用 ; 分隔）
+fn main() -> i64 {
+    let sum = 0;
+    for (let i = 0; i < 10; i = i + 1) {
+        sum = sum + i;
+    }
+    print(sum);
+    let v = Vec<i64>[1,2,3];
+    print(len(v));
+    return 0;
+}

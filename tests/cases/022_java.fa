@@ -1,0 +1,11 @@
+use java
+
+fn main() -> i64:
+    let math = java.class("java.lang.Math")
+    print(java.call_i64(math, "max", "(II)I", 3, 7))
+    print(java.call_f64(math, "sqrt", "(D)D", 16.0))
+    let sbcls = java.class("java.lang.StringBuilder")
+    let sb = java.new(sbcls, "()V")
+    sb.jcall_void("append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;", java.str("FA+Java"))
+    print(sb.jcall_obj("toString", "()Ljava/lang/String;").to_str())
+    return 0

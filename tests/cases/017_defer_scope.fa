@@ -1,0 +1,17 @@
+struct Res:
+    id: i64
+    tag: str
+
+fn make(id: i64) -> Res:
+    return Res { id: id, tag: "resource" }
+
+fn main() -> i64:
+    let r = make(7)
+    print(r.id, r.tag)
+    let i = 0
+    while i < 3:
+        let tmp = make(i)
+        print(tmp.id)
+        i = i + 1
+    print("作用域结束，临时结构体应已释放")
+    return 0

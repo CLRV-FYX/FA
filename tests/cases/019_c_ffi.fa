@@ -1,0 +1,8 @@
+use c "stdio.h":
+    fn printf(fmt: *u8, ...) -> i32
+    fn strlen(s: *u8) -> u64
+
+fn main() -> i64:
+    printf("C: %d %s %.3f\n", 42, "ok", 3.14159)
+    print(strlen("hello"))
+    return 0

@@ -1,0 +1,34 @@
+# Java 互操作：JVM 被嵌入 FA 进程（JNI），
+# 因此 JDK 类库、任意 Maven jar、自研 jar 都能直接调用。
+use java
+
+fn main() -> i64:
+    # 1) 静态方法
+    let math = java.class("java.lang.Math")
+    print("Math.max(3,7)   =", java.call_i64(math, "max", "(II)I", 3, 7))
+    print("Math.sqrt(2.0)  =", java.call_f64(math, "sqrt", "(D)D", 2.0))
+    print("Math.pow(2,10)  =", java.call_f64(math, "pow", "(DD)D", 2.0, 10.0))
+
+    # 2) 创建对象 + 实例方法（StringBuilder）
+    let sbcls = java.class("java.lang.StringBuilder")
+    let sb = java.new(sbcls, "()V")
+    sb.jcall_void("append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;", java.str("FA + Java"))
+    sb.jcall_void("append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;", java.str(" = 好用"))
+    let text = sb.jcall_obj("toString", "()Ljava/lang/String;")
+    print("StringBuilder  =", text.to_str())
+    print("长度            =", sb.jcall_i64("length", "()I"))
+
+    # 3) Java 的字符串处理 + 结果回到 FA
+    let strcls = java.class("java.lang.String")
+    let upper = java.call_obj(strcls, "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;",
+                              java.str("hello from java"))
+    let up = upper.jcall_obj("toUpperCase", "()Ljava/lang/String;")
+    print("toUpperCase    =", up.to_str())
+
+    # 4) Java 的 ArrayList
+    let alcls = java.class("java.util.ArrayList")
+    let list = java.new(alcls, "()V")
+    list.jcall_void("add", "(Ljava/lang/Object;)Z", java.str("A"))
+    list.jcall_void("add", "(Ljava/lang/Object;)Z", java.str("B"))
+    print("ArrayList.size =", list.jcall_i64("size", "()I"))
+    return 0

@@ -1,0 +1,313 @@
+"""FA 编译驱动：源码 -> 汇编 -> 目标文件 -> 可执行文件（含 C/C++/Python/Java 互操作链接）。"""
+
+from __future__ import annotations
+import os
+import sys
+import glob
+import shutil
+import subprocess
+import sysconfig
+from typing import List, Optional, Tuple
+
+from .lexer import FaSyntaxError
+from .parser import parse
+from .sema import Sema, FaTypeError
+from . import codegen as CG
+from .asmgen import generate_asm
+
+FA_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+RUNTIME_DIR = os.path.join(FA_ROOT, "runtime")
+BUILD_DIR = os.path.join(FA_ROOT, "build")
+
+# --------------------------------------------------------------- C 类型映射
+def c_type_of(ty) -> str:
+    n = ty.name if ty.name else ""
+    base = {
+        "i8": "int8_t", "i16": "int16_t", "i32": "int32_t", "i64": "int64_t",
+        "isize": "intptr_t", "u8": "uint8_t", "u16": "uint16_t",
+        "u32": "uint32_t", "u64": "uint64_t", "usize": "size_t",
+        "f32": "float", "f64": "double", "bool": "bool", "char": "char",
+        "void": "void", "str": "FaStr*", "any": "uint64_t",
+        "pyobj": "void*", "jobj": "void*",
+    }.get(n)
+    if base:
+        return base
+    if ty.kind == "ptr":
+        inner = ty.inner
+        if inner is None or inner.name == "void":
+            return "void*"
+        if inner.name == "u8":
+            return "const char*" if False else "char*"
+        return c_type_of(inner) + "*"
+    if ty.kind == "struct" or ty.kind == "enum":
+        return f"{ty.name}*"
+    if ty.kind == "vec" or ty.kind == "map":
+        return "void*"
+    return "uint64_t"
+
+
+def c_param_decl(name: str, ty) -> str:
+    return f"{c_type_of(ty)} {name}"
+
+
+# --------------------------------------------------------------- 环境探测
+def py_config() -> Tuple[List[str], List[str]]:
+    inc = sysconfig.get_paths().get("include") or ""
+    libdir = sysconfig.get_config_var("LIBDIR") or ""
+    ver = sysconfig.get_config_var("VERSION") or f"{sys.version_info.major}.{sys.version_info.minor}"
+    ldl = sysconfig.get_config_var("LDLIBRARY") or f"libpython{ver}.so"
+    cflags = [f"-I{inc}"] if inc else []
+    ldflags = [f"-L{libdir}"] if libdir else []
+    if ldl.startswith("libpython") and ldl.endswith(".so"):
+        ldflags.append(f"-lpython{ver}")
+        ldflags.append(f"-Wl,-rpath,{libdir}")
+    return cflags, ldflags
+
+
+def java_config() -> Tuple[List[str], List[str], str]:
+    home = os.environ.get("JAVA_HOME")
+    cands = []
+    if home:
+        cands.append(home)
+    cands += sorted(glob.glob("/usr/lib/jvm/*")) + sorted(glob.glob("/usr/java/*"))
+    for jh in cands:
+        if os.path.exists(os.path.join(jh, "include", "jni.h")):
+            libdir = os.path.join(jh, "lib", "server")
+            if not os.path.isdir(libdir):
+                libdir = os.path.join(jh, "lib")
+            return ([f"-I{os.path.join(jh, 'include')}",
+                     f"-I{os.path.join(jh, 'include', 'linux')}"],
+                    [f"-L{libdir}", "-ljvm", f"-Wl,-rpath,{libdir}"], jh)
+    return ([], [], "")
+
+
+def cc() -> str:
+    return os.environ.get("CC", "gcc")
+
+
+def cxx() -> str:
+    return os.environ.get("CXX", "g++")
+
+
+# --------------------------------------------------------------- 运行时构建
+def build_runtime(build_dir: str, with_py: bool, with_java: bool) -> List[str]:
+    os.makedirs(build_dir, exist_ok=True)
+    py_cflags, _ = py_config()
+    java_cflags, _, _ = java_config()
+
+    def obj(name: str, src: str, extra: List[str], tag: str) -> str:
+        out = os.path.join(build_dir, f"{name}{tag}.o")
+        if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(src):
+            return out
+        cmd = [cc(), "-O2", "-std=gnu11", "-fno-strict-aliasing",
+               f"-I{RUNTIME_DIR}", f"-I{os.path.dirname(RUNTIME_DIR)}"]
+        cmd += extra + ["-c", src, "-o", out]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"运行时编译失败 ({src}):\n{r.stderr}")
+        return out
+
+    objs = [obj("fa_runtime", os.path.join(RUNTIME_DIR, "fa_runtime.c"), [], ""),
+            obj("fa_syscall", os.path.join(RUNTIME_DIR, "fa_syscall.S"), [], ""),
+            obj("fa_python", os.path.join(RUNTIME_DIR, "fa_python.c"),
+                (["-DFA_HAS_PYTHON=1"] + py_cflags) if with_py else [],
+                "_py" if with_py else "_stub"),
+            obj("fa_jvm", os.path.join(RUNTIME_DIR, "fa_jvm.c"),
+                (["-DFA_HAS_JAVA=1"] + java_cflags) if with_java else [],
+                "_jvm" if with_java else "_stub")]
+    return objs
+
+
+# --------------------------------------------------------------- 前端
+class CompileResult:
+    def __init__(self):
+        self.ok = True
+        self.asm = ""
+        self.sema = None
+        self.irmod = None
+        self.error = ""
+        self.stage = ""
+
+
+def frontend(src: str, filename: str, opt: int = 2) -> CompileResult:
+    res = CompileResult()
+    try:
+        mod = parse(src, filename)
+        sema = Sema(mod, filename, src).run()
+        irmod = CG.generate(sema)
+        asm = generate_asm(irmod, sema, opt)
+        res.sema, res.irmod, res.asm = sema, irmod, asm
+        return res
+    except FaSyntaxError as e:
+        res.ok = False; res.stage = "语法分析"; res.error = e.pretty(src)
+    except FaTypeError as e:
+        res.ok = False; res.stage = "语义分析"; res.error = e.pretty(src)
+    except Exception as e:
+        import traceback
+        res.ok = False; res.stage = "代码生成"
+        res.error = f"{type(e).__name__}: {e}\n" + traceback.format_exc()
+    return res
+
+
+# --------------------------------------------------------------- C++ shim
+def gen_cxx_shim(sema: Sema, out_dir: str, base_dir: str) -> Optional[str]:
+    if not sema.cxx_shims:
+        return None
+    lines = ["// FA 自动生成的 C++ 互操作 shim", '#include "fa_runtime.h"']
+    for h in sema.c_headers:
+        lines.append(f"#include \"{h}\"")
+    lines.append("")
+    for d in sema.cxx_shims:
+        params = [c_param_decl(p.name, d.sym.params[i]) for i, p in enumerate(d.params)]
+        ret = c_type_of(d.sym.ret) if d.sym.ret else "void"
+        args = ", ".join(p.name for p in d.params)
+        body = f"return {d.name}({args});" if (d.sym.ret and d.sym.ret.kind != "void") \
+            else f"{d.name}({args});"
+        lines.append(f'extern "C" {ret} fa_{d.name}({", ".join(params)}) {{ {body} }}')
+    path = os.path.join(out_dir, "_fa_cxx_shim.cpp")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
+# --------------------------------------------------------------- main 引导
+def gen_main_shim(sema: Sema, out_dir: str) -> str:
+    fn = sema.fns.get("main")
+    nparams = len(fn.params) if fn else 0
+    ret = fn.ret if fn else None
+    retty = "int64_t" if (ret is None or ret.kind != "void") else "void"
+    if nparams >= 2:
+        sig = ("extern int64_t fa_main(int64_t argc, char** argv);\n"
+               "extern void fa_set_args(int64_t argc, char** argv);")
+        call = "fa_set_args((int64_t)argc, argv); return (int)fa_main((int64_t)argc, argv);"
+    else:
+        sig = (f"extern {retty} fa_main(void);\n"
+               f"extern void fa_set_args(int64_t argc, char** argv);")
+        call = ("fa_set_args((int64_t)argc, argv); return (int)fa_main();"
+                if retty == "int64_t"
+                else "fa_set_args((int64_t)argc, argv); fa_main(); return 0;")
+    src = f"""/* FA 自动生成 */
+#include <stdint.h>
+{sig}
+int main(int argc, char** argv) {{ (void)argc; (void)argv; {call} }}
+"""
+    path = os.path.join(out_dir, "_fa_main_shim.c")
+    with open(path, "w") as f:
+        f.write(src)
+    return path
+
+
+# --------------------------------------------------------------- 构建入口
+def build(src_path: str, out_path: str = None, emit_asm: bool = False,
+          opt: int = 2, run: bool = False, keep: bool = False,
+          verbose: bool = False) -> int:
+    src_path = os.path.abspath(src_path)
+    base = os.path.splitext(os.path.basename(src_path))[0]
+    out_dir = os.path.dirname(os.path.abspath(out_path)) if out_path else os.path.dirname(src_path)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = out_path or os.path.join(out_dir, base)
+    work = os.path.join(out_dir, ".fa_work")
+    os.makedirs(work, exist_ok=True)
+
+    with open(src_path) as f:
+        src = f.read()
+
+    r = frontend(src, src_path, opt)
+    if not r.ok:
+        sys.stderr.write(f"[{r.stage}] {r.error}\n")
+        return 1
+    sema = r.sema
+
+    asm_path = os.path.join(work, base + ".s")
+    with open(asm_path, "w") as f:
+        f.write(r.asm)
+    if emit_asm:
+        shutil.copy(asm_path, os.path.join(out_dir, base + ".s"))
+        if verbose:
+            print(f"[FA] 汇编已输出 -> {os.path.join(out_dir, base + '.s')}")
+
+    # 汇编
+    obj_path = os.path.join(work, base + ".o")
+    cmd = [cc(), "-c", asm_path, "-o", obj_path]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.stderr.write(f"[汇编失败] {p.stderr}\n")
+        sys.stderr.write(f"  汇编文件：{asm_path}\n")
+        return 1
+
+    link_objs = [obj_path]
+    link_flags: List[str] = []
+
+    # C++ shim
+    shim = gen_cxx_shim(sema, work, os.path.dirname(src_path))
+    if shim:
+        shim_obj = os.path.join(work, "_fa_cxx_shim.o")
+        cmd = [cxx(), "-O2", "-std=c++17", f"-I{RUNTIME_DIR}",
+               f"-I{os.path.dirname(src_path)}", "-c", shim, "-o", shim_obj]
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if p.returncode != 0:
+            sys.stderr.write(f"[C++ shim 编译失败] {p.stderr}\n")
+            sys.stderr.write(f"  已生成的 shim：{shim}（可手工修改后重新编译链接）\n")
+            return 1
+        link_objs.append(shim_obj)
+
+    # main 引导
+    main_c = gen_main_shim(sema, work)
+    main_obj = os.path.join(work, "_fa_main_shim.o")
+    p = subprocess.run([cc(), "-O2", "-c", main_c, "-o", main_obj],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.stderr.write(f"[main 引导编译失败] {p.stderr}\n")
+        return 1
+    link_objs.append(main_obj)
+
+    # 运行时
+    with_py = bool(sema.py_used)
+    with_java = bool(sema.java_used)
+    link_objs += build_runtime(BUILD_DIR, with_py, with_java)
+
+    # 链接
+    link_flags += ["-lm", "-ldl", "-lpthread"]
+    if with_py:
+        _, pyld = py_config()
+        link_flags += pyld
+    if with_java:
+        _, jld, _ = java_config()
+        link_flags += jld
+    src_dir = os.path.dirname(src_path)
+    for l in sema.link_libs:
+        if l.startswith("-"):
+            link_flags.append(l)
+        elif "/" in l or l.endswith((".so", ".a", ".dylib")):
+            # 直接给出库文件路径（相对源文件的路径需要解析成绝对路径）
+            pth = l if os.path.isabs(l) else os.path.normpath(os.path.join(src_dir, l))
+            link_flags.append(pth)
+            d = os.path.dirname(pth)
+            if d:
+                link_flags.append(f"-Wl,-rpath,{os.path.abspath(d)}")
+        else:
+            link_flags.append(f"-l{l}")
+
+    cmd = [cc(), f"-O{opt}", "-no-pie"] + link_objs + ["-o", out_path] + link_flags
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.stderr.write(f"[链接失败] {p.stderr}\n")
+        sys.stderr.write("  " + " ".join(cmd) + "\n")
+        return 1
+    if verbose:
+        print(f"[FA] 构建完成 -> {out_path}")
+    if run:
+        return subprocess.run([out_path], cwd=os.path.dirname(src_path)).returncode
+    return 0
+
+
+def run_file(src_path: str, args=None) -> int:
+    """编译并运行（用于测试与 fa run）"""
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="fa_run_")
+    out = os.path.join(tmp, "a.out")
+    rc = build(src_path, out, keep=True, verbose=False)
+    if rc != 0:
+        return rc
+    args = args or []
+    return subprocess.run([out] + list(args), cwd=os.path.dirname(os.path.abspath(src_path))).returncode

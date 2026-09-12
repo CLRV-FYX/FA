@@ -1,0 +1,20 @@
+fn count_primes(n: i64) -> i64:
+    let flags = Vec<bool>[]
+    let i = 0
+    while i < n:
+        flags.push(true)
+        i = i + 1
+    let count = 0
+    let p = 2
+    while p < n:
+        if flags.get(p):
+            count = count + 1
+            let k = p * p
+            while k < n:
+                flags.set(k, false)
+                k = k + p
+        p = p + 1
+    return count
+fn main() -> i64:
+    print(count_primes(2000000))
+    return 0

@@ -1,0 +1,11 @@
+use py
+
+fn main() -> i64:
+    let r = py.eval("2 ** 20")
+    print(r.to_str())
+    let math = py.import("math")
+    let args = Vec<pyobj>[py.from_f64(9.0)]
+    print(math.attr("sqrt").call(args).to_f64())
+    let s = py.eval("'-'.join(['a','b','c'])")
+    print(s.to_str())
+    return 0

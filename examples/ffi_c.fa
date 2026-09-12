@@ -1,0 +1,15 @@
+# C 互操作：直接声明、直接调用，零胶水代码
+use c "stdio.h":
+    fn printf(fmt: *u8, ...) -> i32
+    fn malloc(n: u64) -> *u8
+    fn free(p: *u8)
+    fn strlen(s: *u8) -> u64
+    fn qsort(base: *u8, nmemb: u64, size: u64, compar: *u8)
+
+fn main() -> i64:
+    printf("printf 来自 C: %d %s %.2f\n", 42, "ok", 3.5)
+    let p = malloc(64)
+    printf("malloc 得到: %p\n", p)
+    free(p)
+    print("strlen:", strlen("hello"))
+    return 0

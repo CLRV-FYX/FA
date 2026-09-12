@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# FA (FYX-all) 编译器启动器（本地开发用；全局安装请运行 install.sh）
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$HERE/compiler:${PYTHONPATH}"
+export FA_HOME="$HERE"
+exec python3 -c "
+import sys, os
+sys.path.insert(0, '$HERE/compiler')
+from falang.cli import main
+sys.exit(main())
+" "$@"

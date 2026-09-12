@@ -1,0 +1,10 @@
+fn main() -> i64:
+    let s = 0
+    for i in 0..10:
+        s = s + i
+    print(s)
+    let t = 0
+    for i in 1..=5:
+        t = t + i
+    print(t)
+    return 0

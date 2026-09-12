@@ -1,0 +1,15 @@
+# C++ 互操作：编译器自动生成 extern "C" shim，无需手写胶水
+use cxx "cpp/mathlib.hpp" lib "cpp/libmathlib.so":
+    fn add_ints(a: i32, b: i32) -> i32
+    fn mean(arr: *f64, n: i32) -> f64
+    fn fact(n: i32) -> i64
+    fn twice_int(v: i32) -> i32
+
+fn main() -> i64:
+    print("C++ add_ints(3,4) =", add_ints(3, 4))
+    print("C++ fact(20)      =", fact(20))
+    print("C++ twice_int(21) =", twice_int(21))
+    let data: [f64; 4] = [1.0, 2.0, 3.0, 4.0]
+    let m = mean(&data[0], 4)
+    print("C++ mean          =", m)
+    return 0

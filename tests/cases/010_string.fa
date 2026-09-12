@@ -1,0 +1,13 @@
+fn main() -> i64:
+    let s = "FA 语言"
+    print(s)
+    print(len(s))
+    print(s + "!")
+    print(s.slice(0, 2))
+    print(s.upper())
+    print(s.find("语"))
+    print(s.contains("语言"), s.contains("xx"))
+    print(i64("123") + 1)
+    let parts = s.split(" ")
+    print(len(parts), parts.get(0), parts.get(1))
+    return 0

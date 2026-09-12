@@ -1,0 +1,19 @@
+struct Point:
+    x: i64
+    y: i64
+
+fn dist2(a: Point, b: Point) -> i64:
+    let dx = a.x - b.x
+    let dy = a.y - b.y
+    return dx * dx + dy * dy
+
+fn main() -> i64:
+    let p = Point { x: 3, y: 4 }
+    let q = Point { x: 0, y: 0 }
+    print(p.x, p.y)
+    print(dist2(p, q))
+    p.x = 10
+    print(p.x, dist2(p, q))
+    let r = p
+    print(r.x, r.y)
+    return 0

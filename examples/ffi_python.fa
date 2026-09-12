@@ -1,0 +1,43 @@
+# Python 互操作：CPython 被嵌入到 FA 进程里，
+# 因此 numpy / pandas / torch 等一切 Python 扩展库都可以直接使用。
+use py
+
+fn main() -> i64:
+    py.exec("print('  [python] hello from CPython')")
+
+    # 1) 直接求值表达式
+    let r = py.eval("2 ** 100")
+    print("2**100 =", r.to_str())
+
+    # 2) 导入模块并调用方法
+    let math = py.import("math")
+    let args = Vec<pyobj>[py.from_f64(2.0)]
+    let sq = math.attr("sqrt").call(args)
+    print("math.sqrt(2) =", sq.to_str())
+    print("转为 FA 数值 :", sq.to_f64())
+
+    # 3) 用 Python 处理字符串，结果拿回 FA
+    let s = py.eval("'FA' + '-' + str(2026)")
+    print("python 字符串 :", s.to_str(), "长度", s.to_str().len())
+
+    # 4) 多行 Python：直接使用 numpy 等第三方扩展库
+    py.exec("""
+try:
+    import numpy as np
+    a = np.arange(10)
+    print('  [python] numpy 求和 =', int(a.sum()))
+    print('  [python] numpy 均值 =', float(a.mean()))
+except ImportError as e:
+    print('  [python] numpy 不可用:', e)
+""")
+
+    # 5) 把 FA 的数据交给 Python 计算再取回
+    let total = 0
+    let i = 0
+    while i < 100:
+        total = total + i
+        i = i + 1
+    let pyv = py.from_i64(total)
+    let dbl = py.eval("lambda x: x * 2").call(Vec<pyobj>[pyv])
+    print("FA 算的 0..99 求和 =", total, "，Python 翻倍 =", dbl.to_i64())
+    return 0

@@ -1,0 +1,21 @@
+fn is_prime(n: i64) -> bool:
+    if n < 2:
+        return false
+    let i = 2
+    while i * i <= n:
+        if n % i == 0:
+            return false
+        i = i + 1
+    return true
+
+fn main() -> i64:
+    let count = 0
+    let sum = 0
+    let n = 2
+    while n < 200:
+        if is_prime(n):
+            count = count + 1
+            sum = sum + n
+        n = n + 1
+    print(count, sum)
+    return 0

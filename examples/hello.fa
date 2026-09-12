@@ -1,0 +1,4 @@
+# FA 第一行代码
+fn main() -> i64:
+    print("你好, FA!")
+    return 0
