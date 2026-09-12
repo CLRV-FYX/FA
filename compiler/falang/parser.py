@@ -573,6 +573,10 @@ class Parser:
             return None
         if self.at_kw("let"):
             return self.parse_let()
+        if self.at_kw("fn"):
+            # 函数体里再定义 fn：会被提升成一个独立函数（名字 = 外层__内层），
+            # 因此不能捕获外层局部变量 —— FA 还没有闭包。
+            return self.parse_fn()
         if self.at(P, "{"):
             # 裸块语句：开一个新作用域（`{ let x = 1 }` 里的 x 出了块就没了）。
             # sema / codegen 早就支持 Block 当语句用，只有语法分析这里没接上，

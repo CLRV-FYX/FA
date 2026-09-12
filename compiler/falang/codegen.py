@@ -544,6 +544,8 @@ class FnGen:
             self.emit("JMP", extra=self.loop_stack[-1][0])
         elif isinstance(s, Defer):
             self.scope.defers.append(s.call)
+        elif isinstance(s, FnDef):
+            pass                    # 嵌套函数已被提升，由 generate() 单独生成
         elif isinstance(s, ExprStmt):
             self.gen_expr(s.expr)
         elif isinstance(s, Match):
@@ -1730,7 +1732,11 @@ class FnGen:
         if isinstance(callee, NameRef):
             if callee.name in BUILTIN_FNS:
                 return self.gen_builtin(callee.name, e)
-            fs = self.sema.fns.get(callee.name)
+            # 优先用 sema 解析出来的那个符号：嵌套函数被提升成了 `外层__内层`，
+            # 按名字在顶层函数表里是查不到的（会误报「未定义函数 'inner'」）。
+            fs = callee.resolved if isinstance(callee.resolved, FnSym) else None
+            if fs is None:
+                fs = self.sema.fns.get(callee.name)
             if fs is None:
                 # 函数指针：`let f: fn(i64) -> i64 = add1` 之后 `f(41)`。
                 # sema 已经把 f 定成 fn 类型了，codegen 却只会查函数表，

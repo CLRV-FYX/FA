@@ -127,6 +127,10 @@ class Sema:
         self.methods: Dict[Tuple[str, str], FnSym] = {}     # (TypeName, method) -> FnSym
         self.globals: Dict[str, VarSym] = {}
         self.global_decls: List[Any] = []    # 顶层 let，按声明顺序（初值也按此顺序执行）
+        # 嵌套函数：每层函数体一个「局部名 -> 提升后的 FnSym」表，内层优先
+        self.local_fns: List[Dict[str, FnSym]] = []
+        # 检查嵌套函数体时，外层函数的作用域链（只为诊断「想捕获局部变量」）
+        self.enclosing_scopes: List[Scope] = []
         self.uses: List[Use] = []
         self.consts: Dict[str, Expr] = {}
         self.descs: List[Type] = []        # 需要 RC 描述符的结构体
@@ -539,6 +543,7 @@ class Sema:
         prev = self.cur_fn
         self.cur_fn = sym
         sc = self.enter(sym)
+        self.local_fns.append({})
         if self_type is not None:
             st = self.structs.get(self_type) or self.enums.get(self_type)
             v = VarSym("self", st, mutable=True, is_param=True)
@@ -550,7 +555,40 @@ class Sema:
             sc.declare(p.name, VarSym(p.name, ty, mutable=True, is_param=True))
         self.stmt(body)
         self.leave()
+        self.local_fns.pop()
         self.cur_fn = prev
+
+    def check_nested_fn(self, d: FnDef):
+        """函数体里定义的 fn：提升成一个独立函数。
+
+        FA 还没有闭包，所以提升是**唯一**说得通的做法：内层函数变成一个普通的
+        顶层函数，符号名是 `fa_外层__内层`（外层再嵌套就继续拼）。代价是它看不见
+        外层的局部变量 —— 真要传值就当参数传。检查内层函数体时故意挂一条
+        **没有父作用域**的新链，于是引用外层局部变量会落到「未定义」那条路上，
+        再由 enclosing_scopes 给出一句能看懂的错，而不是一句莫名其妙的
+        「未定义的标识符 'x'」。
+        """
+        outer = self.cur_fn
+        local_name = d.name
+        d.local_name = local_name
+        if outer is not None:
+            d.name = f"{outer.name}__{local_name}"
+        if d.name in self.fns:
+            first = self.fns[d.name].decl
+            where = f"（第一次在第 {getattr(first, 'line', 0)} 行）" if first is not None else ""
+            self.error(f"嵌套函数 '{local_name}' 重复定义{where}", d)
+            return
+        self.register_fn(d)
+        if self.local_fns:
+            self.local_fns[-1][local_name] = d.sym
+        # 用一条独立的作用域链检查内层函数体（看不见外层局部变量）
+        self.enclosing_scopes.append(self.scope)
+        outer_scope, self.scope = self.scope, None
+        try:
+            self.check_body(d.sym, d.body, d.params, None)
+        finally:
+            self.scope = outer_scope
+            self.enclosing_scopes.pop()
 
     # ------------------------------------------------------------- 语句
     def stmt(self, s: Stmt):
@@ -658,6 +696,8 @@ class Sema:
                 self.error("break/continue 只能出现在循环内", s)
         elif isinstance(s, Defer):
             self.expr(s.call)
+        elif isinstance(s, FnDef):
+            self.check_nested_fn(s)
         elif isinstance(s, ExprStmt):
             self.expr(s.expr)
         elif isinstance(s, Match):
@@ -1002,6 +1042,14 @@ class Sema:
             e.resolved = g
             e.ty = g.ty
             return g.ty
+        for tbl in reversed(self.local_fns):
+            f = tbl.get(e.name)
+            if f is not None:
+                t = Type("fn", "fn", 8, 8)
+                t.params, t.ret = f.params, f.ret
+                e.resolved = f
+                e.ty = t
+                return t
         f = self.fns.get(e.name)
         if f is not None:
             t = Type("fn", "fn", 8, 8)
@@ -1031,6 +1079,10 @@ class Sema:
             e.resolved = "ns"
             e.ty = Type("ns", e.name, 8, 8)
             return e.ty
+        for sc in self.enclosing_scopes:
+            if sc is not None and sc.lookup(e.name) is not None:
+                self.error(f"嵌套函数不能捕获外层局部变量 '{e.name}'"
+                           f"（FA 还没有闭包：把它当参数传进去，或把函数提到顶层）", e)
         self.error(f"未定义的标识符 '{e.name}'", e)
 
     def expr_unary(self, e: Unary, is_target=False) -> Type:
