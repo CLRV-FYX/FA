@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # FA 语言项目 —— 快照备份脚本
 # 用法: bash scripts/backup.sh [备注]
-# 产出: /home/user/backups/fa-YYYYmmdd-HHMMSS-<备注>.tar.gz  (自动保留最近 30 份)
+# 产出: $FA_BACKUP_DIR/fa-YYYYmmdd-HHMMSS-<备注>.tar.gz  (自动保留最近 30 份)
+#
+# SRC 由脚本自身位置推导，不再硬编码路径（仓库叫什么名字、放在哪儿都能用）。
 set -euo pipefail
 
-SRC="/home/user/fa"
-DEST="/home/user/backups"
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEST="${FA_BACKUP_DIR:-$(dirname "$SRC")/backups}"
 NOTE="${1:-snapshot}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 SAFE_NOTE="$(echo "$NOTE" | tr -c 'A-Za-z0-9_.-' '_' | cut -c1-40)"
-OUT="$DEST/fa-$STAMP-$SAFE_NOTE.tar.gz"
+OUT="$DEST/$(basename "$SRC")-$STAMP-$SAFE_NOTE.tar.gz"
 
 mkdir -p "$DEST"
 
@@ -27,9 +29,10 @@ tar --exclude-vcs-ignores \
     --exclude='./build/*' \
     --exclude='./.git/*' \
     --exclude='__pycache__' \
+    --exclude='.fa_work' \
     -czf "$OUT" -C "$(dirname "$SRC")" "$(basename "$SRC")"
 
 # 3) 保留最近 30 份
-ls -1t "$DEST"/fa-*.tar.gz 2>/dev/null | tail -n +31 | xargs -r rm -f
+ls -1t "$DEST"/$(basename "$SRC")-*.tar.gz 2>/dev/null | tail -n +31 | xargs -r rm -f
 
 echo "backup -> $OUT  ($(du -h "$OUT" | cut -f1))"

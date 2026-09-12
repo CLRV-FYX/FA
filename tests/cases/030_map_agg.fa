@@ -1,0 +1,38 @@
+# Map：键值遍历、结构体值、覆盖与删除
+struct P:
+    x: i64
+    y: i64
+
+fn main() -> i64:
+    let m = Map<str,i64>()
+    m.set("a", 1)
+    m.set("b", 2)
+    m.set("c", 3)
+    print(m.len(), m.get("b"), m.has("z"))
+    m.set("a", 100)              # 覆盖
+    print(m.get("a"), m.len())
+    m.del("b")
+    print(m.len(), m.has("b"))
+
+    let ks = keys(m)
+    let vs = values(m)
+    print(ks.len(), vs.len(), sum(vs))
+    let i = 0
+    while i < ks.len():
+        print(ks.get(i), vs.get(i))
+        i = i + 1
+
+    let pts = Map<str,P>()
+    pts.set("p1", P { x: 1, y: 2 })
+    pts.set("p2", P { x: 3, y: 4 })
+    print(pts.len())
+    let q = pts.get("p2")
+    print(q.x, q.y)
+
+    let mi = Map<i64,str>()
+    mi.set(1, "one")
+    mi.set(2, "two")
+    for k in mi:
+        print(k)
+    print(mi.len())
+    return 0

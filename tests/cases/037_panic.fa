@@ -1,0 +1,10 @@
+# expect-exit: 1
+# expect-stdout: before panic
+# expect-stderr: panic: 主动终止
+# panic() 必须打信息到 stderr 并以 1 退出；退出前已产生的 stdout 不能丢
+fn main() -> i64:
+    assert(1 + 1 == 2)          # 成立的断言不该有任何动静
+    print("before panic")
+    panic("主动终止")
+    print("unreachable")
+    return 0

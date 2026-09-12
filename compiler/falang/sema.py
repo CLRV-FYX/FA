@@ -1,6 +1,7 @@
 """FA 语义分析：类型解析、符号表、方法解析、类型检查与标注。"""
 
 from __future__ import annotations
+import os
 from typing import List, Dict, Optional, Tuple
 from .ast import *
 from . import types as T
@@ -27,13 +28,17 @@ BUILTIN_METHODS = {
     "vec": {"len", "push", "get", "set", "pop", "clear", "contains", "to_str",
             "resize", "sort", "reverse", "join", "sum", "min", "max",
             "index_of"},
-    "map": {"len", "get", "set", "has", "del", "clear", "to_str"},
+    "map": {"len", "get", "set", "has", "del", "clear", "to_str",
+            "keys", "values"},
     "arr": {"len"},
     "pyobj": {"to_str", "to_i64", "to_f64", "call", "attr", "to_str_deep"},
     "jobj": {"to_str", "to_i64", "to_f64", "jcall_i64", "jcall_f64",
              "jcall_obj", "jcall_void"},
-    "int": {"to_str", "abs", "to_f64"},
-    "float": {"to_str", "to_i64", "floor", "ceil", "abs"},
+    "int": {"to_str", "abs", "to_f64", "to_i64"},
+    # 数学函数既有全局形式 sqrt(x)，也有方法形式 x.sqrt()
+    "float": {"to_str", "to_i64", "to_f64", "floor", "ceil", "abs", "round",
+              "trunc", "sqrt", "log", "log2", "log10", "exp", "exp2",
+              "sin", "cos", "tan"},
 }
 
 
@@ -48,6 +53,7 @@ class FaTypeError(Exception):
             lines = src.split("\n")
             if 1 <= self.line <= len(lines):
                 head += "\n    " + lines[self.line - 1]
+                head += "\n    " + " " * max(0, self.col - 1) + "^"
         return head
 
 
@@ -113,6 +119,10 @@ class Sema:
         self.src = src
         self.structs: Dict[str, Type] = {}
         self.enums: Dict[str, Type] = {}
+        # 名字 -> 声明，用于按需布局（自引用类型要先有壳再填字段）
+        self.struct_decls: Dict[str, Any] = {}
+        self.enum_decls: Dict[str, Any] = {}
+        self._laying_out: set = set()
         self.fns: Dict[str, FnSym] = {}
         self.methods: Dict[Tuple[str, str], FnSym] = {}     # (TypeName, method) -> FnSym
         self.globals: Dict[str, VarSym] = {}
@@ -143,6 +153,13 @@ class Sema:
     # ------------------------------------------------------------- 类型解析
     def resolve_type(self, node: Type) -> Type:
         if isinstance(node, TPtr):
+            # 指针目标只要「已登记」就够了，不必现在完成布局：
+            # 自引用结构体（next: *Node）否则会在布局里无限递归。
+            if isinstance(node.inner, TName):
+                nm = node.inner.name
+                tgt = self.structs.get(nm) or self.enums.get(nm)
+                if tgt is not None:
+                    return ptr_to(tgt)
             return ptr_to(self.resolve_type(node.inner))
         if isinstance(node, TOptional):
             inner = self.resolve_type(node.inner)
@@ -177,9 +194,17 @@ class Sema:
             return map_of(self.resolve_type(node.args[0]),
                           self.resolve_type(node.args[1]))
         if name in self.structs:
-            return self.structs[name]
+            t = self.structs[name]
+            if t.fields is None:                    # 还没布局：现在就补上
+                self.layout_struct_decl(self.struct_decls[name])
+                t = self.structs[name]
+            return t
         if name in self.enums:
-            return self.enums[name]
+            t = self.enums[name]
+            if t.variants is None:
+                self.layout_enum_decl(self.enum_decls[name])
+                t = self.enums[name]
+            return t
         self.error(f"未知类型 '{name}'", node)
 
     def const_int(self, e: Expr) -> Optional[int]:
@@ -200,7 +225,64 @@ class Sema:
         return None
 
     # ------------------------------------------------------------- 主流程
+    # ------------------------------------------------------- FA 模块导入
+    def expand_file_uses(self, mod: "Module", base_dir: str, seen: set) -> None:
+        """把 `use "other.fa"` 展开成那个文件的顶层声明。
+
+        语法分析器一直认这个写法（kind="file"），但语义分析直接把它丢进
+        self.uses 就不管了 —— 于是 `use "math.fa"` 之后调用里面的函数只会得到
+        「未定义的标识符」，看起来像是自己写错了名字。
+        这里就地展开：导入的声明进入当前模块，之后的布局/注册/检查流程一概不变。
+        被导入的文件自己也可以再 `use`，用 realpath 去重防循环导入。
+        """
+        from .parser import parse                     # 延迟导入，避免模块级环
+        out: List[Decl] = []
+        for d in mod.decls:
+            if isinstance(d, Use) and d.kind == "std":
+                self.error("FA 没有可导入的标准库模块（内建的 print / len / Vec / Map "
+                           "等直接可用，不需要 use）", d)
+            if not (isinstance(d, Use) and d.kind == "file"):
+                out.append(d)
+                continue
+            if d.alias:
+                self.error('暂不支持 `use "x.fa" as 别名` 的命名空间写法；'
+                           '去掉 as，导入的声明会直接进入当前文件', d)
+            path = d.path if os.path.isabs(d.path) else os.path.join(base_dir, d.path)
+            rp = os.path.realpath(path)
+            if not os.path.exists(rp):
+                self.error(f'找不到要导入的 FA 模块 "{d.path}"'
+                           f'（在 {base_dir or "."} 下找过）', d)
+            if rp in seen:
+                continue                              # 循环导入：只展开一次
+            seen.add(rp)
+            with open(rp, encoding="utf-8") as f:
+                sub_src = f.read()
+            try:
+                sub = parse(sub_src, rp)
+            except Exception as e:
+                self.error(f'导入 "{d.path}" 失败：{e}', d)
+            self.expand_file_uses(sub, os.path.dirname(rp), seen)
+            out.extend(sub.decls)
+        mod.decls = out
+
     def run(self):
+        # 第 0 遍：展开 `use "xxx.fa"` 多文件模块
+        self.expand_file_uses(
+            self.mod,
+            os.path.dirname(os.path.abspath(self.filename))
+            if self.filename and self.filename != "<input>" else os.getcwd(),
+            {os.path.realpath(self.filename)} if self.filename else set())
+        # 顶层重名检查：以前两个同名 fn 会一路走到汇编器，
+        # 报一句 `symbol "xx" is already defined`，用户看不出是哪两行。
+        seen_names: Dict[str, Any] = {}
+        for d in self.mod.decls:
+            nm = getattr(d, "name", None)
+            if not nm or isinstance(d, Use):
+                continue
+            if nm in seen_names:
+                self.error(f"'{nm}' 重复定义（第一次在第 {seen_names[nm].line} 行）", d)
+            seen_names[nm] = d
+
         # 第一遍：收集声明
         for d in self.mod.decls:
             if isinstance(d, Use):
@@ -247,35 +329,86 @@ class Sema:
 
     def collect_decl(self, d):
         if isinstance(d, StructDef):
-            self.structs.setdefault(d.name, None)     # 占位，稍后布局
+            # 立刻登记一个「空壳」类型对象（fields=None 表示尚未布局），
+            # 而不是 None 占位：这样链表/树这类自引用结构体里的 `*Node`
+            # 能拿到**同一个**对象，稍后布局结果就地填进去，所有引用自动生效。
+            # 以前占位是 None，resolve_type 把 *Node 解析成 ptr_to(None)，
+            # 报「类型 *None 没有字段 'val'」，等于递归结构体完全不能用。
+            if d.name not in self.structs:
+                shell = Type("struct", d.name, 8, 8)
+                shell.fields = None
+                self.structs[d.name] = shell
+                self.struct_decls[d.name] = d
         elif isinstance(d, EnumDef):
-            self.enums.setdefault(d.name, None)
+            if d.name not in self.enums:
+                shell = Type("enum", d.name, 16, 8)
+                shell.variants = None
+                self.enums[d.name] = shell
+                self.enum_decls[d.name] = d
         elif isinstance(d, Const):
             self.consts[d.name] = d.init
 
     def layout_struct_decl(self, d: StructDef):
-        fields = [(fn, self.resolve_type(ft)) for fn, ft in d.fields]
-        t = layout_struct(d.name, fields, getattr(d, "packed", False))
+        t = self.structs.get(d.name)
+        if t is not None and t.fields is not None:
+            d.sym = t
+            return                                  # 已布局（模块导入会重复调用）
+        if t is None:
+            t = Type("struct", d.name, 8, 8)
+            t.fields = None
+            self.structs[d.name] = t
+        if d.name in self._laying_out:
+            self.error(f"结构体 '{d.name}' 按值包含了自己（大小无限）；"
+                       f"递归结构请用指针字段，例如 next: *{d.name}", d)
+        self._laying_out.add(d.name)
+        try:
+            fields = [(fn, self.resolve_type(ft)) for fn, ft in d.fields]
+        finally:
+            self._laying_out.discard(d.name)
+        laid = layout_struct(d.name, fields, getattr(d, "packed", False))
+        self._fill_in_place(t, laid)                # 就地填充，保持已有引用有效
         t.methods = {}
-        self.structs[d.name] = t
         d.sym = t
         if t.needs_rc_desc():
             t.desc_id = len(self.descs)
             self.descs.append(t)
 
     def layout_enum_decl(self, d: EnumDef):
-        variants = []
-        for i, (vname, vfields, val) in enumerate(d.variants):
-            if vfields:
-                variants.append((vname, [(fn, self.resolve_type(ft)) for fn, ft in vfields], i))
-            else:
-                variants.append((vname, [], i))
-        t = layout_enum(d.name, variants)
-        self.enums[d.name] = t
+        t = self.enums.get(d.name)
+        if t is not None and t.variants is not None:
+            d.sym = t
+            return
+        if t is None:
+            t = Type("enum", d.name, 16, 8)
+            t.variants = None
+            self.enums[d.name] = t
+        if d.name in self._laying_out:
+            self.error(f"枚举 '{d.name}' 的载荷按值包含了自己；请用指针 *{d.name}", d)
+        self._laying_out.add(d.name)
+        try:
+            variants = []
+            for i, (vname, vfields, val) in enumerate(d.variants):
+                if vfields:
+                    variants.append((vname, [(fn, self.resolve_type(ft))
+                                             for fn, ft in vfields], i))
+                else:
+                    variants.append((vname, [], i))
+        finally:
+            self._laying_out.discard(d.name)
+        laid = layout_enum(d.name, variants)
+        self._fill_in_place(t, laid)
         d.sym = t
         if t.needs_rc_desc():
             t.desc_id = len(self.descs)
             self.descs.append(t)
+
+    @staticmethod
+    def _fill_in_place(t: Type, laid: Type) -> None:
+        for slot in Type.__slots__:
+            if slot in ("name", "_hash"):
+                continue
+            setattr(t, slot, getattr(laid, slot))
+        t._hash = None
 
     def register_fn(self, d: FnDef, extern=False, use: Use = None):
         params = [self.resolve_type(p.ty) for p in d.params]
@@ -284,6 +417,32 @@ class Sema:
                     extern=extern or d.extern, cname=d.cname, decl=d)
         if use is not None and use.kind in ("c", "cxx", "lib"):
             sym.extern = True
+            # C/C++ 互操作只按**指针**传聚合值：FA 的 struct/enum/数组在 ABI 里就是
+            # 指向它的指针，而 C 侧 `void f(Point p)` 是按值收的（16 字节进 rdi:rsi），
+            # 两边对不上时读到的是垃圾 —— 以前要跑到运行时才发现，这里提前拦住。
+            for pi, pt in enumerate(params):
+                if pt.kind in ("vec", "map", "pyobj", "jobj"):
+                    pn = d.params[pi].name if pi < len(d.params) else f"#{pi+1}"
+                    self.error(
+                        f"extern 函数 '{d.name}' 的参数 '{pn}' 是 FA 的 {pt}，"
+                        f"C 侧没有这个类型。请传 `{pn}: *T` 加一个长度参数，"
+                        f"或者用 str（会自动转成 char*）", d)
+                if pt.kind in ("struct", "enum", "arr"):
+                    pn = d.params[pi].name if pi < len(d.params) else f"#{pi+1}"
+                    self.error(
+                        f"extern 函数 '{d.name}' 的参数 '{pn}' 是 {pt}（按值）。"
+                        f"C 互操作只支持按指针传结构体/枚举/数组："
+                        f"FA 侧写 `{pn}: *{pt.name}`，C 侧写 `{pt.name} *{pn}`", d)
+            if ret.kind in ("vec", "map", "pyobj", "jobj"):
+                self.error(
+                    f"extern 函数 '{d.name}' 返回 FA 的 {ret}，C 侧造不出这个类型。"
+                    f"请让 C 返回指针 + 长度，在 FA 侧自己组装容器", d)
+            if ret.kind in ("struct", "enum", "arr"):
+                self.error(
+                    f"extern 函数 '{d.name}' 按值返回 {ret}，C 互操作不支持。"
+                    f"请让 C 函数把结果写进指针参数"
+                    f"（`void {d.name}({ret.name} *out, ...)`），"
+                    f"FA 侧声明成 `-> void` 并传 `&out`", d)
             if use.kind == "lib":
                 sym.lazy = True
                 self.lazy_syms.append((d.name, use.path))
@@ -363,7 +522,7 @@ class Sema:
         elif isinstance(s, Let):
             ty = self.resolve_type(s.ty) if s.ty is not None else None
             if s.init is not None:
-                ity = self.expr(s.init)
+                ity = self.expr(s.init, expect=ty)
                 if ty is None:
                     ty = ity
                     if ty.kind == "void":
@@ -377,7 +536,7 @@ class Sema:
             s.sym = sym
         elif isinstance(s, Assign):
             tt = self.expr(s.target, is_target=True)
-            vt = self.expr(s.value)
+            vt = self.expr(s.value, expect=tt)
             self.check_assignable(tt, vt, s, "赋值")
             if isinstance(s.target, NameRef):
                 v = self.scope.lookup(s.target.name)
@@ -387,7 +546,7 @@ class Sema:
         elif isinstance(s, Return):
             want = self.cur_fn.ret if self.cur_fn else VOID
             if s.value is not None:
-                vt = self.expr(s.value)
+                vt = self.expr(s.value, expect=want)
                 self.check_assignable(want, vt, s, "返回值")
             elif want.kind != "void":
                 self.error(f"函数声明返回 {want}，但 return 没有值", s)
@@ -470,6 +629,8 @@ class Sema:
             pat = arm.pattern
             if isinstance(pat, str):
                 pass
+            elif st.kind == "enum" and isinstance(pat, (Call, MethodCall)):
+                self.bind_variant_pattern(pat, st, arm)
             elif st.kind == "enum" and isinstance(pat, NameRef) \
                     and self.scope.lookup(pat.name) is None:
                 # 裸变体名写法： match c: Red: ...
@@ -491,7 +652,7 @@ class Sema:
             self.leave()
 
     # ------------------------------------------------------------- 表达式
-    def expr(self, e: Expr, is_target=False) -> Type:
+    def expr(self, e: Expr, is_target=False, expect: Optional[Type] = None) -> Type:
         if isinstance(e, NumLit):
             k = getattr(e, "kind", "") or ""
             if k.startswith("f"):
@@ -532,8 +693,19 @@ class Sema:
         if isinstance(e, Index):
             ot = self.expr(e.obj)
             it = self.expr(e.index)
+            if ot.kind == "map":
+                # m[k] / m[k] = v —— 等价于 m.get(k) / m.set(k, v)。
+                # 键类型要跟 Map 声明的键类型对得上，不再一律要求整数。
+                self.check_assignable(ot.key, it, e, "Map 键")
+                e.ty = ot.val
+                return e.ty
             if it.kind != "int":
+                # 以前不管什么类型都报「下标必须是整数」，用 m["x"] 的人
+                # 完全看不出真正的问题（Map 得用 .get/.set）。
                 self.error("下标必须是整数", e)
+            if is_target and ot.kind == "str":
+                self.error("str 不可变（字面量放在只读数据段），不能按下标赋值；"
+                           "需要可变的字符序列请用 Vec<char>", e)
             if ot.kind == "arr":
                 e.ty = ot.elem
             elif ot.kind == "vec":
@@ -549,6 +721,13 @@ class Sema:
             return e.ty
         if isinstance(e, Field):
             ot = self.expr(e.obj)
+            # 指针自动解引用：p.field（p: *S）等价于 (*p).field。
+            # 以前直接报「类型 *S 没有字段 'a'」，于是 new S{...} 拿到的指针
+            # 根本没法用（只能写 p[0].a），C/C++/Rust 过来的人第一反应都是 p.a。
+            if ot.kind == "ptr" and ot.inner is not None \
+                    and ot.inner.kind in ("struct", "enum"):
+                e.auto_deref = True
+                ot = ot.inner
             if ot.kind == "enum" and getattr(e.obj, "is_type", False):
                 # 变体构造器：Color.Red
                 for vname, _vfields, vi in ot.variants:
@@ -578,7 +757,16 @@ class Sema:
             self.error(f"类型 {ot} 没有字段 '{e.name}'", e)
         if isinstance(e, ArrayLit):
             if not e.elems:
-                self.error("空数组字面量需要类型标注（先用 let a: [i64; 0] = ...）", e)
+                # `let v: Vec<i64> = []`：元素类型从上下文标注里拿。
+                # 以前这里一律报错，逼用户改写 `Vec<i64>()`——可标注明明已经写了。
+                if expect is not None and expect.kind in ("vec", "arr"):
+                    e.ty = expect if expect.kind == "vec" else arr_of(expect.elem, 0)
+                    return e.ty
+                if expect is not None and expect.kind == "str":
+                    e.ty = STR
+                    return e.ty
+                self.error("空的 [] 需要上下文类型，例如 let v: Vec<i64> = [] "
+                           "或 let a: [i64; 3] = [1, 2, 3]", e)
             et = self.expr(e.elems[0])
             for x in e.elems[1:]:
                 t2 = self.expr(x)
@@ -641,6 +829,12 @@ class Sema:
             if e.name == "Map":
                 kt = self.resolve_type(e.targs[0])
                 vt = self.resolve_type(e.targs[1])
+                if len(e.args) % 2:
+                    self.error("Map 字面量要成对写：Map<K, V>[键: 值, ...]", e)
+                for i in range(0, len(e.args), 2):
+                    self.check_assignable(kt, self.expr(e.args[i]), e.args[i], "Map 的键")
+                    self.check_assignable(vt, self.expr(e.args[i + 1]), e.args[i + 1],
+                                          "Map 的值")
                 e.ty = T.map_of(kt, vt)
                 return e.ty
             self.error(f"未知构造器 '{e.name}'", e)
@@ -651,7 +845,106 @@ class Sema:
         if isinstance(e, RawExpr):
             e.ty = ANY
             return e.ty
+        if isinstance(e, If):
+            return self.expr_if(e)
+        if isinstance(e, Match):
+            return self.expr_match(e)
         self.error(f"未处理的表达式 {type(e).__name__}", e)
+
+    # ------------------------------------------------ if / match 作为表达式
+    #: 这些内建函数不会返回，以它们结尾的分支算「发散」，不产出值
+    DIVERGING_FNS = ("panic", "exit")
+
+    def _block_tail(self, b, node):
+        """分支的值 = 块里最后一条**表达式语句**；发散分支返回 None。"""
+        stmts = [x for x in (b.stmts if b is not None else []) if x is not None]
+        if stmts:
+            last = stmts[-1]
+            diverges = isinstance(last, (Return, Break, Continue))
+            if not diverges and isinstance(last, ExprStmt) \
+                    and isinstance(last.expr, Call) \
+                    and isinstance(last.expr.callee, NameRef) \
+                    and last.expr.callee.name in self.DIVERGING_FNS:
+                diverges = True
+            if diverges:
+                # `let y = if x > 0 { return 99 } else { x * 2 }`：
+                # 这个分支根本走不到后面，不该要求它有值、也不参与类型统一
+                b.diverges = True
+                return None
+        last = stmts[-1] if stmts else None
+        if isinstance(last, ExprStmt):
+            return last.expr
+        if isinstance(last, (If, Match)):
+            # 嵌套写法：`if a { if b { 1 } else { 2 } } else { 3 }`
+            # 块里最后一条本身就是 if / match，那它就是分支的值
+            if isinstance(last, If):
+                self.expr_if(last)
+            else:
+                self.expr_match(last)
+            return last                     # 类型已经挂在节点上（.ty）
+        self.error("if / match 用作表达式时，每个分支的最后一条语句必须是表达式"
+                   "（它就是该分支的值）；不需要值的话别写在 = 右边", node)
+
+    #: 分支类型统一时按「数值」对待的 kind（与 check_assignable 的隐式提升一致）
+    NUMERIC_KINDS = ("int", "float", "bool", "char")
+
+    def _unify_tails(self, tails, node, what) -> Type:
+        live = [t for t in tails if t is not None]
+        if not live:
+            self.error(f"作为表达式的 {what}，每个分支都发散（return / panic），"
+                       f"没有值可用；直接把它当语句写就行", node)
+        # `nil` 的默认类型是 *u8，但它其实能当任何指针用：先把它排除在统一之外
+        tys = [t.ty for t in live if not isinstance(t, NilLit) and t.ty is not None]
+        if not tys:
+            return ptr_to(TYPES["u8"])
+        ty = tys[0]
+        for t in tys[1:]:
+            if t == ty:
+                continue
+            if ty.kind in self.NUMERIC_KINDS and t.kind in self.NUMERIC_KINDS:
+                # 数值分支：有一边是浮点就整体按 f64，否则按 i64
+                ty = TYPES["f64"] if "float" in (ty.kind, t.kind) else TYPES["i64"]
+                continue
+            if ty.kind == "ptr" and t.kind == "ptr":
+                continue                   # 指针之间允许互转（同 check_assignable）
+            self.error(f"作为表达式的 {what}，各分支类型不一致：{ty} 与 {t}", node)
+        for t in live:                     # nil 分支跟上统一后的指针类型
+            if isinstance(t, NilLit) and ty.kind == "ptr":
+                t.ty = ty
+        if ty.kind in ("struct", "enum", "arr"):
+            self.error(f"作为表达式的 {what} 暂不支持 {ty} 结果（聚合值要走栈槽，"
+                       f"分支之间没法共用一份）；请先 let 一个变量，在分支里赋值", node)
+        if ty.kind == "void":
+            self.error(f"作为表达式的 {what}，分支不能是 void", node)
+        return ty
+
+    def expr_if(self, e: If) -> Type:
+        self.stmt(e)                       # 条件、分支、作用域全部复用语句那套检查
+        if e.orelse is None:
+            self.error("作为表达式的 if 必须有 else 分支（否则可能没有值）", e)
+        tails = [self._block_tail(e.body, e)]
+        tails += [self._block_tail(b, e) for _, b in e.elifs]
+        tails.append(self._block_tail(e.orelse, e))
+        e.ty = self._unify_tails(tails, e, "if")
+        return e.ty
+
+    def _enum_covered(self, e: Match) -> bool:
+        """枚举的每个变体都有分支覆盖（此时不需要 `_` 兜底）。"""
+        st = e.subject.ty
+        if st is None or st.kind != "enum" or not st.variants:
+            return False
+        got = {getattr(a.pattern, "variant_index", None) for a in e.arms}
+        return all(i in got for i in range(len(st.variants)))
+
+    def expr_match(self, e: Match) -> Type:
+        self.stmt(e)
+        has_wild = any(isinstance(a.pattern, str) and a.pattern == "_" for a in e.arms)
+        if not has_wild and not self._enum_covered(e):
+            self.error("作为表达式的 match 必须有 `_` 兜底分支，或覆盖枚举的全部变体"
+                       "（否则可能没有值）", e)
+        e.ty = self._unify_tails([self._block_tail(a.body, e) for a in e.arms],
+                                 e, "match")
+        return e.ty
 
     def expr_name(self, e: NameRef) -> Type:
         v = self.scope.lookup(e.name)
@@ -730,6 +1023,12 @@ class Sema:
             return e.ty
         lt = self.expr(e.left)
         rt = self.expr(e.right)
+        # 整数除以字面量 0：编译期就能断定是错的，别等到运行时 SIGFPE。
+        # （浮点除零是 IEEE 754 的 ±inf / nan，属于合法运算，不拦。）
+        if e.op in ("/", "%", "//") and isinstance(e.right, NumLit) \
+                and not str(getattr(e.right, "kind", "") or "").startswith("f") \
+                and e.right.value == 0 and lt.kind != "float":
+            self.error(f"整数 '{e.op}' 的右操作数是常量 0（运行时必然是除零陷阱）", e)
         # 逻辑运算
         if e.op in ("and", "or"):
             if lt.kind not in ("bool", "int") or rt.kind not in ("bool", "int"):
@@ -790,7 +1089,11 @@ class Sema:
             elif name == "abs":                       # 跟随实参类型
                 e.ty = TYPES["f64"] if (ats and ats[0].is_float) else TYPES["i64"]
             elif name in ("min", "max"):
-                e.ty = ats[0] if ats else TYPES["i64"]
+                # min(a, b) -> 标量类型；min(v) -> 容器元素类型
+                if len(ats) == 1 and ats[0].kind in ("vec", "arr", "map", "str"):
+                    e.ty = self._container_elem(ats[0])
+                else:
+                    e.ty = ats[0] if ats else TYPES["i64"]
             elif name in ("len", "i64", "to_i64", "gcd", "random", "at", "bytes"):
                 e.ty = TYPES["i64"]
             elif name in ("str", "to_str", "read_line", "concat", "env",
@@ -805,10 +1108,18 @@ class Sema:
                 e.ty = VOID
             elif name == "contains":
                 e.ty = TYPES["bool"]
-            elif name in ("sum", "min", "max", "sort"):
-                e.ty = ANY          # 由实参类型决定，见 codegen
-            elif name in ("keys", "values"):
-                e.ty = vec_of(STR)
+            elif name == "sum":
+                e.ty = self._container_elem(ats[0]) if ats else TYPES["i64"]
+            elif name in ("sort", "reverse", "push", "clear", "resize"):
+                e.ty = VOID
+            elif name == "join":
+                e.ty = STR
+            elif name == "pop":
+                e.ty = self._container_elem(ats[0]) if ats else ANY
+            elif name == "keys":
+                e.ty = vec_of(ats[0].key) if (ats and ats[0].kind == "map") else vec_of(STR)
+            elif name == "values":
+                e.ty = vec_of(ats[0].val) if (ats and ats[0].kind == "map") else vec_of(STR)
             else:
                 e.ty = ANY
             return e.ty
@@ -835,13 +1146,92 @@ class Sema:
             e.ty = ret
             return ret
         if isinstance(e.callee, Field):
-            # 枚举变体构造 Enum::Variant(...)
+            # 枚举变体构造 Enum.Variant(...)
+            if getattr(e.callee, "is_variant", False):
+                return self.check_variant_ctor(e, ct)
             ot = self.expr(e.callee.obj)
             self.error(f"不支持的调用形式", e)
         self.error(f"不能调用非函数类型 {ct}", e)
 
+    # ------------------------------------------------------- 枚举变体
+    def variant_fields(self, ety: Type, vi: int):
+        """(变体名, [(字段名, 类型, 相对载荷区的偏移)])"""
+        for (vn, fl, i) in (ety.variants or []):
+            if i == vi:
+                return vn, (fl or [])
+        return "?", []
+
+    def check_variant_args(self, e, ety: Type, vi: int) -> Type:
+        """带载荷的变体构造：Shape.Rect(3.0, 4.0)"""
+        vn, fl = self.variant_fields(ety, vi)
+        if len(fl) != len(e.args):
+            self.error(f"枚举变体 {ety.name}.{vn} 需要 {len(fl)} 个载荷，"
+                       f"实际给了 {len(e.args)} 个", e)
+        for i, a in enumerate(e.args):
+            at = self.expr(a)
+            self.check_assignable(fl[i][1], at, a,
+                                  f"{ety.name}.{vn} 的第 {i+1} 个载荷")
+        e.resolved = "enum-ctor"
+        e.variant_index = vi
+        e.ty = ety
+        return ety
+
+    def check_variant_ctor(self, e: Call, ety: Type) -> Type:
+        return self.check_variant_args(e, ety, e.callee.variant_index)
+
+    def bind_variant_pattern(self, pat, st: Type, arm):
+        """match 里的 `Shape.Rect(w, h)`：把载荷绑定到 w / h 两个局部变量。
+
+        注意 `Shape.Rect(w, h)` 会被语法分析器当成**方法调用**（obj=Shape, name=Rect），
+        只有省略枚举名写成 `Rect(w, h)` 时才是 Call(callee=NameRef)，
+        而 `f().Rect(w, h)` 那种才是 Call(callee=Field)。三种形态都要认。
+        """
+        vi, args = None, []
+        if isinstance(pat, MethodCall):
+            ot = self.expr(pat.obj)
+            if ot.kind == "enum":
+                names = [v[0] for v in (ot.variants or [])]
+                if pat.name in names:
+                    vi, st = names.index(pat.name), ot
+            args = pat.args
+        elif isinstance(pat, Call):
+            callee = pat.callee
+            if isinstance(callee, Field):
+                self.expr(callee)                   # 解析出 is_variant / variant_index
+                if getattr(callee, "is_variant", False):
+                    vi = callee.variant_index
+            elif isinstance(callee, NameRef):       # 允许省略枚举名：Rect(w, h)
+                names = [v[0] for v in (st.variants or [])]
+                if callee.name in names:
+                    vi = names.index(callee.name)
+            args = pat.args
+        if vi is None:
+            self.error(f"match 分支需要 {st} 的变体", arm)
+        vn, fl = self.variant_fields(st, vi)
+        if len(fl) != len(args):
+            self.error(f"变体 {st.name}.{vn} 有 {len(fl)} 个载荷，"
+                       f"模式里写了 {len(args)} 个绑定名", arm)
+        binds = []
+        for i, a in enumerate(args):
+            if not isinstance(a, NameRef):
+                self.error("载荷模式只能是绑定名，例如 Rect(w, h)", a)
+            fty = fl[i][1]
+            a.ty = fty
+            if a.name != "_":
+                self.scope.declare(a.name, VarSym(a.name, fty))
+                binds.append((a.name, fl[i][2], fty))
+        pat.is_variant = True
+        pat.variant_index = vi
+        pat.ty = st
+        pat.bindings = binds
+
     def expr_method(self, e: MethodCall) -> Type:
         ot = self.expr(e.obj)
+        # 枚举变体构造器在语法上和方法调用一模一样：Shape.Circle(2.0)
+        if ot.kind == "enum":
+            names = [v[0] for v in (ot.variants or [])]
+            if e.name in names:
+                return self.check_variant_args(e, ot, names.index(e.name))
         for a in e.args:
             self.expr(a)
         # 命名空间：py.* / java.*
@@ -885,12 +1275,21 @@ class Sema:
                 e.ty = TYPES["f64"]
             elif e.name in ("len", "at", "to_i64", "find", "bytes"):
                 e.ty = TYPES["i64"]
+            elif e.name == "cstr":
+                # 返回的是 FaStr 内部字节区的裸指针（**不加引用**），不是 str。
+                # 以前标成 STR，于是 `let p = s.cstr()` 会对这个 char* 调 rc_inc，
+                # 把字符串数据当成对象头去写 —— 实测直接段错误。
+                e.ty = ptr_to(TYPES["u8"])
             elif e.name in ("to_str", "slice", "trim", "upper", "lower",
-                            "replace", "cstr", "to_str_deep",
+                            "replace", "to_str_deep",
                             "repeat", "trim_start", "trim_end", "join"):
                 e.ty = STR
             elif e.name in ("split", "chars", "keys", "values", "lines"):
-                e.ty = vec_of(STR if e.name != "chars" else CHAR)
+                # Map 的 keys()/values() 元素类型跟着 K / V 走（不是 str）
+                if ot.kind == "map" and e.name in ("keys", "values"):
+                    e.ty = vec_of(ot.key if e.name == "keys" else ot.val)
+                else:
+                    e.ty = vec_of(STR if e.name != "chars" else CHAR)
             elif e.name == "count":
                 e.ty = TYPES["i64"]
             elif e.name == "index_of":
@@ -926,6 +1325,11 @@ class Sema:
                 e.ty = PYOBJ if ot.kind == "pyobj" else JOBJ
             elif e.name in ("floor", "ceil", "abs"):
                 e.ty = ot
+            elif e.name in ("round", "trunc", "sqrt", "log", "log2", "log10",
+                            "exp", "exp2", "sin", "cos", "tan"):
+                # 这些一律按 f64 返回：漏掉的话类型是 ANY，
+                # print 会把它当整数打（1.5.round() 打出 1 而不是 2.0）
+                e.ty = TYPES["f64"]
             else:
                 e.ty = ANY
             return e.ty
@@ -938,6 +1342,20 @@ class Sema:
         self.error(f"类型 {ot} 没有方法 '{e.name}'", e)
 
     # ------------------------------------------------------------- 赋值检查
+    def _container_elem(self, t: Type) -> Type:
+        """容器实参的元素类型（给 sum/min/max/pop/keys/values 推断返回类型用）"""
+        if t is None:
+            return ANY
+        if t.kind == "vec":
+            return t.elem or ANY
+        if t.kind == "arr":
+            return t.elem or ANY
+        if t.kind == "map":
+            return t.val or ANY
+        if t == STR:
+            return TYPES["char"]
+        return t if t.kind in ("int", "float") else ANY
+
     def check_assignable(self, want: Type, got: Type, node, ctx=""):
         if want == got:
             return

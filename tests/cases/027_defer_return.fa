@@ -1,0 +1,36 @@
+# defer 必须在**任何**离开作用域的路径上执行，包括 return
+fn with_return() -> i64:
+    defer print("r1")
+    defer print("r2")
+    print("body")
+    return 42
+
+fn with_value() -> str:
+    defer write("[defer]")
+    let s = "abc".replace("a", "z")
+    return s
+
+fn nested() -> i64:
+    defer print("outer")
+    let i = 0
+    while i < 2:
+        defer write("in{i} ")
+        i = i + 1
+    print("")
+    return 0
+
+fn early(n: i64) -> i64:
+    defer write("<late>")
+    if n > 0:
+        return 1
+    return 0
+
+fn main() -> i64:
+    print(with_return())
+    print(with_value())
+    nested()
+    print(early(5))
+    print("")
+    print(early(0))
+    print("")
+    return 0

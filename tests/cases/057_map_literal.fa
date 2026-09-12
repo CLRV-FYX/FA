@@ -1,0 +1,38 @@
+# Map 字面量：Map<K, V>[键: 值, ...]（以前只能先建空表再一个个 set）
+struct P:
+    x: i64
+    y: i64
+
+fn main() -> i64:
+    let m = Map<str, i64>["a": 1, "b": 2]
+    print(m["a"], m["b"], m.len())
+    m["c"] = 3
+    print(m.len(), m.has("c"), m.has("zz"))
+
+    let mf = Map<str, f64>["pi": 3.14159, "e": 2.71828]
+    print(mf["pi"], mf["e"])
+
+    let mi = Map<i64, str>[1: "一", 2: "二"]
+    print(mi[1], mi[2])
+
+    # 结构体值要装箱（否则存进去的是栈地址）
+    let mp = Map<str, P>["p": P { x: 3, y: 4 }]
+    print(mp["p"].x, mp["p"].y)
+    mp["p"].x = 30
+    print(mp["p"].x)
+
+    let empty = Map<str, i64>[]
+    print(empty.len())
+
+    let mv = Map<str, Vec<i64>>["v": Vec<i64>[1, 2, 3]]
+    print(mv["v"].len(), mv["v"][2])
+
+    # 键可以是算出来的
+    let k = "x"
+    let md = Map<str, i64>[k + "1": 10, "{k}2": 20]
+    print(md["x1"], md["x2"])
+
+    for key in m.keys() {
+        if key == "a" { print("有 a") }
+    }
+    return 0

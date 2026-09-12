@@ -1,0 +1,8 @@
+# expect-exit: 1
+# expect-stderr: 整数除以零
+# 除数是变量，编译期看不出来 -> 运行时 SIGFPE 也要转成一句人话
+fn main() -> i64:
+    let z = 0
+    let x = 10
+    print(x / z)
+    return 0

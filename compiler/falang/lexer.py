@@ -225,12 +225,31 @@ def tokenize(src: str) -> List[Token]:
         if ch == '"':
             adv()
             buf = []
+            idepth = 0                    # 插值表达式 {...} 的嵌套深度
             while True:
                 if i >= n or src[i] == "\n":
                     raise FaSyntaxError("字符串未闭合", l, c)
-                if src[i] == '"':
+                if src[i] == '"' and idepth == 0:
                     adv(); break
-                if src[i] == "\\":
+                if idepth and src[i] in "\"'":
+                    # 插值表达式里的字符串/字符字面量，例如 "{m["x"]}"：
+                    # 整体吞进 buf。以前它的引号会提前结束外层字符串，
+                    # 于是 `print("map: {m["x"]}")` 报「字符串插值 { 未闭合」。
+                    q = src[i]
+                    buf.append(q); adv()
+                    while i < n and src[i] != q:
+                        if src[i] == "\\" and i + 1 < n:
+                            buf.append(src[i]); adv()
+                        buf.append(src[i]); adv()
+                    if i >= n:
+                        raise FaSyntaxError("字符串未闭合", l, c)
+                    buf.append(q); adv()
+                    continue
+                if src[i] == "{" and not src.startswith("{{", i):
+                    idepth += 1; buf.append("{"); adv(); continue
+                if src[i] == "}" and idepth > 0:
+                    idepth -= 1; buf.append("}"); adv(); continue
+                if src[i] == "\\" and idepth == 0:
                     adv()
                     if i >= n:
                         raise FaSyntaxError("转义符后缺少字符", l, c)
@@ -250,10 +269,20 @@ def tokenize(src: str) -> List[Token]:
                             adv(); hx = ""
                             while i < n and src[i] != "}":
                                 hx += src[i]; adv()
+                            if i >= n:
+                                raise FaSyntaxError("\\u{...} 未闭合", l, c)
                             adv()
                             buf.append(chr(int(hx, 16)))
                             continue
-                        raise FaSyntaxError("\\u 需要 {....}", l, c)
+                        # 文档里写的是 \u4F60（4 位十六进制），以前只认 \u{4F60}
+                        hx = ""
+                        while len(hx) < 4 and i < n and src[i] in HEXD:
+                            hx += src[i]; adv()
+                        if len(hx) != 4:
+                            raise FaSyntaxError("\\u 需要 4 位十六进制（\\u4F60）"
+                                                "或花括号形式（\\u{4F60}）", l, c)
+                        buf.append(chr(int(hx, 16)))
+                        continue
                     if e in ESCAPES:
                         buf.append(ESCAPES[e]); adv(); continue
                     raise FaSyntaxError(f"未知转义序列 \\{e}", l, c)
@@ -269,9 +298,40 @@ def tokenize(src: str) -> List[Token]:
             if src[i] == "\\":
                 adv()
                 e = src[i]; adv()
-                chv = ESCAPES.get(e)
-                if chv is None:
-                    raise FaSyntaxError(f"未知转义 \\{e}", l, c)
+                if e == "x":
+                    hx = ""
+                    while len(hx) < 2 and i < n and src[i] in HEXD:
+                        hx += src[i]; adv()
+                    if len(hx) != 2:
+                        raise FaSyntaxError("\\x 需要两位十六进制数字", l, c)
+                    chv = chr(int(hx, 16))
+                elif e == "u":
+                    if i < n and src[i] == "{":
+                        adv(); hx = ""
+                        while i < n and src[i] != "}":
+                            hx += src[i]; adv()
+                        if i >= n:
+                            raise FaSyntaxError("\\u{...} 未闭合", l, c)
+                        adv()
+                    else:
+                        hx = ""
+                        while len(hx) < 4 and i < n and src[i] in HEXD:
+                            hx += src[i]; adv()
+                        if len(hx) != 4:
+                            raise FaSyntaxError("\\u 需要 4 位十六进制（\\u4F60）"
+                                                "或花括号形式（\\u{4F60}）", l, c)
+                    cp = int(hx, 16)
+                    if cp > 0xFF:
+                        raise FaSyntaxError(
+                            f"char 是单字节（u8），装不下 U+{cp:04X}；"
+                            f"多字节字符请写成字符串 \"\\u{cp:04X}\"", l, c)
+                    chv = chr(cp)
+                else:
+                    chv = ESCAPES.get(e)
+                    if chv is None:
+                        raise FaSyntaxError(
+                            f"未知转义 \\{e}（可用：\\n \\t \\r \\\\ \\' \\0 "
+                            f"\\xNN \\uNNNN \\u{{...}}）", l, c)
             else:
                 chv = src[i]; adv()
             if i >= n or src[i] != "'":

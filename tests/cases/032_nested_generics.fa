@@ -1,0 +1,30 @@
+# 嵌套泛型：收尾的 >> 不能被当成移位运算符
+fn main() -> i64:
+    let grid = Vec<Vec<i64>>()
+    grid.push(Vec<i64>[1, 2, 3])
+    grid.push(Vec<i64>[4, 5])
+    print(grid, grid.len())
+    print(grid.get(0).get(2), grid.get(1).len(), sum(grid.get(0)))
+
+    let words = Vec<Vec<str>>()
+    let row = Vec<str>()
+    row.push("a")
+    row.push("b")
+    words.push(row)
+    print(words, words.get(0).get(1))
+
+    let m = Map<str, Vec<i64>>()
+    let e = Vec<i64>()
+    e.push(7)
+    m.set("k", e)
+    print(m.len(), m.get("k"), m.get("k").get(0))
+
+    let deep = Vec<Vec<Vec<i64>>>()
+    let lvl2 = Vec<Vec<i64>>()
+    lvl2.push(Vec<i64>[9])
+    deep.push(lvl2)
+    print(deep.get(0).get(0).get(0))
+
+    # 移位运算本身不能被破坏
+    print(1 << 3, 8 >> 2, 8 >> 2 >> 1, (1 << 2) | (8 >> 3))
+    return 0

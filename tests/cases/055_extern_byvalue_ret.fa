@@ -1,0 +1,12 @@
+# expect-compile-error: 按值返回 Point
+# expect-compile-error: 行 5
+# 同理：C 按值返回结构体走的是 rdx:rax（或内存），FA 用的是 sret 指针约定。
+use c "gfx.h":
+    fn make_point(x: i64, y: i64) -> Point
+
+struct Point:
+    x: i64
+    y: i64
+
+fn main() -> i64:
+    return 0

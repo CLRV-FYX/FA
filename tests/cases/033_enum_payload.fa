@@ -1,0 +1,66 @@
+# 带载荷的枚举变体：构造、match 绑定、拷贝、装进容器
+struct P:
+    x: i64
+    y: i64
+
+enum Msg:
+    Quit
+    Move(x: i64, y: i64)
+    Write(text: str)
+    Color(r: i64, g: i64, b: i64)
+    Point(p: P)
+
+fn show(m: Msg) -> str:
+    match m:
+        Msg.Quit:
+            return "quit"
+        Msg.Move(x, y):
+            return "move {x},{y}"
+        Msg.Write(text):
+            return "write {text}"
+        Msg.Color(r, g, b):
+            return "color {r}/{g}/{b}"
+        Msg.Point(p):
+            return "point {p.x}/{p.y}"
+    return "?"
+
+fn sum_all(v: Vec<Msg>) -> i64:
+    let s = 0
+    let i = 0
+    while i < v.len():
+        match v.get(i):
+            Msg.Move(x, y):
+                s = s + x + y
+            Msg.Color(r, g, b):
+                s = s + r + g + b
+            _:
+                s = s + 1
+        i = i + 1
+    return s
+
+fn main() -> i64:
+    print(show(Msg.Quit))
+    print(show(Msg.Move(1, 2)))
+    print(show(Msg.Write("hello")))
+    print(show(Msg.Color(255, 128, 0)))
+    print(show(Msg.Point(P { x: 3, y: 4 })))
+
+    let v = Vec<Msg>()
+    v.push(Msg.Write("a"))
+    v.push(Msg.Move(7, 8))
+    v.push(Msg.Quit)
+    v.push(Msg.Color(1, 2, 3))
+    print(v.len(), show(v.get(0)), show(v.get(1)), sum_all(v))
+
+    let m = Msg.Write("own")
+    let n = m                       # 拷贝：str 载荷各持一份引用
+    print(show(m), show(n))
+
+    let i = 0
+    while i < 50000:                # 反复构造/释放，引用计数错一点就崩
+        let t = Msg.Write("s{i}")
+        let u = Msg.Point(P { x: i, y: i })
+        let w = t
+        i = i + 1
+    print("stress ok")
+    return 0

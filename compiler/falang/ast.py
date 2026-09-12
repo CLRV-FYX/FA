@@ -194,6 +194,9 @@ class Stmt(Node):
 class Block(Stmt):
     stmts: List[Stmt]
     flat: bool = False      # True：不新建作用域（用于元组解构这类语法糖展开）
+    # True：这个分支以 return / break / continue / panic 结尾，永远不会产出值。
+    # if / match 当表达式用时由语义分析填好，后端据此跳过「把尾表达式写进结果」。
+    diverges: bool = False
 
 
 @dataclass
@@ -359,3 +362,22 @@ class Const(Decl):
 @dataclass
 class Module(Node):
     decls: List[Decl]
+
+
+# -------------------------------------------------------------- 位置信息
+def stamp_positions(n, pline: int = 0, pcol: int = 0) -> None:
+    """自顶向下补全缺失的行/列。
+
+    解析器只在少数节点上记了位置，于是绝大多数报错都打印「行 0, 列 0」，
+    等于没有定位。这里把父节点的位置继承给还没位置的子节点，
+    保证任何诊断至少能指到它所在的那条语句/声明。
+    """
+    if isinstance(n, Node):
+        if not getattr(n, "line", 0):
+            n.line, n.col = pline, pcol
+        pline, pcol = n.line, n.col
+        for v in list(vars(n).values()):
+            stamp_positions(v, pline, pcol)
+    elif isinstance(n, (list, tuple)):
+        for v in n:
+            stamp_positions(v, pline, pcol)

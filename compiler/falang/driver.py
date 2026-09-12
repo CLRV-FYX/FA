@@ -5,6 +5,8 @@ import os
 import sys
 import glob
 import shutil
+import tempfile
+import threading
 import subprocess
 import sysconfig
 from typing import List, Optional, Tuple
@@ -64,6 +66,24 @@ def py_config() -> Tuple[List[str], List[str]]:
     return cflags, ldflags
 
 
+def py_available() -> Tuple[bool, str]:
+    """`use py` 能否真正链接：必须有 Python.h（python3-dev）。
+
+    只报「检测到了 include 目录」是不够的 —— Debian/Ubuntu 上装了 python3 但
+    没装 python3-dev 时，sysconfig 依然给出 include 路径，直到 gcc 才炸出
+    `fatal error: Python.h: No such file or directory`。这里提前判定，
+    好给用户一句可执行的安装建议。
+    """
+    inc = sysconfig.get_paths().get("include") or ""
+    if inc and os.path.exists(os.path.join(inc, "Python.h")):
+        return True, os.path.join(inc, "Python.h")
+    return False, (f"未找到 Python.h（sysconfig include = {inc or '空'}）。"
+                   f"请安装 Python 开发头文件：\n"
+                   f"    Debian/Ubuntu: sudo apt install python3-dev\n"
+                   f"    Fedora/RHEL  : sudo dnf install python3-devel\n"
+                   f"    macOS        : brew install python")
+
+
 def java_config() -> Tuple[List[str], List[str], str]:
     home = os.environ.get("JAVA_HOME")
     cands = []
@@ -90,6 +110,11 @@ def cxx() -> str:
 
 
 # --------------------------------------------------------------- 运行时构建
+# 运行时 .o 是全进程共享的缓存：同一进程内的多线程（tests/run_tests.py 并行）
+# 与不同进程（同时跑多个 fa）都可能同时构建它，因此既要加锁，也要用唯一临时名。
+_RUNTIME_LOCK = threading.Lock()
+
+
 def build_runtime(build_dir: str, with_py: bool, with_java: bool) -> List[str]:
     os.makedirs(build_dir, exist_ok=True)
     py_cflags, _ = py_config()
@@ -97,14 +122,23 @@ def build_runtime(build_dir: str, with_py: bool, with_java: bool) -> List[str]:
 
     def obj(name: str, src: str, extra: List[str], tag: str) -> str:
         out = os.path.join(build_dir, f"{name}{tag}.o")
-        if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(src):
-            return out
-        cmd = [cc(), "-O2", "-std=gnu11", "-fno-strict-aliasing",
-               f"-I{RUNTIME_DIR}", f"-I{os.path.dirname(RUNTIME_DIR)}"]
-        cmd += extra + ["-c", src, "-o", out]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"运行时编译失败 ({src}):\n{r.stderr}")
+        with _RUNTIME_LOCK:
+            if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(src):
+                return out
+            # 唯一临时名（进程 + 线程）+ 原子改名：并行构建时既不会读到半截 .o，
+            # 也不会两个线程抢同一个临时文件。
+            tmp_out = f"{out}.{os.getpid()}.{threading.get_ident()}.tmp"
+            cmd = [cc(), "-O2", "-std=gnu11", "-fno-strict-aliasing",
+                   f"-I{RUNTIME_DIR}", f"-I{os.path.dirname(RUNTIME_DIR)}"]
+            cmd += extra + ["-c", src, "-o", tmp_out]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode != 0:
+                    raise RuntimeError(f"运行时编译失败 ({src}):\n{r.stderr}")
+                os.replace(tmp_out, out)
+            finally:
+                if os.path.exists(tmp_out):
+                    os.unlink(tmp_out)
         return out
 
     objs = [obj("fa_runtime", os.path.join(RUNTIME_DIR, "fa_runtime.c"), [], ""),
@@ -142,6 +176,8 @@ def frontend(src: str, filename: str, opt: int = 2) -> CompileResult:
         res.ok = False; res.stage = "语法分析"; res.error = e.pretty(src)
     except FaTypeError as e:
         res.ok = False; res.stage = "语义分析"; res.error = e.pretty(src)
+    except CG.FaCodegenError as e:
+        res.ok = False; res.stage = "代码生成"; res.error = e.pretty(src)
     except Exception as e:
         import traceback
         res.ok = False; res.stage = "代码生成"
@@ -217,6 +253,25 @@ def build(src_path: str, out_path: str = None, emit_asm: bool = False,
         sys.stderr.write(f"[{r.stage}] {r.error}\n")
         return 1
     sema = r.sema
+
+    # 依赖预检：把「还缺什么才能编译」说成人话，而不是让 gcc 抛一堆 fatal error
+    if sema.py_used:
+        ok, info = py_available()
+        if not ok:
+            sys.stderr.write(f"[依赖缺失] 源码用了 `use py`，需要内嵌 CPython。\n{info}\n")
+            return 1
+    if sema.java_used:
+        _, _, jh = java_config()
+        if not jh:
+            sys.stderr.write("[依赖缺失] 源码用了 `use java`，但找不到 JDK"
+                             "（需要 <jdk>/include/jni.h 与 libjvm.so）。\n"
+                             "    Debian/Ubuntu: sudo apt install default-jdk\n"
+                             "    或：export JAVA_HOME=/path/to/jdk\n")
+            return 1
+    if sema.cxx_shims and shutil.which(cxx()) is None:
+        sys.stderr.write(f"[依赖缺失] 源码用了 `use cxx`（需要自动生成并编译 shim），"
+                         f"但找不到 {cxx()}。\n")
+        return 1
 
     asm_path = os.path.join(work, base + ".s")
     with open(asm_path, "w") as f:
@@ -301,13 +356,23 @@ def build(src_path: str, out_path: str = None, emit_asm: bool = False,
     return 0
 
 
-def run_file(src_path: str, args=None) -> int:
-    """编译并运行（用于测试与 fa run）"""
-    import tempfile
+def run_file(src_path: str, args=None, opt: int = 2, keep: bool = False,
+             verbose: bool = False) -> int:
+    """编译到临时目录并运行（`fa run` 与测试都走这里）。
+
+    刻意**不在源码目录留任何产物**：以前 `fa run x.fa` 会在 x.fa 旁边生成
+    可执行文件和 .fa_work/，跑一次示例就把仓库弄脏了。
+    """
     tmp = tempfile.mkdtemp(prefix="fa_run_")
-    out = os.path.join(tmp, "a.out")
-    rc = build(src_path, out, keep=True, verbose=False)
-    if rc != 0:
-        return rc
-    args = args or []
-    return subprocess.run([out] + list(args), cwd=os.path.dirname(os.path.abspath(src_path))).returncode
+    try:
+        out = os.path.join(tmp, "a.out")
+        rc = build(src_path, out, opt=opt, keep=True, verbose=verbose)
+        if rc != 0:
+            return rc
+        return subprocess.run([out] + list(args or []),
+                              cwd=os.path.dirname(os.path.abspath(src_path))).returncode
+    finally:
+        if keep:
+            print(f"[FA] 中间产物保留在 {tmp}")
+        else:
+            shutil.rmtree(tmp, ignore_errors=True)

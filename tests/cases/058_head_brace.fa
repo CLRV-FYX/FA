@@ -1,0 +1,46 @@
+# if / while / for-in / match 的头部表达式后面紧跟 `{` 时，
+# 那个 `{` 是**块**的开始，不是结构体字面量的开始。
+# 以前 `if done { ... }` 会被解析成 `if (done { ... })`，
+# 报一句莫名其妙的「期望 'NAME'，实际得到 'true'」。
+struct P:
+    x: i64
+
+fn main() -> i64:
+    # 条件就是一个裸名字
+    let done = false
+    let n = 0
+    while done == false {
+        n += 1
+        if n >= 3 { done = true }
+    }
+    print(n, done)
+
+    let ok = true
+    if ok { print("进了 if") }
+
+    let flag = 1
+    while flag > 0 {
+        print("只跑一次")
+        break
+    }
+
+    # for-in 的可迭代对象是裸名字
+    let items = Vec<i64>[1, 2, 3]
+    let sum = 0
+    for x in items { sum += x }
+    print(sum)
+
+    let m = Map<str, i64>["a": 1, "b": 2]
+    let cnt = 0
+    for k in m { cnt += m[k] }
+    print(cnt)
+
+    let arr = [P { x: 1 }, P { x: 2 }]
+    let t = 0
+    for p in arr { t += p.x }
+    print(t)
+
+    # 真要写结构体字面量做条件，加括号即可
+    let q = P { x: 5 }
+    if (q.x) > 1 { print("括号写法也行") }
+    return 0

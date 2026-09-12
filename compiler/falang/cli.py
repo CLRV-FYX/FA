@@ -13,7 +13,7 @@ USAGE = """FA (FYX-all) 编译器  ——  功能完全 + 极致速度
 命令:
   build    编译为可执行文件（默认输出同名可执行文件）
   run      编译并立即运行
-  asm      只输出 x86-64 汇编（.s）
+  asm      只输出 x86-64 汇编（打到 stdout，并存一份 <源文件名>.s；-o 可指定路径）
   check    只做语法/类型检查，不生成代码
   tokens   转储词法分析结果（自举比对用）
   ast      转储语法树（自举比对用）
@@ -24,7 +24,7 @@ USAGE = """FA (FYX-all) 编译器  ——  功能完全 + 极致速度
   -O <0-3>     优化级别（默认 2）
   -v           显示详细过程
   -k           保留中间产物
-  --emit-asm   额外导出汇编文件
+  --emit-asm   build 时额外导出一份汇编文件
 
 示例:
   fa run hello.fa
@@ -39,13 +39,16 @@ def main(argv=None) -> int:
         print(USAGE)
         return 0
     if argv[0] == "version":
-        from .driver import py_config, java_config, RUNTIME_DIR
-        pyc, _ = py_config()
+        from .driver import py_available, java_config, RUNTIME_DIR, cc, cxx
+        import shutil as _sh
+        pyok, pyinfo = py_available()
         _, _, jh = java_config()
-        print("FA 编译器 0.1.0 (bootstrap: python)  目标: x86-64 Linux System V")
+        print("FA 编译器 0.2.0 (bootstrap: python)  目标: x86-64 Linux System V")
         print(f"  运行时目录 : {RUNTIME_DIR}")
-        print(f"  CPython    : {pyc or '未检测到'}")
-        print(f"  JVM        : {jh or '未检测到'}")
+        print(f"  C 编译器   : {cc()}{'（未找到）' if _sh.which(cc()) is None else ''}"
+              f"   C++: {cxx()}{'（未找到）' if _sh.which(cxx()) is None else ''}")
+        print(f"  CPython    : {'可用 ' + pyinfo if pyok else '不可用（use py 会报错并给出安装建议）'}")
+        print(f"  JVM        : {jh or '未检测到（use java 会报错并给出安装建议）'}")
         return 0
 
     cmd = argv[0]
@@ -111,8 +114,34 @@ def main(argv=None) -> int:
         print(r.error)
         return 1
 
-    rc = build(src, out, emit_asm=(emit_asm or cmd == "asm"), opt=opt,
-               run=(cmd == "run"), keep=keep, verbose=verbose)
+    if cmd == "asm":
+        # 「只输出汇编」就真的只跑前端：不汇编、不链接（比以前快一个量级），
+        # 汇编写到 stdout（可以直接 `fa asm x.fa | less`），同时在源码旁存一份 x.s。
+        # 给了 -o 就只写 -o 指定的文件，stdout 只留一行提示。
+        with open(src) as f:
+            r = frontend(f.read(), src, opt)
+        if not r.ok:
+            print(f"[{r.stage}] {r.error}")
+            return 1
+        if out:
+            with open(out, "w") as f:
+                f.write(r.asm)
+            print(f"✓ 汇编已写入 {out}（{r.asm.count(chr(10))} 行）")
+        else:
+            side = os.path.join(os.path.dirname(os.path.abspath(src)),
+                                os.path.splitext(os.path.basename(src))[0] + ".s")
+            with open(side, "w") as f:
+                f.write(r.asm)
+            sys.stdout.write(r.asm)
+            sys.stderr.write(f"[FA] 同时存了一份 -> {side}\n")
+        return 0
+
+    if cmd == "run":
+        # 走临时目录：不在源码旁留可执行文件与 .fa_work/，并且把 `--` 之后的参数传给程序
+        from .driver import run_file
+        return run_file(src, prog_args, opt=opt, keep=keep, verbose=verbose)
+    rc = build(src, out, emit_asm=emit_asm, opt=opt,
+               run=False, keep=keep, verbose=verbose)
     return rc
 
 

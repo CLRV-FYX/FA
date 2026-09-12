@@ -5,14 +5,34 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* kind 编码（与 compiler/falang/types.py 保持一致） */
+/* kind 编码（与 compiler/falang/types.py 保持一致）—— 决定「怎么释放」 */
 #define FA_K_NONE 0
 #define FA_K_STR  1
 #define FA_K_VEC  2
 #define FA_K_MAP  3
 #define FA_K_PY   4
 #define FA_K_JOBJ 5
-#define FA_K_BOX  6
+#define FA_K_BOX  6                   /* 装箱的纯数据结构体：释放时直接 free */
+#define FA_K_STRUCT_DESC_BASE   1000  /* +desc_id：内联/嵌套结构体，释放字段但不 free */
+#define FA_K_BOXED_STRUCT       2000  /* +desc_id：容器里装箱的结构体，释放字段 + free */
+
+/* 元素类型编码（与 compiler/falang/types.py 的 ty_code() 一致）—— 决定「怎么显示」
+   kind 只够用来做引用计数，分不清 i64 / u64 / f64 / bool / char，
+   所以容器额外记一个类型码，to_str / join / print 才能格式化正确。 */
+#define FA_TY_INT    0   /* 宽度看 esz，符号看 sgn */
+#define FA_TY_FLOAT  1   /* 一律按 double 解释（f32 在表达式里已提升为 f64） */
+#define FA_TY_BOOL   2
+#define FA_TY_CHAR   3
+#define FA_TY_STR    4
+#define FA_TY_VEC    5
+#define FA_TY_MAP    6
+#define FA_TY_STRUCT 7
+#define FA_TY_PYOBJ  8
+#define FA_TY_JOBJ   9
+#define FA_TY_PTR    10
+#define FA_TY_ENUM   11
+#define FA_TY_ARR    12
+#define FA_TY_ANY    13
 
 typedef struct FaStr {
     int64_t  rc;
@@ -28,6 +48,7 @@ typedef struct FaVec {
     uint64_t *data;     /* 必须保持在偏移 32：codegen 内联的 get/set/len 直接用这个偏移 */
     int64_t  esz;       /* 元素存储宽度：1/2/4/8 字节 */
     int64_t  sgn;       /* 窄元素是否有符号（决定零扩展还是符号扩展） */
+    int64_t  ety;       /* 元素类型码 FA_TY_*（显示用；偏移 56，绝不可挪到 data 之前） */
 } FaVec;
 
 typedef struct FaMapEntry {
@@ -43,6 +64,8 @@ typedef struct FaMap {
     int64_t     kkind;
     int64_t     vkind;
     FaMapEntry *entries;
+    int64_t     kty;    /* 键类型码 FA_TY_*（显示用） */
+    int64_t     vty;    /* 值类型码 FA_TY_*（显示用） */
 } FaMap;
 
 /* 桥接模块的引用释放钩子 */
@@ -55,6 +78,12 @@ void  fa_free(void *p);
 void  fa_rc_inc(void *p);
 void  fa_rc_dec(void *p, int64_t kind);
 void  fa_register_desc(int64_t id, int64_t *desc);
+void  fa_register_retain(int64_t id, void (*fn)(void *));
+void  fa_register_drop(int64_t id, void (*fn)(void *));
+
+/* 定长数组的批量增减引用（fn != NULL 时元素是内联结构体） */
+void  fa_drop_arr(void *base, int64_t count, int64_t esz, int64_t kind, void (*fn)(void *));
+void  fa_retain_arr(void *base, int64_t count, int64_t esz, int64_t kind, void (*fn)(void *));
 
 /* --- 字符串 --- */
 FaStr *fa_str_new(const char *s, int64_t len);
@@ -128,7 +157,7 @@ void    fa_set_args(int64_t argc, char **argv);
 FaVec  *fa_args(void);
 
 /* --- 容器 --- */
-FaVec *fa_vec_new(int64_t kind, int64_t esz, int64_t sgn);
+FaVec *fa_vec_new(int64_t kind, int64_t esz, int64_t sgn, int64_t ety);
 int64_t fa_vec_len(FaVec *v);
 void    fa_vec_push(FaVec *v, uint64_t val);
 uint64_t fa_vec_get(FaVec *v, int64_t i);
@@ -139,7 +168,7 @@ void    fa_bounds_error(void);
 int64_t fa_vec_contains(FaVec *v, uint64_t val);
 void    fa_vec_resize(FaVec *v, int64_t n, uint64_t val);
 
-FaMap *fa_map_new(int64_t kkind, int64_t vkind);
+FaMap *fa_map_new(int64_t kkind, int64_t vkind, int64_t kty, int64_t vty);
 int64_t fa_map_len(FaMap *m);
 uint64_t fa_map_get(FaMap *m, uint64_t key);
 void    fa_map_set(FaMap *m, uint64_t key, uint64_t val);
