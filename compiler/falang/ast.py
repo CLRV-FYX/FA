@@ -360,6 +360,22 @@ class Const(Decl):
 
 
 @dataclass
+class Global(Decl):
+    """顶层 `let`：全局可变变量。
+
+    与 `const` 的区别：const 是编译期常量（每次用到就重新求值一遍初值表达式），
+    全局变量有**唯一一份存储**（.bss 里的一个槽），可以被任何函数读写。
+    初值在 main 的第一条用户语句之前执行一次（没有初值就是零值）。
+    """
+    name: str
+    ty: Optional[Type]
+    init: Optional[Expr]
+    mutable: bool = True
+    gty: Any = None          # sema 解析出的实际类型
+    sym: Any = None          # VarSym(is_global=True)
+
+
+@dataclass
 class Module(Node):
     decls: List[Decl]
 

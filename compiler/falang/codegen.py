@@ -277,6 +277,9 @@ class FnGen:
                 loc = VarLoc("temp", src, pty, borrowed=True, sym=sym)
             sc.vars[p.name] = loc
 
+        if self.fnsym.name == "main" and getattr(self.sema, "global_decls", None):
+            # 顶层 let 的初值：语义上「在 main 之前执行」，实现上放在 main 最前面
+            self.gen_global_inits()
         self.gen_block(self.body)
 
         # 函数体结尾兜底 return
@@ -551,6 +554,56 @@ class FnGen:
             self.err(f"未支持语句 {type(s).__name__}", s)
         self.flush_owned()
 
+    # ------------------------------------------------- 顶层 let（全局可变变量）
+    def is_global_name(self, name: str) -> bool:
+        """这个名字此刻指的是全局变量吗？（局部/形参同名时局部优先）"""
+        return name in self.sema.globals and self.scope.lookup(name) is None
+
+    def global_addr(self, name: str) -> Temp:
+        """取全局槽的地址（rip 相对），地位相当于局部变量的 alloca 槽。"""
+        g = self.sema.globals[name]
+        t = self.new_temp(ptr_to(g.ty))
+        self.emit("LEA_SYM", t, extra=g.label)
+        return t
+
+    def gen_global_read(self, name: str):
+        """读全局：和读局部变量一样给出**借用**引用（需要自己一份的调用方
+        ——`let s = g` / `v.push(g)`—— 会各自 inc，规则完全一致）。"""
+        gt = self.sema.globals[name].ty
+        addr = self.global_addr(name)
+        if is_agg(gt):
+            return addr                      # 数组：值就是那块存储本身
+        t = self.new_temp(gt)
+        self.emit("LOAD", t, [addr], extra=0, ty=gt)
+        return t
+
+    def gen_global_write(self, name: str, vexpr):
+        """写全局：引用计数类型要「新值取得一份 -> 放掉旧值 -> 存进去」。"""
+        gt = self.sema.globals[name].ty
+        raw = self.gen_expr(vexpr)
+        addr = self.global_addr(name)
+        if is_agg(gt):
+            self.emit_assign_agg(addr, raw, gt)
+            return
+        v = self.coerce(raw, vexpr.ty, gt)
+        if T.t_is_refcounted(gt):
+            if not self.take_owned(v, vexpr.ty):
+                self.emit_rcinc(v, gt)       # 全局取得自己的一份（活到进程结束）
+            old = self.new_temp(gt)
+            self.emit("LOAD", old, [addr], extra=0, ty=gt)
+            self.emit_rcdec_val(old, gt)     # 放掉被覆盖的旧值
+        self.emit("STORE", args=[addr, v], extra=0, ty=gt)
+
+    def gen_global_inits(self):
+        """main 的第一条用户语句之前，把每个顶层 let 的初值算一遍。
+
+        没有初值的（`let n: i64`）不用管：槽在 .bss 里，天然就是零值。
+        """
+        for d in getattr(self.sema, "global_decls", []):
+            if d.init is None:
+                continue
+            self.gen_global_write(d.name, d.init)
+
     def gen_let(self, s: Let):
         ty = s.sym.ty
         if s.init is None:
@@ -597,6 +650,9 @@ class FnGen:
     def gen_assign(self, s: Assign):
         tgt = s.target
         vty = s.value.ty
+        if isinstance(tgt, NameRef) and self.is_global_name(tgt.name):
+            self.gen_global_write(tgt.name, s.value)
+            return
         if isinstance(tgt, NameRef):
             loc = self.scope.lookup(tgt.name)
             if loc is None:
@@ -1137,11 +1193,8 @@ class FnGen:
         return loc
 
     def gen_nameref(self, e: NameRef):
-        if e.name in self.sema.globals:
-            g = self.sema.globals[e.name]
-            t = self.new_temp(g.ty)
-            self.emit("LOAD", t, [Sym(g.name)], extra=0, ty=g.ty)
-            return t
+        if self.is_global_name(e.name):
+            return self.gen_global_read(e.name)
         if e.name in self.sema.consts:
             return self.gen_expr(self.sema.consts[e.name])
         if e.resolved == "ns":
@@ -1378,6 +1431,8 @@ class FnGen:
 
     def gen_addrof1(self, operand: Expr) -> Temp:
         if isinstance(operand, NameRef):
+            if self.is_global_name(operand.name):
+                return self.global_addr(operand.name)   # &全局：拿到 .bss 里的地址
             loc = self.var_loc(operand.name, operand)
             if loc.kind == "mem":
                 return loc.val
@@ -1398,6 +1453,9 @@ class FnGen:
     def gen_addr(self, e: Expr) -> Tuple[Temp, Any, Type]:
         """返回 (基址指针 Temp, 偏移(常量或Temp), 类型)"""
         if isinstance(e, NameRef):
+            if self.is_global_name(e.name):
+                g = self.sema.globals[e.name]
+                return self.global_addr(e.name), 0, g.ty
             loc = self.var_loc(e.name, e)
             if loc.kind == "mem":
                 return loc.val, 0, loc.ty
@@ -2647,6 +2705,13 @@ class FnGen:
 def generate(sema: Sema) -> IRModule:
     mod = IRModule()
     mod.descs = sema.descs
+    # 顶层 let 的存储：(汇编标签, 字节数)。asmgen 在 .bss 里逐个开槽。
+    mod.gvar_slots = []
+    for d in getattr(sema, "global_decls", []):
+        if d.sym is None:
+            continue                          # 语义阶段已经报过错
+        gt = d.sym.ty
+        mod.gvar_slots.append((d.sym.label, max(gt.size if is_agg(gt) else 8, 8)))
     for sym, body, params in getattr(sema, "fn_bodies_plain", []):
         pass
     for item in sema.fn_bodies:

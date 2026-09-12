@@ -181,6 +181,14 @@ class AsmGen:
                 self.R(f"    .asciz \"{name}\"")
             self.R("__fa_lazy_lib:")
             self.R(f"    .asciz \"{self.sema.lazy_syms[0][1]}\"")
+        # 顶层 let 的全局变量槽（.bss 天然清零，所以「没写初值」就等于零值）
+        gvars = getattr(self.mod, "gvar_slots", None)
+        if gvars:
+            self.R("    .section .bss")
+            self.R("    .align 8")
+            for label, size in gvars:
+                self.R(f"{label}:")
+                self.R(f"    .zero {size}")
         # 函数
         self.R("    .text")
         for f in self.mod.funcs:

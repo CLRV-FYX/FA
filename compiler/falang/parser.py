@@ -152,12 +152,15 @@ class Parser:
             return self.parse_impl()
         if self.at_kw("const"):
             return self.parse_const()
+        if self.at_kw("let"):
+            # 顶层 let = 全局可变变量（函数体内的 let 还是普通局部变量）
+            return self.parse_global()
         if self.at_kw("extern"):
             return self.parse_extern_block()
         if self.at_kw("unsafe"):
             self.next()
             return self.parse_decl()
-        self.err(f"顶层只允许 use/fn/struct/enum/impl/const/extern 声明，得到 '{t.value}'")
+        self.err(f"顶层只允许 use/fn/struct/enum/impl/const/let/extern 声明，得到 '{t.value}'")
 
     # ---------------------------------------------------------- use
     def parse_use(self) -> Use:
@@ -491,6 +494,22 @@ class Parser:
         init = self.parse_expr()
         return Const(name=name, ty=ty, init=init)
 
+    def parse_global(self) -> Global:
+        """顶层 `let name[: ty] [= init]` —— 全局可变变量。"""
+        self.expect_kw("let")
+        name = self.expect(NAME).value
+        ty = None
+        if self.at(P, ":"):
+            self.next()
+            ty = self.parse_type()
+        init = None
+        if self.at_op("="):
+            self.next()
+            init = self.parse_expr()
+        if ty is None and init is None:
+            self.err(f"全局变量 '{name}' 需要初值或类型标注（例如 `let n = 0`）")
+        return Global(name=name, ty=ty, init=init)
+
     # ---------------------------------------------------------- 块与语句
     def parse_block(self, scope: str = "block") -> Block:
         if self.at(P, "{"):
@@ -554,6 +573,11 @@ class Parser:
             return None
         if self.at_kw("let"):
             return self.parse_let()
+        if self.at(P, "{"):
+            # 裸块语句：开一个新作用域（`{ let x = 1 }` 里的 x 出了块就没了）。
+            # sema / codegen 早就支持 Block 当语句用，只有语法分析这里没接上，
+            # 于是文档里写的「{} 是空块」实际上会报「无法解析的表达式起始 token '{'」。
+            return self.parse_block("block")
         if self.at_kw("return"):
             self.next()
             val = None

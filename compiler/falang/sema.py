@@ -126,6 +126,7 @@ class Sema:
         self.fns: Dict[str, FnSym] = {}
         self.methods: Dict[Tuple[str, str], FnSym] = {}     # (TypeName, method) -> FnSym
         self.globals: Dict[str, VarSym] = {}
+        self.global_decls: List[Any] = []    # 顶层 let，按声明顺序（初值也按此顺序执行）
         self.uses: List[Use] = []
         self.consts: Dict[str, Expr] = {}
         self.descs: List[Type] = []        # 需要 RC 描述符的结构体
@@ -317,6 +318,10 @@ class Sema:
                     self.layout_struct_decl(sub)
                 elif isinstance(sub, ImplDef):
                     self.register_impl(sub)
+        # 顶层 let：全局变量的类型与初值（此时结构体/枚举已布局、函数签名已注册，
+        # 所以初值里可以写 `Vec<str>[]`、结构体字面量、甚至调用函数）
+        for d in self.global_decls:
+            self.check_global(d)
         # 第二遍：检查函数体
         for d in self.mod.decls:
             if isinstance(d, FnDef) and d.body is not None:
@@ -347,6 +352,46 @@ class Sema:
                 self.enum_decls[d.name] = d
         elif isinstance(d, Const):
             self.consts[d.name] = d.init
+        elif isinstance(d, Global):
+            self.global_decls.append(d)
+
+    def check_global(self, d):
+        """检查一条顶层 `let`，并登记成全局符号。
+
+        初值表达式在「不属于任何函数」的作用域里检查：没有 self、不能 return /
+        break，能用的只有字面量、其它全局、const 和函数调用。
+        """
+        self.enter(None)
+        try:
+            ity = self.expr(d.init) if d.init is not None else None
+        finally:
+            self.leave()
+        if d.ty is not None:
+            want = self.resolve_type(d.ty)
+            if ity is not None:
+                self.check_assignable(want, ity, d, "全局变量初值")
+            d.gty = want
+        elif ity is not None:
+            d.gty = ity
+        else:
+            self.error("全局变量必须有初值或类型标注", d)
+            return
+        if d.gty.kind in ("struct", "enum"):
+            # 结构体/枚举是值类型，槽要按 ty.size 开；读写还要走「拷贝 + 逐字段
+            # 引用计数」那套（emit_init_agg / emit_assign_agg）。先不做，给一句
+            # 明确的错，而不是生成半对的代码。
+            self.error(f"全局变量暂不支持结构体/枚举类型 {d.gty}"
+                       f"（改用 Vec<{d.gty.name}> / Map / 指针，或把字段拆成单独的全局）", d)
+            return
+        if d.gty.kind == "fn":
+            self.error("全局变量暂不支持函数类型（用 const 或把函数名直接当值传）", d)
+            return
+        sym = VarSym(d.name, d.gty, mutable=True, is_global=True)
+        # 汇编标签加前缀，免得和 C 符号 / 函数名（fa_xxx）撞上
+        sym.label = f"__fa_g_{d.name}"
+        sym.decl = d
+        d.sym = sym
+        self.globals[d.name] = sym
 
     def layout_struct_decl(self, d: StructDef):
         t = self.structs.get(d.name)
@@ -951,6 +996,12 @@ class Sema:
             e.resolved = v
             e.ty = v.ty
             return v.ty
+        g = self.globals.get(e.name)
+        if g is not None:
+            # 局部作用域里没有同名变量时才落到全局（和 C/Python 的作用域规则一致）
+            e.resolved = g
+            e.ty = g.ty
+            return g.ty
         f = self.fns.get(e.name)
         if f is not None:
             t = Type("fn", "fn", 8, 8)
