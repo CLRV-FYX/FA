@@ -1,0 +1,38 @@
+# ---- 编译中间产物（可由 fa 重新生成，绝不入库）----
+build/
+.fa_work/
+*.o
+*.s
+!runtime/*.S
+*.so.tmp
+
+# ---- fa run / fa build 在源码目录留下的可执行文件 ----
+# （只忽略已知产物名，避免误伤示例源码）
+/examples/hello
+/examples/ffi_c
+/examples/ffi_cpp
+/examples/ffi_python
+/examples/ffi_java
+/bench/fa_fib
+/bench/fa_loop
+/bench/fa_primes
+/bench/c_fib
+/bench/c_loop
+/bench/c_primes
+/bench/fib
+/bench/loop
+/bench/primes
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ---- 备份 / 编辑器 ----
+*.tar.gz
+*.swp
+*~
+.DS_Store
+# ---- 由测试运行器按需从 mathlib.cpp 构建，不入库 ----
+tests/cases/cpp/*.so
+examples/cpp/*.so.tmp

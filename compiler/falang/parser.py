@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 from typing import List, Optional
-from .lexer import tokenize, split_interpolation, FaSyntaxError
+from .lexer import tokenize, Token, split_interpolation, FaSyntaxError
 from .ast import *
+from .ast import stamp_positions, Node
 
 KW = "KW"
 NAME = "NAME"
@@ -37,6 +38,7 @@ class Parser:
         self.toks = tokenize(src)
         self.pos = 0
         self.in_braces = 0          # 处于 {} 内部时，换行无意义，需要 ';'
+        self.no_struct_lit = 0      # >0 时 `Name {` 不当结构体字面量（见 parse_match）
 
     # ---------------------------------------------------------- 工具
     def peek(self, k: int = 0):
@@ -121,6 +123,10 @@ class Parser:
         return Module(decls)
 
     def parse_decl(self) -> Optional[Decl]:
+        tok = self.cur()
+        return self.stamp(self._parse_decl(), tok)
+
+    def _parse_decl(self) -> Optional[Decl]:
         t = self.cur()
         if t.kind in ("NEWLINE", "INDENT", "DEDENT"):
             self.next()
@@ -495,6 +501,11 @@ class Parser:
                 self.skip_terms()
                 if self.at(P, "}"):
                     break
+                if self.at("EOF"):
+                    # 少写一个 } 时，以前会一路吃到文件末尾，然后报
+                    # 「无法解析的表达式起始 token 'None'」，完全看不出是括号没闭合。
+                    raise FaSyntaxError("缺少 '}'（块未闭合）",
+                                        self.cur().line, self.cur().col)
                 s = self.parse_stmt()
                 if s is not None:
                     stmts.append(s)
@@ -507,8 +518,16 @@ class Parser:
         if self.at("NEWLINE"):
             self.next()
         if not self.at("INDENT"):
-            raise FaSyntaxError("这里需要一个缩进代码块（或用 {} 包裹）",
-                                self.cur().line, self.cur().col)
+            # 单行块：`Color.Red: return "红"`、`if x > 0: return 1`、`else: y = 2`。
+            # 以前这里一律报错，只有「换行 + 缩进」和 `{}` 两种写法能用，
+            # 而单行分支恰恰是 match 最常见的写法。
+            if (self.at("EOF") or self.at("DEDENT") or self.at("NEWLINE")
+                    or self.at(P, "}") or self.at(P, ")")):
+                raise FaSyntaxError("这里需要一个缩进代码块（或用 {} 包裹）",
+                                    self.cur().line, self.cur().col)
+            s1 = self.parse_stmt()
+            self.skip_terms()
+            return Block([s1] if s1 is not None else [])
         self.expect("INDENT")
         stmts = []
         while not self.at("DEDENT") and not self.at("EOF"):
@@ -523,6 +542,10 @@ class Parser:
         return Block(stmts)
 
     def parse_stmt(self) -> Optional[Stmt]:
+        tok = self.cur()
+        return self.stamp(self._parse_stmt(), tok)
+
+    def _parse_stmt(self) -> Optional[Stmt]:
         t = self.cur()
         if t.kind in ("NEWLINE", "INDENT") or self.at(P, ";"):
             self.next()
@@ -692,7 +715,14 @@ class Parser:
 
     def parse_match(self) -> Match:
         self.expect_kw("match")
-        subj = self.parse_expr()
+        # `match x { ... }` 的花括号形式以前根本走不到：解析主语时 `x {`
+        # 被当成结构体字面量吃掉了，于是报「期望 'NAME'，实际得到 'NUM'」。
+        # 解析 match 主语时暂时禁掉结构体字面量（要匹配字面量可以加括号）。
+        self.no_struct_lit += 1
+        try:
+            subj = self.parse_expr()
+        finally:
+            self.no_struct_lit -= 1
         arms = []
         if self.at(P, "{"):
             self.next()
@@ -780,6 +810,7 @@ class Parser:
                     if self.at(P, ","):
                         self.next(); continue
                     break
+                self.split_gt()
                 self.expect_op(">")
             t = TName(name, args)
             if self.at_op("?"):
@@ -792,13 +823,33 @@ class Parser:
             t = TOptional(t)
         return t
 
+    def split_gt(self):
+        """`Vec<Vec<i64>>` / `Map<str, Vec<i64>>` 的收尾 `>>` 会被词法分析当成
+        一个移位运算符，于是嵌套泛型根本写不出来（C++ 早年也有同样的坑）。
+        在**类型参数**位置遇到 `>>`/`>>>` 时就地拆成 `>` + 余下部分。"""
+        t = self.cur()
+        if t.kind == OP and t.value in (">>", ">>>"):
+            self.toks[self.pos] = Token(OP, ">", t.line, t.col)
+            self.toks.insert(self.pos + 1,
+                             Token(OP, t.value[1:], t.line, t.col + 1))
+
     def expect_op(self, op):
         if self.at_op(op):
             return self.next()
         self.err(f"期望运算符 '{op}'")
 
     # ---------------------------------------------------------- 表达式
+    def stamp(self, node, tok):
+        """给还没有位置的节点盖上 tok 的行/列（AST 基类默认 line=col=0）"""
+        if isinstance(node, Node) and not getattr(node, "line", 0) and tok is not None:
+            node.line, node.col = tok.line, tok.col
+        return node
+
     def parse_expr(self, min_prec: int = 0) -> Expr:
+        tok = self.cur()
+        return self.stamp(self._parse_expr(min_prec), tok)
+
+    def _parse_expr(self, min_prec: int = 0) -> Expr:
         lhs = self.parse_unary()
         while True:
             t = self.cur()
@@ -823,6 +874,10 @@ class Parser:
         return lhs
 
     def parse_unary(self) -> Expr:
+        tok = self.cur()
+        return self.stamp(self._parse_unary(), tok)
+
+    def _parse_unary(self) -> Expr:
         t = self.cur()
         if t.kind == OP and t.value in ("-", "+", "!", "~"):
             self.next()
@@ -857,6 +912,10 @@ class Parser:
         return e
 
     def parse_postfix(self, e: Expr) -> Expr:
+        tok = self.cur()
+        return self.stamp(self._parse_postfix(e), tok)
+
+    def _parse_postfix(self, e: Expr) -> Expr:
         while True:
             if self.at(P, "("):
                 args = self.parse_args()
@@ -895,6 +954,10 @@ class Parser:
         return args
 
     def parse_primary(self) -> Expr:
+        tok = self.cur()
+        return self.stamp(self._parse_primary(), tok)
+
+    def _parse_primary(self) -> Expr:
         t = self.cur()
         if t.kind == "NUM":
             self.next()
@@ -931,6 +994,7 @@ class Parser:
                         if self.at(P, ","):
                             self.next(); continue
                         break
+                    self.split_gt()
                     if not self.at_op(">"):
                         raise FaSyntaxError("泛型参数需要以 '>' 结束")
                     self.next()
@@ -956,7 +1020,7 @@ class Parser:
                 # 内置转换，如 i64(x)
                 args = self.parse_args()
                 return Cast(args[0] if args else NilLit(), TName(name))
-            if self.at(P, "{"):
+            if self.at(P, "{") and not self.no_struct_lit:
                 self.next()
                 fields = []
                 while not self.at(P, "}"):
@@ -1011,4 +1075,6 @@ class Parser:
 
 def parse(src: str, filename: str = "<input>") -> Module:
     p = Parser(src, filename)
-    return p.parse_module()
+    mod = p.parse_module()
+    stamp_positions(mod)          # 兜底：任何还没位置的节点继承父节点的位置
+    return mod

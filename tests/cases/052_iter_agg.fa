@@ -1,0 +1,58 @@
+# 遍历与聚合下标：这一组以前有四个 bug
+#   * for x in Vec<f64>      —— CALL 的目标类型标成 f64，asmgen 去读 xmm0，
+#                               而 fa_vec_get 的位模式在 rax 里（打出 4.94e-324）
+#   * for s in Vec<结构体>    —— 循环变量绑成「值」，里面装的其实是装箱指针
+#   * for s in [结构体; N]    —— 直接 LOAD 一个 16 字节的值，asmgen 宽度表 KeyError: 16
+#   * es[1]（聚合数组下标）    —— load_ptr 丢掉了偏移量，永远拿到第 0 个元素
+struct S:
+    a: i64
+    name: str
+
+enum E:
+    A
+    B(n: i64)
+    C(s: str)
+
+fn main() -> i64:
+    let fv = Vec<f64>[1.5]
+    push(fv, 2.5)
+    for x in fv:
+        write("{x} ")
+    print("")
+
+    let vs: Vec<S> = []
+    push(vs, S { a: 1, name: "x" })
+    push(vs, S { a: 2, name: "y" })
+    for s in vs:
+        write("{s.a}{s.name} ")
+    print("")
+
+    let arr = [S { a: 3, name: "p" }, S { a: 4, name: "q" }]
+    for s in arr:
+        write("{s.a}{s.name} ")
+    print("")
+    print(arr[1].a, arr[1].name)
+
+    let es = [E.A, E.B(2), E.C("c")]
+    for e in es:
+        match e:
+            E.A: write("A ")
+            E.B(n): write("B{n} ")
+            E.C(s): write("C{s} ")
+    print("")
+    match es[1]:
+        E.B(n): print("es[1]=B", n)
+        _: print("es[1]=?")
+    match es[2]:
+        E.C(s): print("es[2]=C", s)
+        _: print("es[2]=?")
+
+    # 花括号形式的 match + 单行分支（以前 { 被当成结构体字面量吃掉，解析不了）
+    let e2 = E.B(7)
+    match e2 { E.B(n): print("brace", n) _: print("brace ?") }
+    let m = Map<f64, str>()
+    m.set(1.5, "a")
+    for k in m:
+        write("{k} ")
+    print("")
+    return 0

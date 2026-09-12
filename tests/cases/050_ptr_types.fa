@@ -1,0 +1,59 @@
+# 指针与递归类型：
+#   * p.field 自动解引用（以前报「类型 *S 没有字段 'a'」，new 出来的对象没法用）
+#   * 自引用结构体 / 递归枚举 / 互相引用（以前 *Node 被解析成 *None）
+struct Node:
+    val: i64
+    name: str
+    next: *Node
+
+enum List:
+    Nil
+    Cons(v: i64, next: *List)
+
+struct A:
+    b: *B
+    tag: str
+
+struct B:
+    a: *A
+    n: i64
+
+fn bump(s: *Node, k: i64):
+    s.val = s.val + k
+
+fn sum_list(l: *List) -> i64:
+    if l == nil:
+        return 0
+    match *l:
+        List.Nil:
+            return 0
+        List.Cons(v, next):
+            return v + sum_list(next)
+    return 0
+
+fn main() -> i64:
+    let a = new Node { val: 1, name: "a", next: nil }
+    let b = new Node { val: 2, name: "b", next: a }
+    print(a.val, a.name)
+    print(b.val, b.next.val, b.next.name)
+    b.next.val = 99
+    print(a.val)
+    a.name = "renamed"
+    print(b.next.name)
+    bump(a, 1)
+    print(a.val, (*a).val, a[0].val)
+
+    let s = Node { val: 5, name: "stack", next: nil }
+    let p = &s
+    print(p.val, p.name)
+    p.val = 6
+    print(s.val)
+
+    let l = new List.Cons(1, new List.Cons(2, new List.Cons(3, nil)))
+    print(sum_list(l), sum_list(nil))
+
+    let x = new A { b: nil, tag: "a" }
+    let y = new B { a: x, n: 7 }
+    x.b = y
+    print(x.tag, x.b.n, x.b.a.tag)
+    return 0

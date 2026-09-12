@@ -1,0 +1,8 @@
+# expect-exit: 1
+# expect-stderr: pop from empty vec
+fn main() -> i64:
+    let v = Vec<i64>()
+    v.push(1)
+    print(v.pop())
+    print(v.pop())
+    return 0

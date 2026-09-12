@@ -1,0 +1,31 @@
+# C 互操作里的字符串：str 要自动转成 char*，C 返回的 char* 也要能拿回来。
+# 以前只有「可变参数」那条路做了转换，声明成 `name: str` 的普通 extern 函数
+# 收到的是 FaStr 对象指针（头 16 字节是 rc/len），C 侧 %s 打出来是乱码。
+use c "string.h":
+    fn strlen(s: str) -> u64
+    fn strcmp(a: str, b: str) -> i32
+    fn strcpy(dst: *u8, src: str) -> *u8
+use c "stdlib.h":
+    fn strdup(s: str) -> str
+    fn malloc(n: u64) -> *u8
+
+fn main() -> i64:
+    print(strlen("你好FA"))              # UTF-8 字节数
+    print(strlen(""))
+    print(strcmp("abc", "abc"))
+    print(strcmp("abc", "abd") < 0)
+    print(strcmp("b", "a") > 0)
+
+    # C 返回 char*，FA 侧声明成 str：拷成真正的 FA 字符串，能 .len() / 插值
+    let s = strdup("拷贝出来的")
+    print(s)
+    print(s.len())
+    print("[{s}]")
+
+    # 声明成 *u8 时拿到裸指针：print 按 C 字符串打印，str() 转成 FA 字符串
+    let buf = malloc(64)
+    strcpy(buf, "写入的")
+    print(buf)
+    print(str(buf))
+    print(strlen(str(buf)))
+    return 0

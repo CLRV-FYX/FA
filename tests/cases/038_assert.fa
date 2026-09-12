@@ -1,0 +1,7 @@
+# expect-exit: 1
+# expect-stderr: 算术坏了
+# 断言失败要带上用户给的提示
+fn main() -> i64:
+    let x = 2
+    assert(x + x == 5, "算术坏了")
+    return 0

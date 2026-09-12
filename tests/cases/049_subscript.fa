@@ -1,0 +1,75 @@
+# 下标语法：v[i] / m[k] / s[i] / a[i]，读与写
+# 以前只有数组和指针能取下标，Vec / Map / str 一律在代码生成阶段报
+# 「不支持下标取址」；顺带修掉三个相关 bug：
+#   * push(v, 2.5) 全局写法漏了浮点按位传参，存进去是垃圾（fv.push(2.5) 才对）
+#   * 常量 bitcast 被优化器折叠掉，调用点按浮点 ABI 放进了 xmm0
+#   * s[i] 从偏移 0 读字节，读到的是 FaStr 的 rc/len 头（打印出 U+FFFD）
+struct Item:
+    id: i64
+    name: str
+
+fn main() -> i64:
+    # 字符串：按下标取字节（char = u8）
+    let s = "hello world"
+    print(s[0], s[6], s[s.len - 1])
+    let i = 0
+    while i < 5:
+        write(s[i])
+        i = i + 1
+    print("")
+
+    # 数组
+    let a = [1, 2, 3]
+    a[1] = 9
+    print(a[0], a[1], a[2], len(a))
+
+    # Vec<i64>
+    let v: Vec<i64> = []
+    push(v, 10); push(v, 20); push(v, 30)
+    print(v[0], v[1], v[2], len(v))
+    v[1] = 99
+    print(v[1], v.get(1))
+    for k in 0..len(v):
+        write("{v[k]} ")
+    print("")
+
+    # Vec<f64>（浮点元素要按位模式存取）
+    let fv = Vec<f64>()
+    push(fv, 2.5)
+    let x = 3.75
+    push(fv, x)
+    fv.push(0.5)
+    print(fv[0], fv[1], fv[2])
+    fv[0] = 9.5
+    print(fv[0], fv.get(0))
+
+    # Vec<str>（引用计数元素：写进去要 inc，换出来要 dec）
+    let sv = Vec<str>["a", "b"]
+    print(sv[0], sv[1])
+    sv[0] = "z"
+    print(sv[0], len(sv))
+
+    # Vec<结构体>（元素装箱）
+    let iv: Vec<Item> = []
+    push(iv, Item { id: 1, name: "one" })
+    push(iv, Item { id: 2, name: "two" })
+    print(iv[0].id, iv[0].name, iv[1].name)
+    iv[1] = Item { id: 3, name: "three" }
+    print(iv[1].id, iv[1].name, len(iv))
+
+    # Map：m[k] 读 / m[k] = v 写，等价于 m.get / m.set
+    let m = Map<str, i64>()
+    m["x"] = 1
+    m["y"] = 2
+    print(len(m), m["x"], m["y"], m.has("y"))
+    m["x"] = 100
+    print(m["x"], m.get("x"))
+    let mi = Map<i64, str>()
+    mi[1] = "one"
+    mi[2] = "two"
+    print(mi[1], mi[2], len(mi))
+    let mf = Map<str, f64>()
+    mf["pi"] = 3.14
+    print(mf["pi"])
+    print("map: {m["x"]}")
+    return 0

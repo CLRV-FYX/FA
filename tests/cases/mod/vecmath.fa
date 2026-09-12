@@ -1,0 +1,23 @@
+# 一个可被导入的 FA 模块：结构体 + 方法 + 常量 + 枚举 + 函数
+use "inner.fa"
+
+struct Vec2:
+    x: f64
+    y: f64
+
+impl Vec2:
+    fn norm(self) -> f64:
+        return sqrt(self.x * self.x + self.y * self.y)
+
+    fn scaled(self, k: f64) -> Vec2:
+        return Vec2 { x: scale(self.x, k), y: scale(self.y, k) }
+
+const TAU: f64 = 6.283185307
+
+enum Level:
+    Low
+    High(n: i64)
+    Named(tag: str)
+
+fn circle_area(r: f64) -> f64:
+    return TAU * r * r / 2.0

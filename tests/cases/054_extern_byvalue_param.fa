@@ -1,0 +1,13 @@
+# expect-compile-error: C 互操作只支持按指针传结构体
+# expect-compile-error: 行 6
+# C 侧的 `void draw(Point p)` 是按值收的（16 字节进 rdi:rsi），
+# 而 FA 传的是指针 —— 两边对不上只会读到垃圾，所以直接在编译期拦住。
+use c "gfx.h":
+    fn draw(p: Point)
+
+struct Point:
+    x: i64
+    y: i64
+
+fn main() -> i64:
+    return 0

@@ -1,0 +1,27 @@
+# 函数指针：fn(A) -> R 类型（docs/02 的类型表里一直有，codegen 却调不动）
+fn add1(x: i64) -> i64:
+    return x + 1
+
+fn twice(x: i64) -> i64:
+    return x * 2
+
+fn apply(f: fn(i64) -> i64, x: i64) -> i64:
+    return f(x) + f(x)
+
+fn greet() -> str:
+    return "hi"
+
+fn main() -> i64:
+    let f: fn(i64) -> i64 = add1
+    print(f(41))                 # 42
+    f = twice
+    print(f(21))                 # 42
+    print(apply(add1, 100), apply(twice, 100))
+    let g: fn() -> str = greet
+    print(g())
+    let i = 0
+    while i < 3:
+        write("{f(i)} ")
+        i = i + 1
+    print("")
+    return 0

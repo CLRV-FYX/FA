@@ -1,0 +1,25 @@
+# 容器格式化：不能截断、不能把浮点当整数、字符串要转义
+fn main() -> i64:
+    let big = Vec<str>()
+    let i = 0
+    while i < 200:
+        big.push("0123456789")
+        i = i + 1
+    let text = str(big)
+    print(len(text))                 # 200 * (10 + 2 引号) + 199 * 2 分隔 + 2 括号
+    print(big.len(), sum(Vec<i64>[1,2,3]))
+
+    let esc = Vec<str>()
+    esc.push("a\"b")
+    esc.push("line\nbreak")
+    print(esc)
+
+    let nested = Vec<Vec<i64>>()
+    let inner = Vec<i64>[1, 2]
+    nested.push(inner)
+    print(nested)
+
+    let m = Map<f64,bool>()
+    m.set(1.5, true)
+    print(m)
+    return 0
