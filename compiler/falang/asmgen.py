@@ -377,6 +377,8 @@ class AsmGen:
             licm(f)                      # 必须在 lower_params 之前：形参此时还是「无定义点」
         lower_params(f)
         self.loc, self.spills, self.intervals, used_callee = allocate(f)
+        # 序言 push 的就是这一份，RET 的尾声必须用**同一份**（见 epilogue 调用处）
+        self.used_callee = used_callee
         self.cur = f
         self.alloca_off = {}
         self.save_slots = {}
@@ -921,7 +923,14 @@ class AsmGen:
                     s = self.opreg(v, ctx)
                     if s != "rax":
                         self.L(f"mov rax, {s}")
-            self.epilogue(f, [r for r in CALLEE_SAVED if r in set(self.loc.values())])
+            # 必须用序言 push 的那一份列表：以前这里按「此刻 self.loc 里出现过哪些
+            # 被调用者保存寄存器」重新算一遍，两者并不总是相同（某个寄存器在序言里
+            # push 了，但走到这条 RET 时它分到的临时值已经溢出/死亡）。
+            # push 了 4 个却只 pop 3 个 -> 最后那个（比如 r14）永远不会被还原，
+            # 而 rbx/r12-r15 是**被调用者保存**的：调用方正拿着它存活跃值，
+            # 于是一层递归回来数据就变了（实测递归求字符串长度：轻则算错，
+            # 重则段错误 / malloc 报堆损坏）。
+            self.epilogue(f, self.used_callee)
             return
         if op == "RCINC":
             v = self.opreg(ins.args[0], ctx)
@@ -1307,7 +1316,12 @@ class AsmGen:
         varargs = getattr(fs, "varargs", False) if fs is not None else False
         # al 只在「可变参数」调用里才有意义（= 使用的向量寄存器个数）。
         # 已知被调函数不是可变参数时直接省掉这条 mov（gcc 也不生成）。
-        if varargs or is_ptr or fs is None:
+        # **间接调用一律省掉**：FA 的函数指针类型表达不了可变参数，目标函数根本不读
+        # al；更要紧的是函数指针此刻可能正好待在 rax 里 —— 以前这里先来一句
+        # `mov eax, 0` 再 `call rax`，等于跳到地址 0。实测「把比较函数当参数传进
+        # 排序函数」必定段错误，而同一段代码写成直接调用就没事（直接调用的符号
+        # 不占 rax）。
+        if not is_ptr and (varargs or fs is None):
             self.L(f"mov eax, {freg_i if varargs else 0}")
         if is_ptr:
             if pv == "rax":

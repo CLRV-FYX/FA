@@ -854,6 +854,14 @@ class FnGen:
         idx = self.new_temp(I64)
         limit = self.new_temp(I64)
         vloc = None
+        # 可迭代对象只求值**一次**，并在整个循环期间持有它。
+        # 以前循环体里会再 gen_expr 一遍：对变量只是浪费，对**函数调用**
+        # （`for k in m.keys()`）却是每轮都新建一个容器，而它那条 RCDEC 被
+        # 语句级的 flush 放进了循环体 —— 于是每轮都放一次，第二轮就把还在用的
+        # 对象释放掉了（实测 malloc(): unaligned tcache chunk detected）。
+        obj = None
+        arr_ptr = arr_off = None
+        held = False
         if isinstance(it, Range) or ity.kind == "range":
             if isinstance(it, Range):
                 se, ee = it.start, it.end
@@ -870,7 +878,12 @@ class FnGen:
             self.emit("MOV", idx, [self.coerce(start, I64, I64)], ty=I64)
             self.emit("MOV", limit, [self.coerce(stop, I64, I64)], ty=I64)
         else:
-            obj = self.gen_expr(it)
+            if ity.kind == "arr":
+                arr_ptr, arr_off, _ = self.gen_addr(it)
+            else:
+                obj = self.gen_expr(it)
+                # 从语句级所有权表里摘出来，循环结束后由本函数自己释放一次
+                held = self.take_owned(obj, ity)
             n = self.new_temp(I64)
             if ity.kind == "vec":
                 self.emit("CALL", n, [Sym("fa_vec_len"), obj], ty=I64)
@@ -897,7 +910,6 @@ class FnGen:
             vt = self.new_temp(vty)
             self.emit("MOV", vt, [idx], ty=vty)
         elif ity.kind == "vec":
-            obj = self.gen_expr(it)
             et = ity.elem
             if is_agg(et):
                 # 结构体/枚举元素在槽里存的是**装箱指针**，所以循环变量要绑成
@@ -921,13 +933,11 @@ class FnGen:
                     self.emit("CALL", r, [Sym("fa_vec_get"), obj, idx], ty=vty)
                     self.emit("MOV", vt, [self.coerce(r, vty, vty)], ty=vty)
         elif ity.kind == "str":
-            obj = self.gen_expr(it)
             vt = self.new_temp(vty)
             r = self.new_temp(I64)
             self.emit("CALL", r, [Sym("fa_str_byte"), obj, idx], ty=I64)
             self.emit("MOV", vt, [self.coerce(r, I64, vty)], ty=vty)
         elif ity.kind == "map":
-            obj = self.gen_expr(it)
             vt = self.new_temp(vty)
             kt = ity.key
             if kt is not None and kt.is_float:
@@ -939,7 +949,7 @@ class FnGen:
                 self.emit("CALL", r, [Sym("fa_map_key_at"), obj, idx], ty=vty)
                 self.emit("MOV", vt, [self.coerce(r, vty, vty)], ty=vty)
         elif ity.kind == "arr":
-            ptr, off, _ = self.gen_addr(it)
+            ptr, off = arr_ptr, arr_off
             i8 = self.new_temp(I64)
             self.emit("BIN", i8, [idx, self.const(max(ity.elem.size, 1))], extra="*", ty=I64)
             t2 = self.new_temp(I64)
@@ -969,6 +979,9 @@ class FnGen:
         self.emit("BIN", idx, [idx, self.const(1)], extra="+", ty=I64)
         self.emit("JMP", extra=top)
         self.emit("LABEL", extra=end)
+        if held:
+            # 循环之后释放一次（break 也跳到 end，所以每条路径都覆盖到）
+            self.emit_rcdec_val(obj, ity)
 
     def bind_variant_payload(self, subj, pat):
         """把当前变体的载荷绑定成局部变量（每个绑定都拥有自己的一份引用）"""

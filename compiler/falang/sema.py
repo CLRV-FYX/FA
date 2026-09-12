@@ -1051,6 +1051,10 @@ class Sema:
             if lt == CHAR and rt == CHAR:
                 e.ty = BOOL
                 return BOOL
+            if (lt == CHAR and rt.kind in ("int", "bool")) \
+                    or (rt == CHAR and lt.kind in ("int", "bool")):
+                e.ty = BOOL              # char 就是一个字节，能和整数比较
+                return BOOL
             if lt.kind == "ptr" and rt.kind == "int" and rt.name == "i64":
                 e.ty = BOOL
                 return BOOL
@@ -1059,6 +1063,18 @@ class Sema:
         if lt.kind == "ptr" and rt.kind == "int" and e.op in ("+", "-"):
             e.ty = lt
             return lt
+        # char 参与算术时按 C 的整型提升处理：`b - 'A' + 'a'` 这种大小写转换
+        # 是最常见的写法，以前直接报「运算符 '-' 不支持 char 与 char」。
+        # 结果是 i64（要当字符用就再 chr() 一次）。
+        if (lt == CHAR or rt == CHAR) and e.op in ("+", "-", "*", "/", "%",
+                                                   "&", "|", "^", "<<", ">>"):
+            other = rt if lt == CHAR else lt
+            if other == CHAR or other.kind in ("int", "bool"):
+                e.ty = TYPES["i64"]
+                return e.ty
+            if other.kind == "float":
+                e.ty = TYPES["f64"]
+                return e.ty
         if lt.is_num and rt.is_num:
             if lt.kind == "float" or rt.kind == "float":
                 e.ty = TYPES["f64"] if (lt.name == "f64" or rt.name == "f64") else TYPES["f32"]
