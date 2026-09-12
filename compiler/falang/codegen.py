@@ -1944,7 +1944,13 @@ class FnGen:
                      "count": ("fa_str_count", I64),
                      "lines": ("fa_str_lines", vec_of(STR)),
                      "trim_start": ("fa_str_trim_start", STR),
-                     "trim_end": ("fa_str_trim_end", STR)}
+                     "trim_end": ("fa_str_trim_end", STR),
+                     # UTF-8 码点：char_len() / char_at(i) / codepoints() /
+                     # slice_chars(a, b)
+                     "char_len": ("fa_str_char_len", I64),
+                     "char_at": ("fa_str_char_at", I64),
+                     "codepoints": ("fa_str_codepoints", vec_of(I64)),
+                     "slice_chars": ("fa_str_slice_chars", STR)}
             if name in ("find", "contains", "starts_with", "ends_with", "eq", "replace"):
                 if name == "find":
                     a = self.gen_expr(e.args[0])
@@ -1996,12 +2002,12 @@ class FnGen:
             if name in fnmap:
                 fn, rt = fnmap[name]
                 args = [obj]
-                if name == "slice":
+                if name in ("slice", "slice_chars"):
                     args.append(self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64))
                     args.append(self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, I64))
                 if name == "split":
                     args.append(self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty))
-                if name == "at":
+                if name in ("at", "char_at"):
                     args.append(self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64))
                 r = self.new_temp(rt)
                 self.emit("CALL", r, [Sym(fn)] + args, ty=rt)

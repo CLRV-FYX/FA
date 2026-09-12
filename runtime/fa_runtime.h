@@ -104,6 +104,11 @@ int64_t fa_str_find(FaStr *s, FaStr *sub);
 FaStr *fa_str_trim(FaStr *s);
 FaStr *fa_str_upper(FaStr *s);
 FaStr *fa_str_lower(FaStr *s);
+/* UTF-8 码点（char 是一个字节，码点用 int64_t） */
+int64_t fa_str_char_len(FaStr *s);
+int64_t fa_str_char_at(FaStr *s, int64_t idx);
+FaVec  *fa_str_codepoints(FaStr *s);
+FaStr  *fa_str_slice_chars(FaStr *s, int64_t a, int64_t b);
 FaStr *fa_str_replace(FaStr *s, FaStr *a, FaStr *b);
 FaVec *fa_str_split(FaStr *s, FaStr *sep);
 FaVec *fa_str_chars(FaStr *s);

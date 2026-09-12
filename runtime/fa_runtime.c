@@ -765,6 +765,81 @@ FaVec *fa_str_split(FaStr *s, FaStr *sep) {
     return v;
 }
 
+/* ------------------------------------------------------------------ UTF-8 码点
+   FA 的 char 就是一个字节（u8），所以 s[i] / s.chars() 拿到的都是**字节** ——
+   对中文这类多字节文本，「第 i 个字符」得自己解码。下面这组函数把解码放进运行时：
+   码点用 int64_t 表示（char 装不下 > 255 的码点），非法/截断的字节序列按单字节
+   码点处理（Latin-1 兜底），所以任何输入都不会失败，也不会读到缓冲区外面。 */
+static int64_t utf8_dec(const char *p, int64_t len, int64_t i, int64_t *next) {
+    unsigned char c = (unsigned char)p[i];
+    int64_t need, cp;
+    if (c < 0x80) { *next = i + 1; return c; }
+    else if ((c & 0xE0) == 0xC0) { need = 1; cp = c & 0x1F; }
+    else if ((c & 0xF0) == 0xE0) { need = 2; cp = c & 0x0F; }
+    else if ((c & 0xF8) == 0xF0) { need = 3; cp = c & 0x07; }
+    else { *next = i + 1; return c; }                 /* 非法起始字节 */
+    if (i + need >= len) { *next = i + 1; return c; } /* 序列被截断 */
+    for (int64_t k = 1; k <= need; k++) {
+        unsigned char cc = (unsigned char)p[i + k];
+        if ((cc & 0xC0) != 0x80) { *next = i + 1; return c; }
+        cp = (cp << 6) | (cc & 0x3F);
+    }
+    *next = i + need + 1;
+    return cp;
+}
+
+/* 第 ci 个码点的**字节**下标（ci 超出码点数就返回 len，方便切片时夹紧） */
+static int64_t utf8_byte_off(FaStr *s, int64_t ci) {
+    int64_t i = 0, n = 0, next;
+    while (i < s->len) {
+        if (n == ci) return i;
+        utf8_dec(s->data, s->len, i, &next);
+        i = next; n++;
+    }
+    return s->len;
+}
+
+int64_t fa_str_char_len(FaStr *s) {
+    if (!s) return 0;
+    int64_t n = 0, i = 0, next;
+    while (i < s->len) { utf8_dec(s->data, s->len, i, &next); i = next; n++; }
+    return n;
+}
+
+int64_t fa_str_char_at(FaStr *s, int64_t idx) {
+    if (!s) return 0;
+    int64_t i = 0, n = 0, next, cp;
+    while (i < s->len) {
+        cp = utf8_dec(s->data, s->len, i, &next);
+        if (n == idx) return cp;
+        i = next; n++;
+    }
+    if (idx < 0) return 0;
+    fa_bounds_error();                                /* 和下标越界同一套报错 */
+    return 0;
+}
+
+FaVec *fa_str_codepoints(FaStr *s) {
+    FaVec *v = fa_vec_new(FA_K_NONE, 8, 1, FA_TY_INT);
+    if (!s) return v;
+    int64_t i = 0, next;
+    while (i < s->len) {
+        fa_vec_push(v, (uint64_t)utf8_dec(s->data, s->len, i, &next));
+        i = next;
+    }
+    return v;
+}
+
+FaStr *fa_str_slice_chars(FaStr *s, int64_t a, int64_t b) {
+    if (!s) return fa_str_from_cstr("");
+    int64_t n = fa_str_char_len(s);
+    if (a < 0) a = 0;
+    if (b > n) b = n;
+    if (b < a) b = a;
+    int64_t ba = utf8_byte_off(s, a), bb = utf8_byte_off(s, b);
+    return fa_str_new(s->data + ba, bb - ba);
+}
+
 FaVec *fa_str_chars(FaStr *s) {
     FaVec *v = fa_vec_new(FA_K_NONE, 1, 0, FA_TY_CHAR);
     if (!s) return v;

@@ -24,7 +24,9 @@ BUILTIN_METHODS = {
     "str": {"len", "at", "slice", "eq", "find", "trim", "split", "contains",
             "to_i64", "to_f64", "to_str", "bytes", "upper", "lower",
             "starts_with", "ends_with", "replace", "chars", "cstr",
-            "repeat", "count", "lines", "trim_start", "trim_end"},
+            "repeat", "count", "lines", "trim_start", "trim_end",
+            # UTF-8 码点：char 是一个字节，这组按「字符」而不是按字节算
+            "char_len", "char_at", "codepoints", "slice_chars"},
     "vec": {"len", "push", "get", "set", "pop", "clear", "contains", "to_str",
             "resize", "sort", "reverse", "join", "sum", "min", "max",
             "index_of"},
@@ -1431,8 +1433,12 @@ class Sema:
             e.resolved = "builtin-method"
             if e.name == "to_f64":
                 e.ty = TYPES["f64"]
-            elif e.name in ("len", "at", "to_i64", "find", "bytes"):
+            elif e.name in ("len", "at", "to_i64", "find", "bytes",
+                            "char_len", "char_at"):
                 e.ty = TYPES["i64"]
+            elif e.name == "codepoints":
+                # 码点可能 > 255，char（u8）装不下，所以是 Vec<i64>
+                e.ty = vec_of(TYPES["i64"])
             elif e.name == "cstr":
                 # 返回的是 FaStr 内部字节区的裸指针（**不加引用**），不是 str。
                 # 以前标成 STR，于是 `let p = s.cstr()` 会对这个 char* 调 rc_inc，
@@ -1440,7 +1446,8 @@ class Sema:
                 e.ty = ptr_to(TYPES["u8"])
             elif e.name in ("to_str", "slice", "trim", "upper", "lower",
                             "replace", "to_str_deep",
-                            "repeat", "trim_start", "trim_end", "join"):
+                            "repeat", "trim_start", "trim_end", "join",
+                            "slice_chars"):
                 e.ty = STR
             elif e.name in ("split", "chars", "keys", "values", "lines"):
                 # Map 的 keys()/values() 元素类型跟着 K / V 走（不是 str）
