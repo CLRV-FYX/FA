@@ -370,6 +370,7 @@ class Parser:
         self.expect_kw("struct")
         name = self.expect(NAME).value
         fields = []
+        defaults = {}
         if self.at(P, "{") and not self._block_follows():
             self.next()
             self.in_braces += 1
@@ -380,7 +381,16 @@ class Parser:
                 fn = self.expect(NAME).value
                 self.expect(P, ":")
                 fields.append((fn, self.parse_type()))
+                if self.at_op("="):
+                    self.next()
+                    defaults[fn] = self.parse_expr()
                 self.skip_terms()
+                if self.at(P, ","):
+                    # 花括号写法允许用逗号分隔字段（Rust 风格）：
+                    # `struct P { a: i64, b: i64 = 2 }`。默认值里的逗号
+                    # （`v: Vec<i64> = [1, 2]`）已经被 parse_expr 吃掉了，不会歧义。
+                    self.next()
+                    self.skip_terms()
             self.expect(P, "}")
             self.in_braces -= 1
         else:
@@ -396,9 +406,12 @@ class Parser:
                 fn = self.expect(NAME).value
                 self.expect(P, ":")
                 fields.append((fn, self.parse_type()))
+                if self.at_op("="):          # x: i64 = 3 —— 字段默认值
+                    self.next()
+                    defaults[fn] = self.parse_expr()
                 self.skip_terms()
             self.accept("DEDENT")
-        return StructDef(name=name, fields=fields)
+        return StructDef(name=name, fields=fields, defaults=defaults)
 
     def parse_enum(self) -> EnumDef:
         self.expect_kw("enum")

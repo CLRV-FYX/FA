@@ -327,6 +327,10 @@ class StructDef(Decl):
     pub: bool = False
     packed: bool = False
     sym: Any = None
+    # 字段默认值：{字段名: 初值表达式}。写了默认值的字段，在结构体字面量里
+    # 可以省略（`P { y: 4 }` 会用默认值补上 x）。fields 仍是 (name, Type)
+    # 二元组，不动它的形状 —— 消费方太多，多塞一个元素容易漏改。
+    defaults: Any = field(default_factory=dict)
 
 
 @dataclass

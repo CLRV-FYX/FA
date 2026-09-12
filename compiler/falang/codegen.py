@@ -1625,17 +1625,10 @@ class FnGen:
 
     def gen_arraylit(self, e: ArrayLit):
         ty = e.ty
-        if not e.elems and ty.kind == "vec":
-            # `let v: Vec<i64> = []` 等价于 `Vec<i64>()`
-            et = ty.elem
-            v = self.new_temp(ty)
-            self.emit("CALL", v, [Sym("fa_vec_new"),
-                                  self.const(elem_kind(et, self.sema)),
-                                  self.const(vec_esz(et)),
-                                  self.const(1 if (et.kind == "int" and et.is_signed) else 0),
-                                  self.const(T.ty_code(et))], ty=ty)
-            self.mark_owned(v, ty)
-            return v
+        if ty.kind == "vec":
+            # `let v: Vec<i64> = []` 等价于 `Vec<i64>()`；
+            # `let v: Vec<i64> = [1, 2]` 等价于 `Vec<i64>[1, 2]`
+            return self.gen_vec_from_elems(ty.elem, e.elems)
         slot = self.emit_alloca(max(ty.size, 1))
         for i, el in enumerate(e.elems):
             v = self.gen_expr(el)
@@ -1657,10 +1650,16 @@ class FnGen:
         if st.is_refcounted:
             # 字段可能是「未提供」的，先清零，免得 retain/drop 读到栈上的垃圾指针
             self.emit("ZERO", args=[slot], extra=st.size)
+        defaults = getattr(self.sema.struct_decls.get(st.name), "defaults", None) or {}
         for fname, fty, off in st.fields:
             expr = dict(e.fields).get(fname)
             if expr is None:
-                continue
+                # 字面量里省略的字段：用声明时写的默认值补上（每次构造都重新
+                # 求值一遍，所以 `items: Vec<i64> = []` 每个对象拿到的是各自的空表）
+                expr = defaults.get(fname)
+                if expr is None:
+                    continue                 # 语义阶段已经报过错；这里保持清零
+
             v = self.gen_expr(expr)
             if is_agg(fty):
                 d = self.new_temp(ptr_to(fty))
@@ -1688,29 +1687,35 @@ class FnGen:
                 self.emit_rcinc(v, ty)
         return p
 
+    def gen_vec_from_elems(self, et: Type, elems) -> Temp:
+        """新建一个 Vec<et> 并把 elems 依次 push 进去。
+
+        `Vec<T>[...]`、`Vec<T>(...)` 与「有标注的 [] 字面量」
+        （`let v: Vec<i64> = [1, 2]`）三条路共用，免得引用计数/装箱规则走偏。
+        """
+        vty = vec_of(et)
+        v = self.new_temp(vty)
+        self.emit("CALL", v, [Sym("fa_vec_new"), self.const(elem_kind(et, self.sema)),
+                              self.const(vec_esz(et)),
+                              self.const(1 if (et.kind == "int" and et.is_signed) else 0),
+                              self.const(T.ty_code(et))], ty=vty)
+        self.mark_owned(v, vty)
+        for a in elems:
+            av = self.gen_expr(a)
+            if et.kind in ("struct", "enum"):
+                self.emit("CALL", None, [Sym("fa_vec_push"), v, self.box_agg(av, et)])
+            else:
+                # fa_vec_push 内部已按元素 kind 做 rc_inc
+                cv = self.coerce(av, a.ty, et)
+                if et.is_float:
+                    cv = self.bitcast(cv, I64)
+                self.emit("CALL", None, [Sym("fa_vec_push"), v, cv])
+        return v
+
     def gen_ctor(self, e: Ctor):
         """Vec<T>(...) / Map<K,V>() / Vec<T>[...]"""
         if e.name == "Vec":
-            et = self.sema.resolve_type(e.targs[0])
-            k = elem_kind(et, self.sema)
-            v = self.new_temp(vec_of(et))
-            self.emit("CALL", v, [Sym("fa_vec_new"), self.const(k),
-                                  self.const(vec_esz(et)),
-                                  self.const(1 if (et.kind == "int" and et.is_signed) else 0),
-                                  self.const(T.ty_code(et))],
-                      ty=vec_of(et))
-            self.mark_owned(v, vec_of(et))
-            for a in e.args:
-                av = self.gen_expr(a)
-                if et.kind in ("struct", "enum"):
-                    self.emit("CALL", None, [Sym("fa_vec_push"), v, self.box_agg(av, et)])
-                else:
-                    # fa_vec_push 内部已按元素 kind 做 rc_inc
-                    cv = self.coerce(av, a.ty, et)
-                    if et.is_float:
-                        cv = self.bitcast(cv, I64)
-                    self.emit("CALL", None, [Sym("fa_vec_push"), v, cv])
-            return v
+            return self.gen_vec_from_elems(self.sema.resolve_type(e.targs[0]), e.args)
         if e.name == "Map":
             kt = self.sema.resolve_type(e.targs[0])
             vt = self.sema.resolve_type(e.targs[1])

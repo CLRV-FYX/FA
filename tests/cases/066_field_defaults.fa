@@ -1,0 +1,61 @@
+# 结构体字段默认值：`x: i64 = 3`，于是字面量里可以省略这个字段
+# （README「已知限制」里的「结构体字面量省略字段 —— 所有字段都要写」）。
+#   * 默认值在任何函数之外求值，所以能写字面量、容器构造、const、全局、函数调用
+#   * 每次构造都**重新求值**一遍：`items: Vec<i64> = []` 给每个对象各自的空表，
+#     不是所有对象共享同一个（引用计数也要各自加一份）
+#   * 没写默认值的字段仍然必须在字面量里给出，否则语义阶段报错
+const START = 100
+let shared = Vec<str>["全局"]
+
+fn next_id() -> i64:
+    return 7                        # 默认值里可以调用函数
+
+struct Task:
+    name: str
+    prio: i64 = 3
+    done: bool = false
+    ratio: f64 = 0.5
+    mark: char = '*'
+    tags: Vec<str> = []
+    hist: Vec<i64> = [1, 2]
+    owner: str = "无人"
+    base: i64 = START               # const
+    code: i64 = next_id()           # 函数调用
+
+struct Braced { a: i64 = 1, b: i64 = 2, c: str = "三" }
+
+impl Task:
+    fn show(self) -> str:
+        return "{self.name}/{self.prio}/{self.owner}/{self.tags.len()}"
+
+fn main() -> i64:
+    let t = Task { name: "写测试" }
+    print(t.name, t.prio, t.done, t.ratio, t.mark)
+    print(t.tags.len(), t.hist.len(), t.hist[1], t.owner, t.base, t.code)
+
+    # 覆盖其中几个默认值
+    let u = Task { name: "改代码", prio: 1, owner: "我", done: true }
+    print(u.show())
+    print(u.ratio, u.mark, u.code)
+
+    # 两个对象各自拥有一份默认容器：改一个不能影响另一个
+    t.tags.push("急")
+    t.hist.push(9)
+    print("t:", t.tags.len(), t.tags[0], t.hist.len())
+    print("u:", u.tags.len(), u.hist.len())
+
+    let b = Braced { b: 20 }
+    print("花括号写法:", b.a, b.b, b.c)
+
+    # 反复构造 + 大量后续分配：默认值里的 str/Vec 引用计数错了就会在这里炸
+    let all = Vec<Task>[]
+    for i in 0..2000 {
+        let x = Task { name: "任务{i}" }
+        x.tags.push("t{i}")
+        all.push(x)
+    }
+    print("批量:", all.len(), all[1999].show(), all[0].tags[0])
+    let junk = Vec<str>[]
+    for i in 0..3000 { junk.push("填充{i}") }
+    print("堆检查:", junk.len(), shared.len(), all[1000].hist.len())
+    return 0

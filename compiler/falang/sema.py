@@ -322,6 +322,8 @@ class Sema:
                     self.layout_struct_decl(sub)
                 elif isinstance(sub, ImplDef):
                     self.register_impl(sub)
+        # 结构体字段默认值（要在函数签名注册之后：默认值里可以调用函数）
+        self.check_struct_defaults()
         # 顶层 let：全局变量的类型与初值（此时结构体/枚举已布局、函数签名已注册，
         # 所以初值里可以写 `Vec<str>[]`、结构体字面量、甚至调用函数）
         for d in self.global_decls:
@@ -358,6 +360,29 @@ class Sema:
             self.consts[d.name] = d.init
         elif isinstance(d, Global):
             self.global_decls.append(d)
+
+    def check_struct_defaults(self):
+        """检查 `struct P: x: i64 = 3` 这类字段默认值。
+
+        默认值在任何函数之外求值（和顶层 let 的初值一样）：能用字面量、
+        容器构造、const、全局和函数调用，没有 self、不能 return。
+        """
+        for name, d in self.struct_decls.items():
+            defaults = getattr(d, "defaults", None) or {}
+            if not defaults:
+                continue
+            st = self.structs.get(name)
+            fty = {fn: t for fn, t, off in (st.fields or [])}
+            for fn, ex in defaults.items():
+                if fn not in fty:
+                    self.error(f"结构体 {name} 没有字段 '{fn}'，默认值写错了地方", d)
+                    continue
+                self.enter(None)
+                try:
+                    got = self.expr(ex, expect=fty[fn])
+                finally:
+                    self.leave()
+                self.check_assignable(fty[fn], got, ex, f"字段 '{fn}' 的默认值")
 
     def check_global(self, d):
         """检查一条顶层 `let`，并登记成全局符号。
@@ -852,6 +877,15 @@ class Sema:
                     return e.ty
                 self.error("空的 [] 需要上下文类型，例如 let v: Vec<i64> = [] "
                            "或 let a: [i64; 3] = [1, 2, 3]", e)
+            if expect is not None and expect.kind == "vec":
+                # `let v: Vec<i64> = [1, 2]`、`Task { hist: [1, 2] }`：
+                # 标注明明写的是 Vec，就不必再逼用户写一遍 `Vec<i64>[1, 2]`。
+                # 元素类型以标注为准，所以 `Vec<f64> = [1, 2]` 这种整数升浮点也允许。
+                for x in e.elems:
+                    self.check_assignable(expect.elem, self.expr(x, expect=expect.elem),
+                                          x, "Vec 元素")
+                e.ty = expect
+                return e.ty
             et = self.expr(e.elems[0])
             for x in e.elems[1:]:
                 t2 = self.expr(x)
@@ -865,10 +899,16 @@ class Sema:
             st = self.structs.get(e.name)
             if st is None:
                 self.error(f"未知结构体 '{e.name}'", e)
-            given = {fn: self.expr(fv) for fn, fv in e.fields}
+            fty_by_name = {fn: t for fn, t, off in st.fields}
+            given = {fn: self.expr(fv, expect=fty_by_name.get(fn))
+                     for fn, fv in e.fields}
+            defaults = getattr(self.struct_decls.get(e.name), "defaults", None) or {}
             for fn, fty, off in st.fields:
                 if fn not in given:
-                    self.error(f"结构体 {e.name} 缺少字段 '{fn}'", e)
+                    if fn in defaults:
+                        continue             # 有默认值：字面量里可以省略
+                    self.error(f"结构体 {e.name} 缺少字段 '{fn}'（它也没有默认值）", e)
+                    continue
                 self.check_assignable(fty, given[fn], e, f"字段 '{fn}' 初始化")
             for fn in given:
                 if fn not in [f[0] for f in st.fields]:
