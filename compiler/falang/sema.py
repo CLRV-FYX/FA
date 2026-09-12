@@ -909,11 +909,10 @@ class Sema:
                 continue                   # 指针之间允许互转（同 check_assignable）
             self.error(f"作为表达式的 {what}，各分支类型不一致：{ty} 与 {t}", node)
         for t in live:                     # nil 分支跟上统一后的指针类型
-            if isinstance(t, NilLit) and ty.kind == "ptr":
+            if isinstance(t, NilLit):
+                if ty.kind != "ptr":
+                    self.error(f"作为表达式的 {what}，nil 分支不能和 {ty} 分支混用", node)
                 t.ty = ty
-        if ty.kind in ("struct", "enum", "arr"):
-            self.error(f"作为表达式的 {what} 暂不支持 {ty} 结果（聚合值要走栈槽，"
-                       f"分支之间没法共用一份）；请先 let 一个变量，在分支里赋值", node)
         if ty.kind == "void":
             self.error(f"作为表达式的 {what}，分支不能是 void", node)
         return ty

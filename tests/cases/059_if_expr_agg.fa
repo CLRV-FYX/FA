@@ -1,0 +1,60 @@
+# if / match 表达式的聚合结果（结构体 / 枚举 / 数组），以及分支里产生的
+# 中间引用必须在**分支内部**释放这件事。
+#
+# 曾经段错误的写法：两条分支轮流走，其中一条在插值里产生临时字符串。
+# 那些临时值属于「语句级」的所有权表，要是拖到语句末尾（已经在分支外面）
+# 才释放，走另一条分支时对应寄存器里装的是循环下标之类的无关值，
+# rc_dec 拿它当对象指针 -> 段错误。
+struct P:
+    x: i64
+    name: str
+
+enum E:
+    A
+    B(n: i64)
+
+fn mk(n: i64) -> P:
+    return P { x: n, name: "z{n}" }
+
+fn main() -> i64:
+    let c = true
+
+    # 结构体：一条分支是字面量，另一条是返回聚合值的函数调用
+    let p = if c { P { x: 1, name: "一" } } else { mk(2) }
+    print(p.x, p.name)
+
+    # 借用已有的值（拷一份并逐字段加引用）
+    let q = if c { mk(7) } else { p }
+    print(q.x, q.name, p.x, p.name)
+
+    # 数组
+    let arr = if c { [1, 2, 3] } else { [9, 9, 9] }
+    print(arr[0], arr[1], arr[2], arr.len())
+
+    # 枚举
+    let e = match q.x {
+        7: E.B(q.x)
+        _: E.A
+    }
+    print(match e { E.A: "A" E.B(n): "B{n}" })
+
+    # 嵌套
+    let nested = if c { if q.x > 3 { mk(10) } else { mk(11) } } else { mk(12) }
+    print(nested.x, nested.name)
+
+    # 两条分支轮流走 + 插值产生的临时字符串（就是上面说的段错误场景）
+    let total = 0
+    let chars = 0
+    for i in 0..2000 {
+        let t = if i % 2 == 0 { mk(i) } else { P { x: i, name: "n{i}" } }
+        let s = if i % 3 == 0 { "三的倍数" } else { "其它{i}" }
+        let v = match i % 3 {
+            0: Vec<i64>[i]
+            1: Vec<i64>[i, i]
+            _: Vec<i64>[]
+        }
+        total += t.x + v.len()
+        chars += s.len()
+    }
+    print(total, chars)
+    return 0

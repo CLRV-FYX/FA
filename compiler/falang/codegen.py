@@ -698,9 +698,18 @@ class FnGen:
                 else self.gen_block(orelse)
         self.emit("LABEL", extra=end)
 
+    def _value_slot(self, ty: Type):
+        """if / match 表达式的结果归属地：标量用寄存器临时值，聚合用栈槽。"""
+        hint = self.take_hint()
+        if is_agg(ty):
+            slot = self.emit_alloca(ty.size)
+            self.mark_agg_owned(slot, ty)
+            return slot
+        return self.hint_or_new(hint, ty)
+
     def gen_if_value(self, e: If):
-        """`let x = if c { a } else { b }` —— 结果统一放进一个临时变量。"""
-        r = self.hint_or_new(self.take_hint(), e.ty)
+        """`let x = if c { a } else { b }` —— 结果统一放进一个临时变量/栈槽。"""
+        r = self._value_slot(e.ty)
         end = self.new_label("ifend")
         self.gen_if_chain([(e.cond, e.body)] + list(e.elifs), e.orelse, end, dst=r)
         return r
@@ -715,30 +724,71 @@ class FnGen:
         if getattr(b, "diverges", False):
             self.gen_block(b)          # return / break / panic：不产出值
             return
+        # 进分支前先记下「已经存在的」临时引用：它们由外层语句负责释放
+        # （条件表达式产生的引用两条分支都可能用到，不能在分支里放掉）
+        ref_before = set(self.owned_ids)
+        agg_before = set(self.agg_owned_ids)
         self.push_scope()
-        stmts = [x for x in b.stmts if x is not None]
-        for st in stmts[:-1]:
-            self.gen_stmt(st)
-        tail = stmts[-1]
-        if isinstance(tail, ExprStmt):
-            v, sty = self.gen_expr(tail.expr), tail.expr.ty
-        else:
-            # 嵌套的 if / match 表达式：尽量让它直接算进 dst
-            self.hint = dst
-            v = self.gen_expr(tail)
-            self.hint = None
-            sty = tail.ty
-        if v is dst:
+        # 三条产出路径（值就是 dst / 聚合 / 标量）都要在**分支内**收尾，
+        # 所以用 try...finally：漏掉任何一条，分支里的中间引用就会跑到分支外
+        # 才释放，另一条分支执行时那些寄存器装的是无关的值。
+        try:
+            stmts = [x for x in b.stmts if x is not None]
+            for st in stmts[:-1]:
+                self.gen_stmt(st)
+            tail = stmts[-1]
+            if isinstance(tail, ExprStmt):
+                v, sty = self.gen_expr(tail.expr), tail.expr.ty
+            else:
+                # 嵌套的 if / match 表达式：尽量让它直接算进 dst
+                self.hint = dst
+                v = self.gen_expr(tail)
+                self.hint = None
+                sty = tail.ty
+            if v is dst:
+                return
+            if is_agg(sty):
+                # 聚合结果：分支里新建的值直接把所有权移交给 dst（emit_init_agg
+                # 内部会 take_agg_owned），来自变量的则拷一份并逐字段加引用。
+                # 判定用的是**尾表达式的类型**：dst 是 emit_alloca 出来的槽，
+                # 它自己的 .ty 是 *u8（指向槽的指针），不是聚合类型。
+                self.emit_init_agg(dst, v, sty)
+                return
+            if sty != dst.ty:
+                v = self.coerce(v, sty, dst.ty)   # 只可能是数值提升（sema 已统一过）
+            if T.t_is_refcounted(dst.ty):
+                if not self.take_owned(v, sty):
+                    self.emit_rcinc(v, sty)
+                self.mark_owned(dst, dst.ty)
+            self.emit("MOV", dst, [v], ty=dst.ty)
+        finally:
             self.pop_scope()
-            return
-        if sty != dst.ty:
-            v = self.coerce(v, sty, dst.ty)      # 只可能是数值提升（sema 已统一过）
-        if T.t_is_refcounted(dst.ty):
-            if not self.take_owned(v, sty):
-                self.emit_rcinc(v, sty)
-            self.mark_owned(dst, dst.ty)
-        self.emit("MOV", dst, [v], ty=dst.ty)
-        self.pop_scope()
+            self.release_new_refs(dst, ref_before, agg_before)
+
+    def release_new_refs(self, keep, ref_before, agg_before):
+        """在**分支内部**释放这个分支自己新建的临时引用（`keep` 除外）。
+
+        `self.owned` / `self.agg_owned` 是**语句级**的：if / match 当表达式用时，
+        分支里产生的中间引用（例如 `"n{i}"` 插值过程中的 `str(i)` 与 concat 结果）
+        要是留到语句末尾才释放，那时已经在分支外面了 —— 走另一条分支的执行路径上，
+        那些寄存器里装的是完全无关的值。实测
+        `let t = if i % 2 == 0 { mk(i) } else { P { x: i, name: "n{i}" } }`
+        会把循环下标当成对象指针做 rc_dec，直接段错误。
+
+        之前就存在的引用（条件表达式产生的）不动，仍由外层语句释放：
+        它们的活跃区间横跨整个 if，寄存器分配器不会在分支里复用。
+        """
+        for v, ty in list(self.owned):
+            if v.id not in ref_before and v is not keep:
+                self.emit_rcdec_val(v, ty)
+        self.owned = [x for x in self.owned if x[0].id in ref_before or x[0] is keep]
+        self.owned_ids = {x[0].id for x in self.owned}
+        for slot, ty in list(self.agg_owned):
+            if slot.id not in agg_before and slot is not keep:
+                self.emit_rcdec_val(slot, ty)
+        self.agg_owned = [x for x in self.agg_owned
+                          if x[0].id in agg_before or x[0] is keep]
+        self.agg_owned_ids = {x[0].id for x in self.agg_owned}
 
     def gen_for_c(self, s):
         """for (init; cond; step) { body } —— 展开为
@@ -983,8 +1033,8 @@ class FnGen:
         self.emit("LABEL", extra=end)
 
     def gen_match_value(self, s: Match):
-        """`let x = match v { ... }` —— 每个分支把尾表达式的值写进同一个临时变量。"""
-        r = self.hint_or_new(self.take_hint(), s.ty)
+        """`let x = match v { ... }` —— 每个分支把尾表达式的值写进同一个归属地。"""
+        r = self._value_slot(s.ty)
         self.gen_match(s, dst=r)
         return r
 
