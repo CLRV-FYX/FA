@@ -1050,6 +1050,13 @@ class Sema:
                 if expect is not None and expect.kind == "str":
                     e.ty = STR
                     return e.ty
+                if expect is not None and expect.kind == "map":
+                    # 标注明明写的是 Map，却按「没有上下文」报错，还举的全是 Vec 的例子
+                    # ——`let m: Map<str, i64> = []` 得到的提示是「例如 let v: Vec<i64> = []」，
+                    # 照着改还是错。空 Map 没有「元素」可列，只能写构造器或带 K/V 的字面量。
+                    self.error("空的 [] 建不出 Map（键值对写不出来）：空表写 "
+                               "Map<K, V>() 或 Map<K, V>[]，带初值写 "
+                               'Map<K, V>["甲": 1]', e)
                 self.error("空的 [] 需要上下文类型，例如 let v: Vec<i64> = [] "
                            "或 let a: [i64; 3] = [1, 2, 3]", e)
             if expect is not None and expect.kind == "vec":
