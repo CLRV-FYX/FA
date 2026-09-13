@@ -1,0 +1,67 @@
+# 不给初值的声明：引用计数类型必须拿到**真的空对象**，不是 NULL。
+#
+# 以前只有 memset 0 / const_zero，于是：
+#   let v: Vec<i64>      → NULL：v.to_str() 当场段错误，v.push(1) 静默失效
+#   let m: Map<str,i64>  → NULL：m.set(k,v) 静默失效（fa_map_set 对 NULL 直接返回）
+#   let a: [Vec<i64>; 2] → 两个 NULL 槽：push 有时静默失效、有时段错误，
+#                          而 to_str() 打出来还是 [[], []]，看着像空表其实什么都没有
+#   let p: P             → str 字段是 NULL（打印成空，但和 "" 比是 false）
+#   let gv: Vec<i64>（全局）→ .bss 的零就是 NULL，同样静默失效
+# 现在这些都建出真的空对象；结构体字段有声明时写的默认值就用默认值
+# （和 P{} 省略字段一个规矩）。
+let gs: str
+let gv: Vec<i64>
+let gm: Map<str, Vec<i64>>
+let garr: [Vec<i64>; 2]
+let gn: i64
+let gb: bool
+
+struct P:
+    x: i64
+    name: str = "无名"
+    items: Vec<i64> = []
+
+fn main() -> i64:
+    # 局部：容器
+    let v: Vec<i64>
+    print("局部 Vec:", v.to_str(), v.len())
+    v.push(7)
+    print("push 之后:", v.to_str())
+    let m: Map<str, i64>
+    m.set("k", 1)
+    print("局部 Map:", m.to_str(), m.len())
+    let s: str
+    print("局部 str:", "[" + s + "]", s.len(), s == "", s.chars().len())
+
+    # 局部：数组里装容器
+    let av: [Vec<i64>; 2]
+    av[0].push(1)
+    av[1].push(2)
+    print("数组里的 Vec:", av.to_str())
+    let am: [Map<str, i64>; 1]
+    am[0].set("甲", 1)
+    print("数组里的 Map:", am.to_str())
+    let sa: [str; 2]
+    print("数组里的 str:", sa.to_str(), sa[0] == sa[1])
+
+    # 局部：结构体（字段默认值要用上）
+    let p: P
+    print("结构体:", p.to_str())
+    p.items.push(9)
+    print("改字段:", p.to_str())
+    let ps: [P; 2]
+    ps[1].x = 5
+    print("结构体数组:", ps.to_str())
+
+    # 全局
+    print("全局标量:", gn, gb, gs.len())
+    gv.push(1)
+    gv.push(2)
+    print("全局 Vec:", gv.to_str())
+    gm.set("k", Vec<i64>[9])
+    gm.get("k").push(10)
+    print("全局 Map:", gm.to_str())
+    garr[0].push(5)
+    garr[1].push(6)
+    print("全局数组:", garr.to_str())
+    return 0

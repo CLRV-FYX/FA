@@ -345,6 +345,59 @@ class FnGen:
             return m
         return self.const_zero(ty)
 
+    def emit_zero_agg(self, slot, ty: Type):
+        """聚合值不给初值时，把每个引用计数槽位都建成**真的空对象**。
+
+        ZERO 只是 memset 0，于是 `let v: [Vec<i64>; 2]` 的两个槽位是 NULL：
+        `v[0].push(1)` 要么静默失效、要么当场段错误（实测 `[Vec<i64>; 1]` 上 push 就崩），
+        而 `to_str()` 打出来还是 `[[], []]`。`let p: P` 的 str / 容器字段同理。
+        结构体字段有声明时写的默认值就用默认值（和 `P{}` 省略字段一个规矩）。
+        """
+        if ty is None:
+            return
+        if ty.kind == "arr":
+            esz = max(ty.elem.size, 1)
+            for i in range(getattr(ty, "count", 0) or 0):
+                self.emit_zero_at(slot, i * esz, ty.elem)
+        elif ty.kind == "struct":
+            defaults = getattr(self.sema.struct_decls.get(ty.name), "defaults",
+                               None) or {}
+            for fname, fty, off in (ty.fields or []):
+                expr = defaults.get(fname)
+                if expr is not None:
+                    v = self.gen_expr(expr)
+                    if is_agg(fty):
+                        d = self.new_temp(ptr_to(fty))
+                        self.emit("LEA", d, [slot], extra=off)
+                        self.emit_init_agg(d, v, fty)
+                    else:
+                        self.emit("STORE", args=[slot, self.coerce(v, expr.ty, fty)],
+                                  extra=off, ty=fty)
+                        if T.t_is_refcounted(fty):
+                            self.emit_rcinc(v, expr.ty)
+                else:
+                    self.emit_zero_at(slot, off, fty)
+        elif ty.kind == "enum":
+            # tag 已经被 ZERO 清成 0，只要把第 0 个变体的载荷建出来（8 = tag 宽度）
+            for vname, vfields, vi in (getattr(ty, "variants", None) or []):
+                if vi == 0:
+                    for fname, fty, off in (vfields or []):
+                        self.emit_zero_at(slot, 8 + off, fty)
+                    break
+
+    def emit_zero_at(self, base, off, ty: Type):
+        """在 base+off 上放一个 ty 的真零值。标量已经被 ZERO 清成 0，不用管。"""
+        if ty is None:
+            return
+        if ty.kind in ("str", "vec", "map"):
+            v = self.tail_zero_value(ty)
+            self.emit("STORE", args=[base, v], extra=off, ty=ty)
+            self.take_owned(v, ty)      # 归变量所有；静态空串本来就没登记
+        elif is_agg(ty):
+            d = self.new_temp(ptr_to(ty))
+            self.emit("LEA", d, [base], extra=off)
+            self.emit_zero_agg(d, ty)
+
     # ------------------------------------------------------------ 内存辅助
     def emit_alloca(self, size: int, align: int = 8) -> Temp:
         d = self.new_temp(ptr_to(U8))
@@ -930,10 +983,24 @@ class FnGen:
     def gen_global_inits(self):
         """main 的第一条用户语句之前，把每个顶层 let 的初值算一遍。
 
-        没有初值的（`let n: i64`）不用管：槽在 .bss 里，天然就是零值。
+        没有初值的标量（`let n: i64`）不用管：槽在 .bss 里，天然就是零值。
+        引用计数类型不行 —— .bss 的零就是 NULL：`let gv: Vec<i64>` 之后
+        `gv.push(1)` 静默失效（fa_vec_push 对 NULL 直接返回）、`gv.to_str()` 段错误，
+        结构体/数组全局里的 str 与容器字段同理。这些也在这里建出真的空对象
+        （全局活到进程结束，引用交给 .bss 里那个槽拿着，LSan 认它是根，不算泄漏）。
         """
         for d in getattr(self.sema, "global_decls", []):
             if d.init is None:
+                # 类型要拿**解析过的**那份：d.ty 在写了类型名的声明上是 AST 的 TName
+                # （`let gv: Vec<i64>`），读 .kind 直接 AttributeError 把编译器打崩。
+                gt = self.sema.globals[d.name].ty
+                addr = self.global_addr(d.name)
+                if is_agg(gt):
+                    self.emit_zero_agg(addr, gt)
+                elif gt is not None and gt.kind in ("str", "vec", "map"):
+                    v = self.tail_zero_value(gt)
+                    self.take_owned(v, gt)
+                    self.emit("STORE", args=[addr, v], extra=0, ty=gt)
                 continue
             self.gen_global_write(d.name, d.init)
 
@@ -943,7 +1010,17 @@ class FnGen:
             if is_agg(ty):
                 slot = self.emit_alloca(ty.size)
                 self.emit("ZERO", args=[slot], extra=ty.size)
+                # memset 0 只够标量：引用计数的槽位得放**真的空对象**（见 emit_zero_agg）
+                self.emit_zero_agg(slot, ty)
                 loc = VarLoc("mem", slot, ty, sym=s.sym)
+            elif ty.kind in ("str", "vec", "map"):
+                # `let v: Vec<i64>` 以前拿到的是 const_zero，也就是 NULL：
+                # `v.to_str()` 当场段错误，`v.push(1)` / `m.set(k, v)` 静默失效
+                # （fa_vec_push / fa_map_set 对 NULL 直接返回），而 to_str 打出来
+                # 还是 `[]` / `{}`，看着像空表其实什么都没有。
+                t = self.tail_zero_value(ty)
+                self.take_owned(t, ty)        # 所有权归这个变量，语句末尾别再放一次
+                loc = VarLoc("temp", t, ty, sym=s.sym)
             else:
                 t = self.new_temp(ty)
                 self.emit("MOV", t, [self.const_zero(ty)], ty=ty)
