@@ -1447,25 +1447,5 @@ int64_t fa_imin(int64_t a, int64_t b) { return a < b ? a : b; }
 int64_t fa_imax(int64_t a, int64_t b) { return a > b ? a : b; }
 int64_t fa_gcd(int64_t a, int64_t b) { while (b) { int64_t t = a % b; a = b; b = t; } return a < 0 ? -a : a; }
 
-/* ============================================================ 动态库 */
-void *fa_dl_open(const char *path) {
-    void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
-    if (!h) {
-        static const char pre[] = "panic: 打不开动态库 ";
-        fa_sys_write(2, pre, (int64_t)(sizeof(pre) - 1));
-        fa_sys_write(2, path, (int64_t)strlen(path));
-        fa_sys_write(2, "\n", 1);
-    }
-    return h;
-}
-
-int64_t fa_dl_bind(void *handle, void **slot, const char *name) {
-    if (!handle) return 0;
-    void *s = dlsym(handle, name);
-    if (!s) return 0;
-    *slot = s;
-    return 1;
-}
-
 /* 程序退出时刷新输出缓冲 */
 __attribute__((destructor)) static void fa_cleanup(void) { fa_flush(); }

@@ -1,0 +1,10 @@
+# `use lib "库"` = 运行时 dlopen：不参与链接，程序跑起来才打开库、dlsym 找符号。
+# 路径不带 / 就原样交给 dlopen（走系统搜索路径），带 / 的按**源文件所在目录**解析。
+# 这里用系统的 libm 当对象，免得往仓库里塞一个 .so 二进制。
+use lib "libm.so.6":
+    fn sqrt(x: f64) -> f64
+    fn pow(a: f64, b: f64) -> f64
+
+fn main() -> i64:
+    print(sqrt(144.0), pow(2.0, 10.0), sqrt(2.0))
+    return 0

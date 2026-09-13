@@ -173,16 +173,6 @@ class AsmGen:
                         self.R(f"    .quad {off}")
                         self.R(f"    .quad {k}")
                 self.R("    .quad -1")
-        # 懒绑定符号全局槽
-        if getattr(self.sema, "lazy_syms", None):
-            self.R("    .section .data")
-            for name, path in self.sema.lazy_syms:
-                self.R(f"__fa_lazy_{name}:")
-                self.R("    .quad 0")
-                self.R(f"__fa_lazy_name_{name}:")
-                self.R(f"    .asciz \"{name}\"")
-            self.R("__fa_lazy_lib:")
-            self.R(f"    .asciz \"{self.sema.lazy_syms[0][1]}\"")
         # 顶层 let 的全局变量槽（.bss 天然清零，所以「没写初值」就等于零值）
         gvars = getattr(self.mod, "gvar_slots", None)
         if gvars:
@@ -364,16 +354,6 @@ class AsmGen:
             self.R(f"    mov rdi, {t.desc_id}")
             self.R(f"    lea rsi, [rip+__fa_drop_{t.name}]")
             self.R("    call fa_register_drop")
-        lazy = getattr(self.sema, "lazy_syms", None)
-        if lazy:
-            self.R("    lea rdi, [rip+__fa_lazy_lib]")
-            self.R("    call fa_dl_open")
-            self.R("    mov rbx, rax")
-            for name, path in lazy:
-                self.R(f"    mov rdi, rbx")
-                self.R(f"    lea rsi, [rip+__fa_lazy_{name}]")
-                self.R(f"    lea rdx, [rip+__fa_lazy_name_{name}]")
-                self.R("    call fa_dl_bind")
         self.R("    mov rsp, rbp")
         self.R("    pop rbp")
         self.R("    ret")

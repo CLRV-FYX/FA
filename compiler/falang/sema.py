@@ -701,6 +701,16 @@ class Sema:
         ret = self.resolve_type(d.ret) if d.ret is not None else VOID
         sym = FnSym(d.name, params, ret, varargs=d.varargs,
                     extern=extern or d.extern, cname=d.cname, decl=d)
+        if sym.extern and d.body is not None:
+            # `extern "C": fn fa_add(a: i64, b: i64) -> i64: return a + b` 以前一路
+            # 走到代码生成，在那儿炸出 AttributeError（extern 的符号没有解析过
+            # 形参/返回值的布局，可它有函数体，两边对不上）。extern 只是**声明**，
+            # 不能带体 —— 这句话在这儿说清楚，比一个 Python 栈回溯有用。
+            self.error(
+                f"extern 的 '{d.name}' 不能带函数体：extern 是用来**声明** C/C++ 那边"
+                "已经存在的函数的（只写签名，不写体）。"
+                "想让 C 反过来调用 FA 函数目前还不支持", d)
+            return sym
         if use is not None and use.kind in ("c", "cxx", "lib"):
             sym.extern = True
             # C/C++ 互操作只按**指针**传聚合值：FA 的 struct/enum/数组在 ABI 里就是
@@ -730,8 +740,15 @@ class Sema:
                     f"（`void {d.name}({ret.name} *out, ...)`），"
                     f"FA 侧声明成 `-> void` 并传 `&out`", d)
             if use.kind == "lib":
+                # `use lib "./x.so":` = 运行时 dlopen。这些符号不参与链接，
+                # 由 driver 生成一个 dlopen+dlsym 的转发 shim（见 gen_dl_shim）。
+                if d.varargs:
+                    self.error(
+                        f"extern 函数 '{d.name}' 带可变参数（...），没法用 use lib 转发"
+                        "（变参的实参类型只有调用点知道）。改成链接期导入："
+                        'use c "头文件.h" lib "./x.so":', d)
                 sym.lazy = True
-                self.lazy_syms.append((d.name, use.path))
+                self.lazy_syms.append((d, use.path))
             if use.kind == "cxx":
                 self.cxx_shims.append(d)
                 sym.cname = f"fa_{d.name}"      # shim 里生成的是 extern "C" fa_xxx

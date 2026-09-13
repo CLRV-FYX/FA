@@ -212,8 +212,6 @@ int64_t fa_imax(int64_t a, int64_t b);
 int64_t fa_gcd(int64_t a, int64_t b);
 
 /* --- 动态库懒绑定 --- */
-void *fa_dl_open(const char *path);
-int64_t fa_dl_bind(void *handle, void **slot, const char *name);
 
 /* --- 手写汇编热路径 --- */
 int64_t fa_sys_write(int64_t fd, const char *buf, int64_t count);

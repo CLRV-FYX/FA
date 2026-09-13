@@ -206,6 +206,84 @@ def gen_cxx_shim(sema: Sema, out_dir: str, base_dir: str) -> Optional[str]:
     return path
 
 
+def dl_c_type(ty) -> str:
+    """dlopen 转发 shim 里用的 C 类型。
+
+    和 c_type_of 的区别只有 str：代码生成那边对 extern 函数的 str 参数会先转成
+    char*（返回值反过来从 char* 拷一份成 FaStr），所以 shim 必须按 char* 声明，
+    不然 C 库里那个 `int f(const char*)` 收到的是一个 FaStr 指针，读到的是乱码。
+    """
+    if ty is not None and ty.kind == "str":
+        return "const char*"
+    return c_type_of(ty)
+
+
+def gen_dl_shim(sema: Sema, out_dir: str, base_dir: str) -> Optional[str]:
+    """`use lib "./x.so":` 声明的函数 -> 运行时 dlopen + dlsym 的转发 shim。
+
+    这些符号不参与链接（库要等程序跑起来才打开），所以代码生成那边照常
+    `call add2`，链接时找到的就是这个 shim：第一次调用时 dlopen 库、dlsym 符号，
+    之后走缓存下来的函数指针。路径在编译期解析成绝对路径（相对源文件），
+    这样可执行文件换个目录跑也找得到库。
+    """
+    if not sema.lazy_syms:
+        return None
+    L = []
+    L.append("/* FA 自动生成：use lib 的运行时 dlopen 转发 */")
+    L.append("#include <dlfcn.h>")
+    L.append("#include <stdint.h>")
+    L.append("#include <stdbool.h>")
+    L.append("#include <stdlib.h>")
+    L.append("#include <stdio.h>")
+    L.append("")
+    L.append("static void fa_dl_die(const char *what, const char *where) {")
+    L.append('    fputs("panic: ", stderr);')
+    L.append("    fputs(what, stderr);")
+    L.append('    if (where && *where) { fputs(" ", stderr); fputs(where, stderr); }')
+    L.append('    fputs("\\n", stderr);')
+    L.append("    exit(1);")
+    L.append("}")
+    L.append("")
+    # 每个库一个句柄变量，第一次用到时 dlopen
+    handles = {}
+    for d, path in sema.lazy_syms:
+        lib = path if (os.path.isabs(path) or "/" not in path) \
+            else os.path.abspath(os.path.join(base_dir, path))
+        if lib not in handles:
+            handles[lib] = "fa_dl_h%d" % len(handles)
+    for lib, h in handles.items():
+        L.append('static void *%s = 0;   /* %s */' % (h, lib))
+    L.append("")
+    for idx, (d, path) in enumerate(sema.lazy_syms):
+        lib = path if (os.path.isabs(path) or "/" not in path) \
+            else os.path.abspath(os.path.join(base_dir, path))
+        h = handles[lib]
+        sym = sema.fns[d.name]
+        ps = [dl_c_type(sym.params[i]) for i in range(len(d.params))]
+        names = [p.name for p in d.params]
+        sig = ", ".join("%s %s" % (t, n) for t, n in zip(ps, names)) or "void"
+        psig = ", ".join(ps) or "void"
+        ret = dl_c_type(sym.ret) if sym.ret else "void"
+        args = ", ".join(names)
+        slot = "fa_dl_p%d" % idx
+        has_ret = bool(sym.ret) and sym.ret.kind != "void"
+        L.append("static %s (*%s)(%s) = 0;" % (ret, slot, psig))
+        L.append("%s %s(%s) {" % (ret, d.name, sig))
+        L.append("    if (!%s) {" % slot)
+        L.append('        if (!%s) %s = dlopen("%s", RTLD_NOW | RTLD_GLOBAL);' % (h, h, lib))
+        L.append('        if (!%s) fa_dl_die("打不开动态库", "%s");' % (h, lib))
+        L.append('        %s = (%s (*)(%s))dlsym(%s, "%s");' % (slot, ret, psig, h, d.name))
+        L.append('        if (!%s) fa_dl_die("动态库里找不到这个符号", "%s（在 %s 里）");'
+                 % (slot, d.name, lib))
+        L.append("    }")
+        L.append("    %s%s(%s);" % ("return " if has_ret else "", slot, args))
+        L.append("}")
+        L.append("")
+    out = os.path.join(out_dir, "_fa_dl_shim.c")
+    with open(out, "w") as f:
+        f.write("\n".join(L) + "\n")
+    return out
+
 # --------------------------------------------------------------- main 引导
 def gen_main_shim(sema: Sema, out_dir: str) -> str:
     fn = sema.fns.get("main")
@@ -305,6 +383,18 @@ def build(src_path: str, out_path: str = None, emit_asm: bool = False,
             sys.stderr.write(f"  已生成的 shim：{shim}（可手工修改后重新编译链接）\n")
             return 1
         link_objs.append(shim_obj)
+
+    # `use lib "./x.so"` 的运行时 dlopen 转发
+    dlshim = gen_dl_shim(sema, work, os.path.dirname(src_path))
+    if dlshim:
+        dl_obj = os.path.join(work, "_fa_dl_shim.o")
+        cmd = [cc(), "-O2", f"-I{RUNTIME_DIR}", "-c", dlshim, "-o", dl_obj]
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if p.returncode != 0:
+            sys.stderr.write(f"[dlopen shim 编译失败] {p.stderr}\n")
+            sys.stderr.write(f"  已生成的 shim：{dlshim}\n")
+            return 1
+        link_objs.append(dl_obj)
 
     # main 引导
     main_c = gen_main_shim(sema, work)
