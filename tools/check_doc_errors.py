@@ -38,9 +38,25 @@ def fa(*args, cwd):
     return r.returncode, (r.stdout + r.stderr)
 
 
+MULTIFILE = re.compile(r"^//\s*(\S+\.fa)\s*$", re.M)
+
+
 def real_output(code: str):
     """这段反面教材的真实输出：编译不过就是报错，编得过就真跑一遍看它 panic 什么。"""
     with tempfile.TemporaryDirectory() as work:
+        # 一个块里写了多个文件（`// dup.fa` 接着 `// main.fa`）：和 tests/check_docs.py
+        # 同一套规矩 —— 各写各的文件，查最后那个（主文件），并把 use 的路径改成
+        # 刚写出来的绝对路径。以前这里不分文件，多文件反面教材只会报
+        # 「找不到要导入的 FA 模块」，而模块路径里还带着一个每次都变的临时目录名，
+        # 于是这个块永远对不上。
+        parts = MULTIFILE.split(code)
+        if len(parts) > 1:
+            for i in range(1, len(parts) - 1, 2):
+                with open(os.path.join(work, parts[i]), "w", encoding="utf-8") as f:
+                    f.write(parts[i + 1])
+            code = re.sub(r'use\s+"([^"]+\.fa)"',
+                          lambda mm: 'use "%s"' % os.path.join(work, mm.group(1)),
+                          parts[-1])
         src = os.path.join(work, "_neg.fa")
         open(src, "w", encoding="utf-8").write(code)
         rc, out = fa("check", src, cwd=work)

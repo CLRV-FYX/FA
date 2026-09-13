@@ -126,7 +126,7 @@ fa/
 ## 5. 自动化测试
 
 ```bash
-python3 tests/run_tests.py            # 跑全部用例（118 个）
+python3 tests/run_tests.py            # 跑全部用例（119 个）
 python3 tests/run_tests.py --opt 0    # 换个优化级别再跑一遍（差分测试）
 python3 tests/run_tests.py 010        # 只跑名字里含 010 的用例
 python3 tests/run_tests.py --record   # 把当前输出记录为期望输出（改动需人工复核）

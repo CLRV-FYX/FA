@@ -640,7 +640,11 @@ class Parser:
             return Asm(code=code)
         if self.at_kw("raise"):
             self.next()
-            return ExprStmt(expr=Call(callee=NameRef("__fa_panic"),
+            # `raise "出事了"` 就是 panic 的另一种写法。以前这里造了一个叫
+            # __fa_panic 的调用，可运行时和内建表里都没有这个名字，
+            # 于是语义阶段报「未定义的标识符 '__fa_panic'」—— 一个内部名字
+            # 漏到用户面前，还看不出是 raise 的事。
+            return ExprStmt(expr=Call(callee=NameRef("panic"),
                                       args=[self.parse_expr()]))
         # 赋值 / 复合赋值 / 表达式语句
         e = self.parse_expr()
