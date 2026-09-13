@@ -1649,7 +1649,13 @@ class FnGen:
     def gen_nameref(self, e: NameRef):
         if self.is_global_name(e.name):
             return self.gen_global_read(e.name)
-        if e.name in self.sema.consts:
+        # 常量替换必须排在「这名字在本作用域里是不是个变量」之后：sema 解析
+        # 标识符的顺序是 局部 -> 全局 -> 函数 -> 类型 -> 常量，所以
+        #     const K: i64 = 5
+        #     fn main(): let K = 99; print(K)
+        # 里的 K 是那个局部变量。这里却先查了 sema.consts，于是 print(K)
+        # 悄悄打出 5 —— 局部那份根本没被读过，编译器也不吭声。
+        if e.name in self.sema.consts and not isinstance(e.resolved, VarSym):
             return self.gen_expr(self.sema.consts[e.name])
         if e.resolved == "ns":
             return Const(0, I64)

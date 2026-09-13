@@ -538,9 +538,40 @@ class Sema:
                 self.enums[d.name] = shell
                 self.enum_decls[d.name] = d
         elif isinstance(d, Const):
+            self.check_const_init(d)
             self.consts[d.name] = d.init
         elif isinstance(d, Global):
             self.global_decls.append(d)
+
+    def check_const_init(self, d):
+        """const 的初值必须是**编译期算得出来**的。
+
+        const 在实现上是「按使用处替换初值表达式」，不是「求值一次存起来」。
+        所以初值里要是有函数调用，每用一次就调一次：
+
+            let n: i64 = 0
+            fn tick() -> i64: n += 1; return n
+            const C: i64 = tick()
+            print(C, C, C)          # 实测 1 2 3，不是 1 1 1
+
+        「常量」打出三个不同的数，这是标准的悄悄给错答案。容器/结构体字面量
+        也一样（每用一次建一个新的）。要「算一次的值」就用全局 let。
+        """
+        def ok(e):
+            if isinstance(e, (NumLit, StrLit, CharLit, BoolLit, NameRef)):
+                return True
+            if isinstance(e, Unary):
+                return ok(e.operand)
+            if isinstance(e, Binary):
+                return ok(e.left) and ok(e.right)
+            return False
+
+        if d.init is not None and not ok(d.init):
+            self.error(
+                f"常量 '{d.name}' 的初值必须是编译期算得出来的"
+                f"（字面量、别的常量、它们之间的算术）。const 是**按使用处替换**的，"
+                f"初值里调函数的话每用一次就调一次（print(C, C) 会打出两个不同的数）；"
+                f"要「只求一次的值」请用全局 let", d)
 
     def check_struct_defaults(self):
         """检查 `struct P: x: i64 = 3` 这类字段默认值。
@@ -852,6 +883,11 @@ class Sema:
                 if v is not None:
                     # 变量默认可重新赋值（降低上手门槛）；`let mut x` 只是显式的风格标注。
                     v.assigned = True
+                elif s.target.name in self.consts and s.target.name not in self.globals:
+                    # 以前这里不拦，一路走到代码生成才报「未定义变量 'K'」——
+                    # 常量在符号表里没有存储位置，报错却说得像名字打错了。
+                    self.error(f"'{s.target.name}' 是常量（const），不能赋值；"
+                               f"要能改的值用全局 let 或者局部 let", s)
         elif isinstance(s, Return):
             want = self.cur_fn.ret if self.cur_fn else VOID
             if s.value is not None:
