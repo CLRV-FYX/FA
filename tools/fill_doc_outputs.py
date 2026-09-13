@@ -75,7 +75,10 @@ def main(argv):
     left = 0
     for path in files:
         if os.path.exists(path):
-            left += open(path, encoding="utf-8").read().count("@@OUT@@")
+            # 只数「真的还是占位符」的：```fa 块后面紧跟的 ```text 块里那个。
+            # 文档正文里提到这几个字符（讲这个工具怎么用）不算 —— 以前一律数进去，
+            # 于是每跑完一次都报「还剩 N 个没填」，其实是散文里的两个字。
+            left += len(BLOCK.findall(open(path, encoding="utf-8").read()))
     if left:
         print(f"文档里还剩 {left} 个 @@OUT@@ 没填")
     return 1 if bad else 0
