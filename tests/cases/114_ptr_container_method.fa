@@ -1,0 +1,9 @@
+# expect-compile-error: 本身就是引用
+# 容器的值本身就是一个指针，再取一层地址是指针的指针；在 *Vec 上调 push，
+# 运行时会把外层地址当成 FaVec 头去读 —— 不是报错，是踩内存，所以编译期拦。
+fn main() -> i64:
+    let v = Vec<i64>[1]
+    let vp = &v
+    vp.push(3)
+    print(v.to_str())
+    return 0

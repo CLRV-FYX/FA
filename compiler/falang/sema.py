@@ -857,6 +857,7 @@ class Sema:
             if s.value is not None:
                 vt = self.expr(s.value, expect=want)
                 self.check_assignable(want, vt, s, "返回值")
+                self.check_no_local_addr(s.value, s)
             elif want.kind != "void":
                 self.error(f"函数声明返回 {want}，但 return 没有值", s)
         elif isinstance(s, If):
@@ -1681,6 +1682,35 @@ class Sema:
         pat.ty = st
         pat.bindings = binds
 
+    def check_no_local_addr(self, e, s):
+        """`return &a`（a 是本函数的局部变量或形参）拿到的是悬垂指针。
+
+        函数一返回那块栈就没了。实测这种代码常常「碰巧还对」（栈上那几个字节
+        还没被覆盖，最简形式真能打出正确的值），换个函数、多一层调用就变垃圾 ——
+        典型的悄悄给错答案，比直接崩难查得多。要在堆上建对象就写 new。
+        """
+        if not isinstance(e, AddrOf) or not isinstance(e.operand, NameRef):
+            return
+        v = self.scope.lookup(e.operand.name) if self.scope else None
+        if isinstance(v, VarSym):
+            self.error(
+                f"不能返回局部变量 '{e.operand.name}' 的地址：函数一返回那块栈就没了，"
+                f"调用方拿到的是悬垂指针（常常「碰巧还对」，换个调用就变垃圾值）。"
+                f"要返回堆上的对象用 new，要返回一份值就直接返回它", s)
+
+    def method_lookup_type(self, ot: Type) -> Type:
+        """找方法时看哪个类型：`*P` 上看 `P` 的（自动解引用）。
+
+        字段访问一直是自动解引用的（`p.x`，p 是 `*P`），方法却不认，
+        报「类型 *P 没有方法 'bump'」—— 同一种东西两套规矩，谁都会踩。
+        代码生成那边不用改：方法的 self 本来就是指针，`gen_expr(*P 变量)`
+        给出的正是那个指针。
+        """
+        if getattr(ot, "kind", None) == "ptr" and getattr(ot, "inner", None) is not None \
+                and ot.inner.kind in ("struct", "enum"):
+            return ot.inner
+        return ot
+
     def check_method_receiver(self, e: MethodCall, ot: Type, fs: FnSym):
         """分清楚「静态方法」（impl 里不带 self）和普通方法（带 self）。
 
@@ -1703,9 +1733,11 @@ class Sema:
             self.error(f"方法 '{e.name}' 带 self，得用实例调用："
                        f"let p = {e.obj.name} {{...}}，然后 p.{e.name}(...)"
                        f"；想直接用类型名调用，就把形参里的 self 去掉", e)
-        elif not recv_is_type and not has_self and ot.kind in ("struct", "enum"):
+        elif not recv_is_type and not has_self \
+                and self.method_lookup_type(ot).kind in ("struct", "enum"):
+            lk = self.method_lookup_type(ot)
             self.error(f"方法 '{e.name}' 没有 self（静态方法），要用类型名调用："
-                       f"{ot.name}.{e.name}(...)", e)
+                       f"{lk.name}.{e.name}(...)", e)
 
     def expr_method(self, e: MethodCall) -> Type:
         ot = self.expr(e.obj)
@@ -1738,10 +1770,11 @@ class Sema:
             else:
                 self.java_used = True
             return e.ty
-        key = (ot.name if ot.kind in ("struct", "enum") else ot.kind, e.name)
+        lk = self.method_lookup_type(ot)
+        key = (lk.name if lk.kind in ("struct", "enum") else lk.kind, e.name)
         fs = self.methods.get(key)
-        if fs is None and ot.kind in ("struct", "enum"):
-            fs = self.methods.get((ot.name, e.name))
+        if fs is None and lk.kind in ("struct", "enum"):
+            fs = self.methods.get((lk.name, e.name))
         if fs is not None:
             self.check_method_receiver(e, ot, fs)
             e.resolved = fs
@@ -1846,6 +1879,15 @@ class Sema:
             e.resolved = fs
             e.ty = fs.ret
             return fs.ret
+        if ot.kind == "ptr" and getattr(ot, "inner", None) is not None \
+                and ot.inner.kind in ("vec", "map", "str", "arr"):
+            # `vp.push(3)`（vp 是 *Vec<i64>）：容器的值**本身就是一个指针**，
+            # 再取一层地址就是指针的指针，运行时的 fa_vec_push 会把外层地址
+            # 当成 FaVec 头去读 —— 不是报错，是踩内存。这里说清楚两条出路。
+            self.error(
+                f"{ot} 上不能直接调 .{e.name}()：容器和 str 本身就是引用，"
+                f"要改到原对象，形参直接写 {ot.inner}（不用加 *）；"
+                f"确实拿到指针的话，先解引用再调：(*p).{e.name}(...)", e)
         self.error(f"类型 {ot} 没有方法 '{e.name}'", e)
 
     # ------------------------------------------------------------- 赋值检查

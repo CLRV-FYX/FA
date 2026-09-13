@@ -1,0 +1,13 @@
+# expect-compile-error: 悬垂指针
+# `return &局部变量` 是悬垂指针：函数一返回那块栈就没了。实测这种代码常常
+# 「碰巧还对」（最简形式真能打出正确的值），换个函数、多一层调用就变垃圾值。
+struct P:
+    x: i64 = 0
+
+fn leak() -> *P:
+    let a = P { x: 1 }
+    return &a
+
+fn main() -> i64:
+    print(leak().x)
+    return 0

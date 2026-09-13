@@ -1,0 +1,65 @@
+# 指针：& 取地址、* 解引用、传指针改原对象、new / free、nil、指针身份、
+# 容器里装指针、数组元素上再做指针算术。
+#
+# 回归：`p.bump(1)`（p 是 *P）以前报「类型 *P 没有方法 'bump'」，而字段访问
+# `p.x` 一直是自动解引用的 —— 同一种东西两套规矩。现在方法也自动解引用。
+struct P:
+    x: i64 = 0
+    s: str = ""
+
+impl P:
+    fn bump(self, k: i64):
+        self.x += k
+
+    fn label(self) -> str:
+        return "{self.s}#{self.x}"
+
+fn bump_ptr(p: *P, k: i64):
+    p.x += k
+    p.bump(k)            # 指针上直接调方法（自动解引用）
+
+fn mk(v: i64) -> *P:
+    return new P { x: v, s: "n{v}" }
+
+fn main() -> i64:
+    let a = P { x: 1, s: "甲" }
+    let p = &a
+    print(p.x, p.s, p.label())
+
+    p.x = 9
+    print(a.x)
+    (*p).x = 10
+    print(a.x)
+
+    bump_ptr(p, 5)
+    print(a.x, a.label())
+
+    # new / free
+    let q = mk(5)
+    print(q.x, q.s, q.label())
+    q.bump(1)
+    print(q.x)
+    free(q)
+
+    # nil 与指针身份
+    let r: *P = nil
+    print(r == nil, p == nil, p == &a)
+
+    # 标量也能取地址
+    let n = 3
+    let np = &n
+    print(*np)
+    *np = 7
+    print(n)
+
+    # 容器与数组里装指针
+    let v = Vec<*P>[&a]
+    print(v[0].x, v.len())
+    let arr: [*P; 2] = [&a, nil]
+    print(arr[0].label(), arr[1] == nil)
+
+    # 数组元素上的指针算术（按元素大小走）
+    let xs = [P { x: 1 }, P { x: 2 }, P { x: 3 }]
+    let e = &xs[0]
+    print(e.x, (e + 1).x, (e + 2).x)
+    return 0
