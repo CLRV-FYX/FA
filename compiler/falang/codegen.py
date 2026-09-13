@@ -190,7 +190,7 @@ class FnGen:
         sc = self.scope
         # defer 先执行（后进先出）
         for d in reversed(sc.defers):
-            self.gen_expr(d)
+            self.gen_deferred(d)
         # 再释放本作用域拥有的引用
         for loc, ty in reversed(sc.drops):
             self.emit_drop(loc, ty)
@@ -484,6 +484,32 @@ class FnGen:
         self.agg_owned.clear()
         self.agg_owned_ids.clear()
 
+    def flush_owned_since(self, ref_before: set, agg_before: set):
+        """释放「快照之后」新登记的 owned 临时引用。
+
+        defer 的实参（插值出来的字符串、方法调用的结果……）在 defer 真正执行时
+        才求值，而那时已经不在任何语句的收尾流程里，没人替它释放 —— 循环里写
+        `defer write("x{i} ")` 每轮就漏两个 FaStr（str(i) 与拼接结果）。
+        只释放快照之后新增的部分：快照里那些可能还被外层表达式拿着。
+        """
+        for v, ty in list(self.owned):
+            if v.id not in ref_before:
+                self.emit_rcdec_val(v, ty)
+        self.owned = [x for x in self.owned if x[0].id in ref_before]
+        self.owned_ids = {x[0].id for x in self.owned}
+        for slot, ty in list(self.agg_owned):
+            if slot.id not in agg_before:
+                self.emit_rcdec_val(slot, ty)
+        self.agg_owned = [x for x in self.agg_owned if x[0].id in agg_before]
+        self.agg_owned_ids = {x[0].id for x in self.agg_owned}
+
+    def gen_deferred(self, d):
+        """执行一条 defer：求值 -> 释放它自己产生的临时引用"""
+        ref_before = set(self.owned_ids)
+        agg_before = set(self.agg_owned_ids)
+        self.gen_expr(d)
+        self.flush_owned_since(ref_before, agg_before)
+
     def unwind_scopes(self):
         """`return` 之前，把当前仍然打开的所有作用域的 defer 与引用释放补上。
 
@@ -496,7 +522,7 @@ class FnGen:
         sc = self.scope
         while sc is not None:
             for d in reversed(sc.defers):
-                self.gen_expr(d)
+                self.gen_deferred(d)
             for loc, ty in reversed(sc.drops):
                 self.emit_drop(loc, ty)
             sc = sc.parent
@@ -2435,6 +2461,9 @@ class FnGen:
                         cs = self.new_temp(STR)
                         self.emit("CALL", cs, [Sym("fa_str_from_cstr"), v], ty=STR)
                         self.emit("CALL", None, [Sym("fa_print_str"), cs])
+                        # fa_str_from_cstr 拷出一份新 FaStr，打完就得放：
+                        # 以前没登记，print 一个 C 的 char* 就漏一份拷贝。
+                        self.mark_owned(cs, STR)
                     else:
                         self.emit("CALL", None, [Sym("fa_print_ptr"), v])
                 elif a.ty.kind in ("vec", "map", "pyobj", "jobj"):

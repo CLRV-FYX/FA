@@ -1,3 +1,4 @@
+# expect-asan-leak: 16
 # C 互操作里的字符串：str 要自动转成 char*，C 返回的 char* 也要能拿回来。
 # 以前只有「可变参数」那条路做了转换，声明成 `name: str` 的普通 extern 函数
 # 收到的是 FaStr 对象指针（头 16 字节是 rc/len），C 侧 %s 打出来是乱码。
@@ -16,7 +17,9 @@ fn main() -> i64:
     print(strcmp("abc", "abd") < 0)
     print(strcmp("b", "a") > 0)
 
-    # C 返回 char*，FA 侧声明成 str：拷成真正的 FA 字符串，能 .len() / 插值
+    # C 返回 char*，FA 侧声明成 str：拷成真正的 FA 字符串，能 .len() / 插值。
+    # 代价是 C 那边 malloc 的 16 字节没人释放（docs/04「-> str 总是拷贝」那条）——
+    # 文件头的 expect-asan-leak 就是给这笔账留的，要自己管就声明成 -> *u8 再 free。
     let s = strdup("拷贝出来的")
     print(s)
     print(s.len())
@@ -28,4 +31,5 @@ fn main() -> i64:
     print(buf)
     print(str(buf))
     print(strlen(str(buf)))
+    free(buf)                      # 内建 free()：*u8 这种就是 libc 的 free
     return 0

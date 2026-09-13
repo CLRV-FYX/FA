@@ -42,6 +42,8 @@ fn main() -> i64:
     print(b.next.name)
     bump(a, 1)
     print(a.val, (*a).val, a[0].val)
+    free(b)                        # b.next 指向 a，指针字段不是引用计数，各自释放
+    free(a)
 
     let s = Node { val: 5, name: "stack", next: nil }
     let p = &s
@@ -51,9 +53,22 @@ fn main() -> i64:
 
     let l = new List.Cons(1, new List.Cons(2, new List.Cons(3, nil)))
     print(sum_list(l), sum_list(nil))
+    # 顺着链把每个节点还回去（free 会先还变体里的引用字段，再还内存）
+    let cur = l
+    while cur != nil:
+        match *cur:
+            List.Cons(v, next):
+                let nxt = next
+                free(cur)
+                cur = nxt
+            List.Nil:
+                free(cur)
+                cur = nil
 
     let x = new A { b: nil, tag: "a" }
     let y = new B { a: x, n: 7 }
     x.b = y
     print(x.tag, x.b.n, x.b.a.tag)
+    free(y)
+    free(x)
     return 0

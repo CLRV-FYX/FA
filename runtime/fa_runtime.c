@@ -554,6 +554,15 @@ int64_t fa_str_count(FaStr *s, FaStr *sub) {
     return n;
 }
 
+/* 运行时自己新建一个 FaStr 再塞进 Vec 时用这个。
+   fa_vec_push 会按元素 kind 加一次引用（容器自己持有的那份），所以
+   「创建时的那份」必须在这里还掉，否则每个元素都多一次引用、永远释放不了：
+   ASan 实测 `"FA 语言".split(" ")` 漏 2 个 FaStr，args() 每个参数漏一个。 */
+static void vec_push_new_str(FaVec *v, FaStr *s) {
+    fa_vec_push(v, (uint64_t)(uintptr_t)s);
+    fa_rc_dec(s, FA_K_STR);
+}
+
 FaVec *fa_str_lines(FaStr *s) {
     FaVec *v = fa_vec_new(FA_K_STR, 8, 0, FA_TY_STR);
     if (!s) return v;
@@ -562,8 +571,7 @@ FaVec *fa_str_lines(FaStr *s) {
         if (i == s->len || s->data[i] == '\n') {
             int64_t end = i;
             if (end > start && s->data[end - 1] == '\r') end--;
-            FaStr *line = fa_str_new(s->data + start, end - start);
-            fa_vec_push(v, (uint64_t)line);
+            vec_push_new_str(v, fa_str_new(s->data + start, end - start));
             start = i + 1;
         }
     }
@@ -620,8 +628,7 @@ void fa_set_args(int64_t argc, char **argv) { g_argc = argc; g_argv = argv; }
 FaVec *fa_args(void) {
     FaVec *v = fa_vec_new(FA_K_STR, 8, 0, FA_TY_STR);
     for (int64_t i = 0; i < g_argc; i++) {
-        FaStr *s = fa_str_from_cstr(g_argv ? g_argv[i] : "");
-        fa_vec_push(v, (uint64_t)s);
+        vec_push_new_str(v, fa_str_from_cstr(g_argv ? g_argv[i] : ""));
     }
     return v;
 }
@@ -750,18 +757,18 @@ FaVec *fa_str_split(FaStr *s, FaStr *sep) {
     if (!s) return v;
     if (!sep || sep->len == 0) {
         for (int64_t i = 0; i < s->len; i++)
-            fa_vec_push(v, (uint64_t)fa_str_new(s->data + i, 1));
+            vec_push_new_str(v, fa_str_new(s->data + i, 1));
         return v;
     }
     int64_t start = 0;
     for (int64_t i = 0; i + sep->len <= s->len; i++) {
         if (memcmp(s->data + i, sep->data, (size_t)sep->len) == 0) {
-            fa_vec_push(v, (uint64_t)fa_str_new(s->data + start, i - start));
+            vec_push_new_str(v, fa_str_new(s->data + start, i - start));
             start = i + sep->len;
             i = start - 1;
         }
     }
-    fa_vec_push(v, (uint64_t)fa_str_new(s->data + start, s->len - start));
+    vec_push_new_str(v, fa_str_new(s->data + start, s->len - start));
     return v;
 }
 
