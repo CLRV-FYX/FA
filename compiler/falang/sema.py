@@ -1303,8 +1303,14 @@ class Sema:
         self.error(f"运算符 '{e.op}' 不支持 {lt} 与 {rt}", e)
 
     def expr_call(self, e: Call) -> Type:
-        # 内建多态函数
-        if isinstance(e.callee, NameRef) and e.callee.name in BUILTIN_FNS:
+        # 内建多态函数。用户自己定义了同名函数时**让用户赢**：
+        # 内建分支以前排在最前面，于是 `fn sign(n: i64) -> str` 定义得好好的，
+        # 调用却被悄悄换成内建的 sign（返回 -1/0/1 的 i64）—— 不报错、
+        # 返回类型都不一样，是最难查的一类。名字解析（expr_name）本来就是
+        # 先查 self.fns 再查 BUILTIN_FNS，这里跟上就好。
+        if isinstance(e.callee, NameRef) and e.callee.name in BUILTIN_FNS \
+                and e.callee.name not in self.fns \
+                and not any(e.callee.name in t for t in self.local_fns):
             ats = [self.expr(a) for a in e.args]
             name = e.callee.name
             e.resolved = "builtin"

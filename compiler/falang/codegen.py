@@ -1918,7 +1918,11 @@ class FnGen:
     def gen_call(self, e: Call):
         callee = e.callee
         if isinstance(callee, NameRef):
-            if callee.name in BUILTIN_FNS:
+            # 只有 sema 也把这次调用解析成内建时才走内建路径。
+            # 以前这里只看名字：用户定义了 fn sign(n: i64) -> str，sema 已经
+            # 让用户的函数赢了，codegen 却又按名字拐进 gen_builtin("sign")，
+            # 实参/返回值全对不上（实测直接段错误）。
+            if callee.name in BUILTIN_FNS and getattr(e, "resolved", None) == "builtin":
                 return self.gen_builtin(callee.name, e)
             # 优先用 sema 解析出来的那个符号：嵌套函数被提升成了 `外层__内层`，
             # 按名字在顶层函数表里是查不到的（会误报「未定义函数 'inner'」）。

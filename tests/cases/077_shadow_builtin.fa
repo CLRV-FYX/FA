@@ -1,0 +1,28 @@
+# 回归：用户定义与内建同名的函数时，必须用用户的（内建只作后备）。
+# 以前 sema 让内建赢了，codegen 又只看名字 —— 于是 fn sign(...) -> str
+# 定义得好好的，调用却悄悄走了内建 sign（返回 i64），返回类型都对不上。
+fn sign(n: i64) -> str:
+    if n < 0 { return "负" }
+    if n == 0 { return "零" }
+    return "正"
+
+fn len(s: str) -> str:
+    return "len={s.len()}"
+
+fn min(a: i64, b: i64) -> str:
+    return "min({a},{b})"
+
+fn main() -> i64:
+    # 被覆盖的三个：走用户实现
+    print(sign(-3), sign(0), sign(7))
+    print(len("abc"))
+    print(min(4, 2))
+
+    # 没被覆盖的内建：照常可用
+    print(max(4, 2), abs(-5), clamp(9, 0, 5), str(42), chr(20320))
+
+    # 方法调用不受影响（内建方法与内建函数是两张表）
+    let v = Vec<i64>[3, 1, 2]
+    v.sort()
+    print(v.len(), v.to_str(), sign(v[0]), len(v.to_str()))
+    return 0
