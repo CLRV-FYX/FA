@@ -200,6 +200,23 @@ class Sema:
         raise FaTypeError(msg, line, col)
 
     # ------------------------------------------------------------- 类型解析
+    # 结构体/枚举在容器里存的是**装箱指针**，Vec/Map 存的是把手：拿它们当键，
+    # 哈希的是地址而不是内容 —— `m.set(P{x:1}, 5)` 之后 `m.get(P{x:1})` 永远查不到
+    # （两次装的是不同的盒子）。而且释放路径会把盒子当引用计数对象处理，实测退出时
+    # glibc 报 "free(): invalid pointer"；遍历这种 Map 还会让后端撞上 16 字节的
+    # 宽度表。与其留着一串坑，编译期就说清楚。
+    MAP_KEY_BAD = ("struct", "enum", "vec", "map", "arr")
+
+    def check_map_key(self, kt, node):
+        if kt is not None and kt.kind in self.MAP_KEY_BAD:
+            self.error(
+                f"Map 的键不能是 {kt}：键要能按内容哈希和比较，"
+                f"只有 str / 整数 / 浮点 / bool / char / 指针可以"
+                f"（结构体、枚举在容器里存的是装箱指针，哈希的是地址："
+                f"set 完再 get 查不到，程序退出时还会 free 出错）。"
+                f"想按结构体查，就用它那个唯一字段当键，或者用 Vec 自己找",
+                node)
+
     def resolve_type(self, node: Type) -> Type:
         if isinstance(node, TPtr):
             # 指针目标只要「已登记」就够了，不必现在完成布局：
@@ -240,8 +257,9 @@ class Sema:
         if name == "Map":
             if len(node.args) != 2:
                 self.error("Map 需要两个类型参数：Map<K, V>", node)
-            return map_of(self.resolve_type(node.args[0]),
-                          self.resolve_type(node.args[1]))
+            kt = self.resolve_type(node.args[0])
+            self.check_map_key(kt, node)
+            return map_of(kt, self.resolve_type(node.args[1]))
         if name in self.structs:
             t = self.structs[name]
             if t.fields is None:                    # 还没布局：现在就补上
@@ -1004,6 +1022,7 @@ class Sema:
                 return e.ty
             if e.name == "Map":
                 kt = self.resolve_type(e.targs[0])
+                self.check_map_key(kt, e)       # Map<K,V>() / Map<K,V>[k: v] 这条路
                 vt = self.resolve_type(e.targs[1])
                 if len(e.args) % 2:
                     self.error("Map 字面量要成对写：Map<K, V>[键: 值, ...]", e)

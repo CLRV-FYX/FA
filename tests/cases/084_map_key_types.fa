@@ -1,0 +1,14 @@
+# expect-compile-error: Map 的键不能是
+# Map 的键必须能按**内容**哈希和比较。结构体/枚举在容器里存的是装箱指针，
+# 哈希的是地址：set 完再 get 永远查不到；释放路径还会把盒子当引用计数对象，
+# 实测退出时 glibc 报 "free(): invalid pointer"；遍历它更会让后端撞上
+# 16 字节的宽度表（以前直接甩一页 Python traceback）。现在编译期就拦下来。
+struct P:
+    x: i64
+    name: str
+
+fn main() -> i64:
+    let m = Map<P, i64>()
+    m.set(P{x: 1, name: "一"}, 5)
+    print(m.len())
+    return 0

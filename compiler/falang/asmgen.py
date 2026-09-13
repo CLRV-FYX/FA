@@ -9,6 +9,7 @@ from .types import Type, TYPES
 from .regalloc import (allocate, lower_params, Reg, GP_REGS, FP_REGS, SCRATCH,
                        VOLATILE_GP, CALLEE_SAVED, compute_intervals, is_float_ty)
 from .sema import Sema
+from .codegen import FaCodegenError
 
 I64 = TYPES["i64"]
 INT_REGS = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
@@ -636,6 +637,20 @@ class AsmGen:
             return rr
         raise Exception(f"bad operand {v}")
 
+    def mem_word(self, sz) -> str:
+        """内存操作数的大小前缀（byte/word/dword/qword ptr）。
+
+        查不到就说明有人想把一个**多字宽的聚合值**当标量存取 —— 例如结构体当
+        Map 的键时，循环变量被绑成了一个 16 字节的「值」。以前这里直接
+        KeyError: 16，用户看到的是一整页 Python traceback；现在给一句人话。
+        """
+        w = {1: "byte", 2: "word", 4: "dword", 8: "qword"}.get(sz)
+        if w is None:
+            raise FaCodegenError(
+                f"内部错误：{sz} 字节的值被当成标量存取了（聚合值应该按地址传）。"
+                f"把这段代码提给作者；能绕开的话先绕开（例如别拿结构体当 Map 的键）")
+        return w + " ptr"
+
     def addr_str(self, base: str, off, ctx: Ctx) -> str:
         """[base + off]，off 可以是 int、已加载的寄存器名（Temp），
         或 (下标 Temp, 比例) —— 后者直接生成 x86 比例变址 [base + idx*scale]。"""
@@ -858,7 +873,7 @@ class AsmGen:
                 self.L(f"movsd {a}, {s}" if ty.name == "f64" else f"movss {a}, {s}")
             else:
                 sz = ty.size if ty else 8
-                word = {1: "byte", 2: "word", 4: "dword", 8: "qword"}[sz] + " ptr"
+                word = self.mem_word(sz)
                 if (isinstance(srcv, Const) and not isinstance(srcv.val, float)
                         and -2 ** 31 <= int(srcv.val) < 2 ** 31):
                     self.L(f"mov {word} {a}, {int(srcv.val)}")

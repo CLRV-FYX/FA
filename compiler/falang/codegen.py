@@ -1380,6 +1380,9 @@ class FnGen:
             else:
                 self.emit("CALL", r, [Sym("fa_str_of_ptr"), v], ty=STR)
         elif ty.kind == "vec" or ty.kind == "map":
+            if self._container_has_agg(ty):
+                # 元素里有结构体/枚举：运行时只会打 `{...}`，这一种在编译期自己拼
+                return self.gen_container_to_str_agg(v, ty)
             self.emit("CALL", r, [Sym("fa_container_to_str"), v,
                                   self.const(1 if ty.kind == "vec" else 2)], ty=STR)
         elif ty.kind == "pyobj":
@@ -1396,6 +1399,161 @@ class FnGen:
             self.emit("CALL", r, [Sym("fa_str_of_ptr"), v], ty=STR)
         self.mark_owned(r, STR)
         return r
+
+    # ------------------------------------------- 容器里装着结构体 / 枚举时的 to_str
+    def _container_has_agg(self, ty: Type) -> bool:
+        """容器里（含嵌套几层）有没有结构体 / 枚举元素。
+
+        运行时的 fa_container_to_str 只认元素 kind，结构体/枚举一律打成 `{...}`
+        —— 可 `print(v[0])` 明明是 `P { x: 1, y: 甲 }`。字段名只有编译器知道，
+        所以这种情况在编译期展开一个循环，逐元素调用 struct/enum 的 to_str。
+        """
+        if ty is None:
+            return False
+        if ty.kind == "vec":
+            return self._ty_has_agg(ty.elem)
+        if ty.kind == "map":
+            return self._ty_has_agg(ty.key) or self._ty_has_agg(ty.val)
+        return False
+
+    def _ty_has_agg(self, t) -> bool:
+        if t is None:
+            return False
+        if t.kind in ("struct", "enum"):
+            return True
+        if t.kind in ("vec", "map"):
+            return self._container_has_agg(t)
+        return False
+
+    def _vec_elem_at(self, obj, i, et: Type):
+        """取 Vec 的第 i 个元素（和 gen_for 里同一套取值规则）。"""
+        if is_agg(et):
+            # 结构体/枚举在槽里存的是**装箱指针**；fa_vec_get 返回借用引用
+            p = self.new_temp(ptr_to(et))
+            self.emit("CALL", p, [Sym("fa_vec_get"), obj, i], ty=ptr_to(et))
+            return p
+        if et.is_float:
+            raw = self.new_temp(I64)
+            self.emit("CALL", raw, [Sym("fa_vec_get"), obj, i], ty=I64)
+            return self.bitcast(raw, et)
+        r = self.new_temp(et)
+        self.emit("CALL", r, [Sym("fa_vec_get"), obj, i], ty=et)
+        return r
+
+    def _map_slot_at(self, obj, i, t: Type, is_key: bool):
+        """取 Map 第 i 个占用槽的键 / 值。"""
+        fn = "fa_map_key_at" if is_key else "fa_map_val_at"
+        if t is not None and is_agg(t):
+            p = self.new_temp(ptr_to(t))
+            self.emit("CALL", p, [Sym(fn), obj, i], ty=ptr_to(t))
+            return p
+        if t is not None and t.is_float:
+            raw = self.new_temp(I64)
+            self.emit("CALL", raw, [Sym(fn), obj, i], ty=I64)
+            return self.bitcast(raw, t)
+        r = self.new_temp(t or I64)
+        self.emit("CALL", r, [Sym(fn), obj, i], ty=t or I64)
+        return r
+
+    def _elem_to_str(self, v, ty: Type) -> Temp:
+        """容器元素的文本：str 加双引号、char 加单引号。
+
+        运行时的 fa_container_to_str 就是这么打的（`["a", "b"]`、`{'a'}`），
+        编译器自己拼的时候必须逐字对齐，否则同一个 Vec 因为元素类型不同
+        就有两种样子。
+        """
+        sv = self.gen_to_str(v, ty)
+        q = '"' if ty == STR else ("'" if ty == CHAR else "")
+        if not q:
+            return sv
+        return self.concat_str(self.concat_str(self.make_str(q), sv), self.make_str(q))
+
+    def gen_container_to_str_agg(self, v, ty: Type) -> Temp:
+        """`[P { x: 1 }, P { x: 2 }]` / `{"甲": P { x: 1 }}`。
+
+        两件事必须照着 gen_enum_to_str 的做法来（第一版两条都没做，实测打出来
+        缺元素、`print(v)` 直接段错误）：
+
+        1) 累积用的字符串放**栈槽**里。它的活跃区间横跨整个循环，留在临时寄存器里
+           会被循环体里的 CALL 冲掉；
+        2) 每轮新建的中间引用（字段名、字段值、拼接结果）要**在本轮内**释放
+           （release_new_refs）。它们是语句级登记的，留到语句末尾就已经在循环外面了，
+           那时寄存器里装的是完全无关的值 —— 这正是 if/match 表达式踩过的坑。
+           顺带也把峰值内存压下来：打印一千个元素不会同时活着几千个 FaStr。
+        """
+        is_vec = ty.kind == "vec"
+        et = ty.elem if is_vec else None
+        kt, vt = (ty.key, ty.val) if not is_vec else (None, None)
+
+        slot = self.emit_alloca(8)
+        # 槽里第一份也做成**堆上**的串（concat 的返回值 rc=1）：后面每轮覆盖时
+        # 都要 rc_dec 掉旧的那份，而静态串是不能减引用的。
+        head = self.concat_str(self.make_str(""), self.make_str("[" if is_vec else "{"))
+        self.take_owned(head, STR)
+        self.emit("STORE", args=[slot, head], extra=0, ty=STR)
+
+        n = self.new_temp(I64)
+        if is_vec:
+            self.emit("LOAD", n, [v], extra=8, ty=I64)
+        else:
+            self.emit("CALL", n, [Sym("fa_map_len"), v], ty=I64)
+        i = self.new_temp(I64)
+        self.emit("MOV", i, [self.const(0)], ty=I64)
+
+        top = self.new_label("cts")
+        body = self.new_label("ctsb")
+        end = self.new_label("ctse")
+        self.emit("LABEL", extra=top)
+        c = self.new_temp(BOOL)
+        self.emit("CMP", c, [i, n], extra="<", ty=I64)
+        self.emit("BR", args=[c], extra=(body, end))
+        self.emit("LABEL", extra=body)
+
+        # ---- 分隔符：不是第一个就补 ", "，同时把上一轮那份累积串放掉
+        nz = self.new_temp(BOOL)
+        self.emit("CMP", nz, [i, self.const(0)], extra=">", ty=I64)
+        l_sep = self.new_label("ctssep")
+        l_no = self.new_label("ctsnosep")
+        self.emit("BR", args=[nz], extra=(l_sep, l_no))
+        self.emit("LABEL", extra=l_sep)
+        sep_refs = set(self.owned_ids)
+        sep_aggs = set(self.agg_owned_ids)
+        cur = self.new_temp(STR)
+        self.emit("LOAD", cur, [slot], extra=0, ty=STR)
+        withsep = self.concat_str(cur, self.make_str(", "))
+        self.take_owned(withsep, STR)
+        self.emit("STORE", args=[slot, withsep], extra=0, ty=STR)
+        self.emit_rcdec_val(cur, STR)
+        self.release_new_refs(None, sep_refs, sep_aggs)
+        self.emit("LABEL", extra=l_no)
+
+        # ---- 这一轮的元素文本（结构体/枚举由编译器展开字段，其余类型照常）
+        ref_before = set(self.owned_ids)
+        agg_before = set(self.agg_owned_ids)
+        if is_vec:
+            piece = self._elem_to_str(self._vec_elem_at(v, i, et), et)
+        else:
+            ks = self._elem_to_str(self._map_slot_at(v, i, kt, True), kt)
+            piece = self.concat_str(ks, self.make_str(": "))
+            piece = self.concat_str(
+                piece, self._elem_to_str(self._map_slot_at(v, i, vt, False), vt))
+        cur2 = self.new_temp(STR)
+        self.emit("LOAD", cur2, [slot], extra=0, ty=STR)
+        acc = self.concat_str(cur2, piece)
+        self.take_owned(acc, STR)
+        self.emit("STORE", args=[slot, acc], extra=0, ty=STR)
+        self.emit_rcdec_val(cur2, STR)
+        self.release_new_refs(None, ref_before, agg_before)
+
+        self.emit("BIN", i, [i, self.const(1)], extra="+", ty=I64)
+        self.emit("JMP", extra=top)
+        self.emit("LABEL", extra=end)
+
+        fin = self.new_temp(STR)
+        self.emit("LOAD", fin, [slot], extra=0, ty=STR)
+        out = self.concat_str(fin, self.make_str("]" if is_vec else "}"))
+        self.emit_rcdec_val(fin, STR)
+        return out
 
     # ------------------------------------------------- 聚合值的可读化打印
     def concat_str(self, a, b) -> Temp:

@@ -35,8 +35,8 @@ fn main() -> i64:
     print(Ev.Nothing, Ev.One(5), Ev.Two("二", 1.5), Ev.Nest(i1))
 
     let vs = Vec<Inner>[i1, Inner { a: 1, b: "一" }]
-    # 容器里的元素是运行时格式化的（它不知道字段表，只能打 {...}），
-    # 但把元素取出来就是编译期已知的类型，照样能完整打印
+    # 容器里装着结构体/枚举时，to_str 在**编译期**展开（字段表只有编译器知道，
+    # 运行时的 fa_container_to_str 只能打 {...}），所以整个表也能完整打印
     print(vs, "|", vs[0], vs[1].b)
 
     print("插值 {o.tag} / {i1} / {Ev.One(3)}")
