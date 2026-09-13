@@ -17,6 +17,7 @@ BUILTIN_FNS = {
     "file_read", "file_write", "cmd",
     "hex", "oct", "bin", "args", "round", "trunc", "log2", "log10", "exp2",
     "hypot", "clamp", "sign", "sum", "sort", "reverse", "join", "chr",
+    "free",          # 释放 new / C 那边拿来的指针（引用计数类型不需要它）
 }
 
 # str / Vec / Map / pyobj / jobj 的内建方法
@@ -1325,6 +1326,15 @@ class Sema:
                 e.ty = STR
             elif name == "args":
                 e.ty = vec_of(STR)
+            elif name == "free":
+                if len(ats) != 1:
+                    self.error(f"free(p) 需要 1 个参数（要释放的指针），"
+                               f"这里给了 {len(ats)} 个", e)
+                if ats[0].kind != "ptr":
+                    self.error(f"free() 只能释放指针（`new` 出来的，或 C 那边 malloc 的），"
+                               f"得到 {ats[0]}。str / Vec / Map 是引用计数的，"
+                               "出作用域自动释放，不用也不能 free", e)
+                e.ty = VOID
             elif name in ("round", "trunc", "log2", "log10", "exp2", "hypot", "clamp"):
                 e.ty = TYPES["f64"] if (not ats or ats[0].is_float) else TYPES["i64"]
             elif name in ("assert", "print", "println", "write", "exit",

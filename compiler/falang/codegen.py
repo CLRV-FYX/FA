@@ -1431,8 +1431,14 @@ class FnGen:
                 self.emit("CMP", c, [rr, self.const(1)], extra="==", ty=I64)
             else:
                 self.emit("CMP", c, [rr, self.const(0)], extra=op, ty=I64)
-            self.mark_owned(a, lt)
-            self.mark_owned(b, rt)
+            # 这里**不能**把 a / b 登记成本语句拥有的引用：
+            # 它们是操作数（多半是变量里借来的值），不是比较产生的新对象。
+            # 以前登记了，语句末尾就多减一次引用计数 —— 堆上的字符串
+            # （`"he"+"llo"`、`v.join("-")` 这种）会被提前释放，函数收尾再减一次
+            # 就是 use-after-free。小字符串 glibc 一般不吭声，长字符串直接
+            # “corrupted size vs. prev_size while consolidating”。
+            # 操作数如果本身是新临时值（比如 `("a"+"b") == c` 的左边），
+            # 拼接那边已经登记过了，这里不用管。
             return c
         # 指针算术
         if lt.kind == "ptr" and rt.kind == "int" and op in ("+", "-"):
@@ -1790,6 +1796,13 @@ class FnGen:
         self.emit("CALL", p, [Sym("fa_alloc"), self.const(max(ty.size, 8))], ty=ptr_to(ty))
         if is_agg(ty):
             self.emit("MEMCPY", args=[p, v], extra=ty.size, ty=ty)
+            # 堆上这份拷贝必须自己拥有一份引用：结构体 / 枚举 / 数组里的
+            # str、Vec、Map 字段逐个 rc_inc（编译器为类型生成的 __fa_retain_<T>
+            # / fa_retain_arr）。以前只 memcpy 不 retain，`new P { name: "x" + "y" }`
+            # 里那个临时字符串在语句末尾就被释放，堆上的字段成了悬垂指针，
+            # 下一次读它是 heap-use-after-free（ASan 实测抓到）。
+            # 标量路径下面那支本来就 rc_inc 了，聚合路径漏了。
+            self.emit_rcinc(p, ty)
         else:
             self.emit("STORE", args=[p, v], extra=0, ty=ty)
             if T.t_is_refcounted(ty):
@@ -2526,10 +2539,30 @@ class FnGen:
             return self.call2(fn, a, b, tt)
         if name == "random":
             return self.call0("fa_random", I64)
+        if name == "free":
+            # 释放 `new` 出来的（或 C 那边 malloc 的）指针。
+            # 指向的对象如果自己有引用（结构体字段里的 str / Vec / Map、
+            # 数组元素），先逐个还掉，再把这块内存还给 malloc —— 只调 libc 的
+            # free 会把字段漏掉。
+            v = self.gen_expr(e.args[0])
+            inner = e.args[0].ty.inner
+            if inner is not None and T.t_is_refcounted(inner):
+                if inner.kind in ("struct", "enum", "arr"):
+                    self.emit_rcdec_val(v, inner)      # 收「对象地址」
+                else:
+                    held = self.new_temp(inner)        # *str 这种：先取出指针
+                    self.emit("LOAD", held, [v], extra=0, ty=inner)
+                    self.emit_rcdec_val(held, inner)
+            self.emit("CALL", None, [Sym("fa_free"), v])
+            return self.const(0, VOID)
         if name == "chr":
             # 码点 -> UTF-8 字符串（1~4 字节）
             v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
-            return self.call1("fa_str_chr", v, STR)
+            r = self.call1("fa_str_chr", v, STR)
+            # 新字符串归本语句所有，收尾要释放。以前漏了这行，chr() 的结果
+            # 在 print / 拼接以外没人管 —— 每调一次漏一个 FaStr。
+            self.mark_owned(r, STR)
+            return r
         if name in ("hex", "oct", "bin"):
             v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
             base = {"hex": 16, "oct": 8, "bin": 2}[name]

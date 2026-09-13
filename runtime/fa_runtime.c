@@ -897,7 +897,10 @@ void fa_print_i64(int64_t v) { char b[24]; int64_t n; fmt_i64(b, v, &n); obuf_pu
 void fa_print_f64(double v) {
     FaStr *s = fa_str_of_f64(v); fa_print_str(s); fa_free(s);
 }
-void fa_print_bool(int64_t v) { fa_print_str(fa_str_of_bool(v)); }
+/* 以前是 fa_print_str(fa_str_of_bool(v))：堆上分配一个 "true"/"false" 却从不
+   释放，于是**每打印一个布尔值就漏 20 字节**（fa_print_f64 / fa_print_ptr 都
+   记得 fa_free，就这里漏了）。直接往输出缓冲写死字符串，一次分配都不需要。 */
+void fa_print_bool(int64_t v) { obuf_put(v ? "true" : "false", v ? 4 : 5); }
 void fa_print_char(int64_t v) { char b[1] = {(char)v}; obuf_put(b, 1); }
 void fa_print_ptr(void *v) { FaStr *s = fa_str_of_ptr(v); fa_print_str(s); fa_free(s); }
 void fa_print_nl(void) { obuf_put("\n", 1); maybe_flush_nl(); }
