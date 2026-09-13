@@ -1164,8 +1164,18 @@ class Sema:
 
     def expr_binary(self, e: Binary) -> Type:
         if e.op in ("..", "..="):
-            self.expr(e.left)
-            self.expr(e.right)
+            lt = self.expr(e.left)
+            rt = self.expr(e.right)
+            if lt.kind == "range" or rt.kind == "range":
+                # `0..10..2` 被解析成 (0..10)..2。FA 的 range 只有「起..止」，
+                # 没有步进 —— 以前这里照样给个 range 类型，一路走到 asmgen 的
+                # 二元运算符表才 KeyError: '..'，把 Python 异常糊在用户脸上。
+                self.error("范围运算符不能连用：FA 的 range 只有 `起..止` / `起..=止`，"
+                           "没有步进写法。要跳着走请用 while，"
+                           "或 `for i in 0..n { let j = i * 2 }`", e)
+            for side, t in (("左", lt), ("右", rt)):
+                if t.kind not in ("int", "bool", "char"):
+                    self.error(f"range 的{side}端点必须是整数（或 char），得到 {t}", e)
             e.ty = Type("range", "range", 16, 8)
             return e.ty
         lt = self.expr(e.left)
