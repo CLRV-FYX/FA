@@ -191,7 +191,7 @@ python3 tests/run_asan.py             # 整套用例在 AddressSanitizer 底下�
   未知转义 `\q`、`s[0] = "x"` 改不可变字符串，都给人话报错（不再甩 Python traceback）
 - ✅ 四条互操作链路：C、C++（自动生成 shim）、Python（含 numpy）、Java（JDK 类库）；
   `str` 与 `char*` 在 extern 边界上双向自动转换，按值收发结构体这类对不上的 ABI 会编译期报错
-- ✅ 运行时安全网：段错误 / 除零 / 下标越界 / 空 Vec pop / assert 失败都有中文报错和非零退出码
+- ✅ 运行时安全网：段错误 / 栈溢出 / 除零 / 下标越界 / 空 Vec pop / assert 失败都有中文报错和非零退出码
 - ✅ 性能（2 核 Xeon 2.60 GHz 虚拟机，gcc 12.2，实测见 [06_性能.md](docs/06_性能.md)）：
 
   | 基准 | FA | C -O2 | C -O2 -fno-inline | CPython | FA/C | FA/C 同算法 |

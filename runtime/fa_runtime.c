@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <ucontext.h>
 
 /* Python / Java 桥接的引用释放钩子（由对应桥接模块注册） */
 void (*fa_py_decref)(void *) = NULL;
@@ -1153,11 +1154,35 @@ static struct { int sig; const char *msg; int64_t len; } fa_traps[] = {
     { SIGSEGV, "panic: 段错误（非法内存访问 / 野指针）\n", 0 },
 };
 
-static void fa_trap(int sig) {
+/* 栈溢出必须能报出来：主栈耗尽时内核没法在栈上放信号帧，处理器根本跑不起来，
+   进程就这么静默消失（shell 只看到一个奇怪的退出码，用户什么都看不到）。
+   所以给信号单独备一块栈，并用 SA_ONSTACK 让处理器在那上面跑。 */
+#define FA_ALTSTACK_BYTES (256 * 1024)
+static char fa_altstack_mem[FA_ALTSTACK_BYTES];
+
+static const char fa_msg_stackovf[] =
+    "panic: 栈溢出（递归太深 / 局部变量太大）\n";
+static int64_t fa_msg_stackovf_len = 0;
+
+/* x86-64 glibc 的 ucontext 里 RSP 在 gregs 的下标（REG_RSP，见 sys/ucontext.h） */
+#define FA_REG_RSP 15
+
+static void fa_trap(int sig, siginfo_t *si, void *uc) {
     const char *msg = "panic: 致命硬件陷阱\n";
     int64_t len = 27;
     for (unsigned i = 0; i < sizeof(fa_traps) / sizeof(fa_traps[0]); i++) {
         if (fa_traps[i].sig == sig) { msg = fa_traps[i].msg; len = fa_traps[i].len; break; }
+    }
+    if (sig == SIGSEGV && si != NULL && uc != NULL) {
+        /* 出错地址紧贴栈指针下方 = call/push 撞上了栈底的守护页，是栈溢出，
+           不是野指针。野指针解引用的地址一般离 RSP 很远。 */
+        unsigned long rsp =
+            (unsigned long)((ucontext_t *)uc)->uc_mcontext.gregs[FA_REG_RSP];
+        unsigned long addr = (unsigned long)(uintptr_t)si->si_addr;
+        if (addr <= rsp && rsp - addr < (1UL << 16)) {
+            msg = fa_msg_stackovf;
+            len = fa_msg_stackovf_len;
+        }
     }
     if (fa_olen) { fa_sys_write(1, fa_obuf, (int64_t)fa_olen); fa_olen = 0; }
     fa_sys_write(2, msg, len);
@@ -1166,9 +1191,20 @@ static void fa_trap(int sig) {
 
 __attribute__((constructor))
 static void fa_install_traps(void) {
+    stack_t ss;
+    ss.ss_sp = fa_altstack_mem;
+    ss.ss_size = sizeof(fa_altstack_mem);
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
+    fa_msg_stackovf_len = (int64_t)strlen(fa_msg_stackovf);
     for (unsigned i = 0; i < sizeof(fa_traps) / sizeof(fa_traps[0]); i++) {
+        struct sigaction sa;
         fa_traps[i].len = (int64_t)strlen(fa_traps[i].msg);
-        signal(fa_traps[i].sig, fa_trap);
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = fa_trap;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigemptyset(&sa.sa_mask);
+        sigaction(fa_traps[i].sig, &sa, NULL);
     }
 }
 
