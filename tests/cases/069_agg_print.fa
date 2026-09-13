@@ -1,0 +1,63 @@
+# 聚合值的可读化打印。以前结构体 / 枚举 / 数组一律走 fa_str_of_ptr，
+# `print(p)` 打出来是个栈地址（0x7ffd…）—— 初学者写的第一件事往往就是
+# print 一个结构体，看到地址只会懵。字段名、类型、偏移编译期全都知道，
+# 所以在 codegen 里直接展开成字符串拼接（嵌套的会递归下去），运行时不用改。
+# 顺带带出另一个崩溃：结构体里有**数组字段**时，asmgen 的 _field_ops 用到
+# `T.t_is_refcounted` 而文件里没有 `from . import types as T` -> NameError。
+struct Inner:
+    a: i64
+    b: str
+
+struct Outer:
+    tag: str
+    inner: Inner
+    list: Vec<i64>
+    arr: [i64; 3]
+    ratio: f64
+    ok: bool
+
+enum Ev:
+    Nothing
+    One(v: i64)
+    Two(s: str, n: f64)
+    Nest(i: Inner)
+
+struct Node:
+    val: i64
+    next: *Node
+
+fn main() -> i64:
+    let i1 = Inner { a: 7, b: "七" }
+    let o = Outer { tag: "外", inner: i1, list: [1, 2],
+                    arr: [9, 8, 7], ratio: 0.25, ok: true }
+    print(o)
+    print(o.inner, o.arr, o.list, o.ratio, o.ok)
+    print(Ev.Nothing, Ev.One(5), Ev.Two("二", 1.5), Ev.Nest(i1))
+
+    let vs = Vec<Inner>[i1, Inner { a: 1, b: "一" }]
+    # 容器里的元素是运行时格式化的（它不知道字段表，只能打 {...}），
+    # 但把元素取出来就是编译期已知的类型，照样能完整打印
+    print(vs, "|", vs[0], vs[1].b)
+
+    print("插值 {o.tag} / {i1} / {Ev.One(3)}")
+    print("str():", str(i1), str(Ev.Two("x", 2.0)).len())
+
+    let a = [1, 2, 3]
+    let sa = ["甲", "乙"]
+    print(a, sa, a[0])
+
+    # 递归结构体：指针字段打出来是地址（每次都不同），所以只比字段
+    let n2 = new Node { val: 2, next: nil }
+    let n1 = new Node { val: 1, next: n2 }
+    print(n1.val, n1.next.val, n1.next == nil, n2.next == nil)
+
+    # 反复格式化：拼接过程中的中间字符串引用计数错了就会在压堆时暴露
+    let total = 0
+    for k in 0..2000 {
+        total += str(Inner { a: k, b: "b{k}" }).len()
+    }
+    print("批量:", total)
+    let junk = Vec<str>[]
+    for i in 0..3000 { junk.push("填充{i}") }
+    print("堆检查:", junk.len(), str(o).len())
+    return 0

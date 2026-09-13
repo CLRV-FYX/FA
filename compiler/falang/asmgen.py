@@ -4,6 +4,7 @@ from __future__ import annotations
 import struct
 from typing import List, Dict, Optional, Tuple
 from .ir import Temp, Const, Sym, StrConst, Label, Instr, IRFunc, IRModule
+from . import types as T
 from .types import Type, TYPES
 from .regalloc import (allocate, lower_params, Reg, GP_REGS, FP_REGS, SCRATCH,
                        VOLATILE_GP, CALLEE_SAVED, compute_intervals, is_float_ty)

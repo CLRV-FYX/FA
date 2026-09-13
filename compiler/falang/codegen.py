@@ -1277,10 +1277,119 @@ class FnGen:
             self.emit("CALL", r, [Sym("fa_py_to_str"), v], ty=STR)
         elif ty.kind == "jobj":
             self.emit("CALL", r, [Sym("fa_jvm_to_str"), v], ty=STR)
-        elif ty.kind == "struct" or ty.kind == "arr" or ty.kind == "enum":
-            self.emit("CALL", r, [Sym("fa_str_of_ptr"), v], ty=STR)
+        elif ty.kind == "struct":
+            return self.gen_struct_to_str(v, ty)
+        elif ty.kind == "enum":
+            return self.gen_enum_to_str(v, ty)
+        elif ty.kind == "arr":
+            return self.gen_arr_to_str(v, ty)
         else:
             self.emit("CALL", r, [Sym("fa_str_of_ptr"), v], ty=STR)
+        self.mark_owned(r, STR)
+        return r
+
+    # ------------------------------------------------- 聚合值的可读化打印
+    def concat_str(self, a, b) -> Temp:
+        """两个 str 拼起来，返回一份**新的拥有**引用（fa_str_concat 的约定）。"""
+        r = self.new_temp(STR)
+        self.emit("CALL", r, [Sym("fa_str_concat"), a, b], ty=STR)
+        self.mark_owned(r, STR)
+        return r
+
+    def load_field_value(self, base, fty: Type, off: int):
+        """取某个偏移上的值：标量 LOAD 出来，聚合（结构体/枚举/数组）取它的地址。"""
+        if is_agg(fty):
+            t = self.new_temp(ptr_to(fty))
+            self.emit("LEA", t, [base], extra=off)
+            return t
+        t = self.new_temp(fty)
+        self.emit("LOAD", t, [base], extra=off, ty=fty)
+        return t
+
+    def gen_struct_to_str(self, v, ty: Type) -> Temp:
+        """`P { x: 1, y: "甲" }`。
+
+        以前结构体/枚举/数组一律走 fa_str_of_ptr —— `print(p)` 打出来是个栈地址
+        （0x7ffd…）。初学者写的第一件事往往就是 print 一个结构体，看到地址只会懵，
+        而字段名、类型、偏移在编译期全都是已知的，直接展开成字符串拼接就行，
+        运行时一行都不用改（嵌套结构体/数组/容器字段会递归下去）。
+        """
+        cur = self.make_str(f"{ty.name} {{ ")
+        for i, (fname, fty, off) in enumerate(ty.fields or []):
+            if i:
+                cur = self.concat_str(cur, self.make_str(", "))
+            cur = self.concat_str(cur, self.make_str(f"{fname}: "))
+            cur = self.concat_str(cur, self.gen_to_str(
+                self.load_field_value(v, fty, off), fty))
+        return self.concat_str(cur, self.make_str(" }"))
+
+    def gen_arr_to_str(self, v, ty: Type) -> Temp:
+        """`[1, 2, 3]` —— 格式与运行时的 Vec 打印**逐字对齐**：
+        str 元素加双引号、char 元素加单引号，其余原样。
+        （不对齐就会出现 `print(Vec<str>["甲"])` 是 `["甲"]`、
+        `print(["甲"])` 却是 `[甲]` 这种同一种东西两种样子的尴尬。）"""
+        et = ty.elem
+        quote = '"' if et == STR else ("'" if et == CHAR else "")
+        cur = self.make_str("[")
+        for i in range(getattr(ty, "count", 0) or 0):
+            if i:
+                cur = self.concat_str(cur, self.make_str(", "))
+            if quote:
+                cur = self.concat_str(cur, self.make_str(quote))
+            cur = self.concat_str(cur, self.gen_to_str(
+                self.load_field_value(v, et, i * max(et.size, 1)), et))
+            if quote:
+                cur = self.concat_str(cur, self.make_str(quote))
+        return self.concat_str(cur, self.make_str("]"))
+
+    def gen_enum_to_str(self, v, ty: Type) -> Temp:
+        """`Circle(r: 2)` / `Dot` —— 按 tag 分支，各变体拼各自的载荷。
+
+        每个分支的中间引用必须**在分支内**释放（release_new_refs）：它们是语句级
+        登记的，留到语句末尾就已经在分支外面了，走别的变体那条路径上寄存器里装的
+        是完全无关的值（这正是 if/match 表达式踩过的那个坑）。
+        """
+        variants = getattr(ty, "variants", None) or []
+        if not variants:
+            r = self.new_temp(STR)
+            self.emit("CALL", r, [Sym("fa_str_of_ptr"), v], ty=STR)
+            self.mark_owned(r, STR)
+            return r
+        tag = self.new_temp(I64)
+        self.emit("LOAD", tag, [v], extra=0, ty=I64)
+        slot = self.emit_alloca(8)
+        # 兜底：tag 不在任何变体里（不该发生）就打个类型名，别去解引用 0
+        self.emit("STORE", args=[slot, self.make_str(ty.name)], extra=0, ty=STR)
+        end = self.new_label("etosend")
+        for vname, vfields, vi in variants:
+            build = self.new_label("etosv")
+            nxt = self.new_label("etosn")
+            c = self.new_temp(BOOL)
+            self.emit("CMP", c, [tag, self.const(vi)], extra="==", ty=I64)
+            self.emit("BR", args=[c], extra=(build, nxt))
+            self.emit("LABEL", extra=build)
+            ref_before = set(self.owned_ids)
+            agg_before = set(self.agg_owned_ids)
+            cur = self.make_str(vname)
+            if vfields:
+                cur = self.concat_str(cur, self.make_str("("))
+                for j, (fname, fty, off) in enumerate(vfields):
+                    if j:
+                        cur = self.concat_str(cur, self.make_str(", "))
+                    if fname:
+                        cur = self.concat_str(cur, self.make_str(f"{fname}: "))
+                    # 载荷区从第 8 字节开始（前 8 字节是 tag）
+                    cur = self.concat_str(cur, self.gen_to_str(
+                        self.load_field_value(v, fty, 8 + off), fty))
+                cur = self.concat_str(cur, self.make_str(")"))
+            self.take_owned(cur, STR)          # 结果交给槽，别在下面被放掉
+            self.emit("STORE", args=[slot, cur], extra=0, ty=STR)
+            self.release_new_refs(None, ref_before, agg_before)
+            self.emit("JMP", extra=end)
+            self.emit("LABEL", extra=nxt)
+        self.emit("LABEL", extra=end)
+        r = self.new_temp(STR)
+        self.emit("LOAD", r, [slot], extra=0, ty=STR)
         self.mark_owned(r, STR)
         return r
 

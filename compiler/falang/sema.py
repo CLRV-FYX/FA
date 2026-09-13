@@ -949,7 +949,9 @@ class Sema:
             if e.name == "Vec":
                 et = self.resolve_type(e.targs[0])
                 for a in e.args:
-                    at = self.expr(a)
+                    # 把元素类型当上下文传下去：`Vec<Vec<i64>>[[1], [2, 3]]` 里
+                    # 那个 [1] 才知道自己该是 Vec<i64> 而不是数组 [i64 x 1]
+                    at = self.expr(a, expect=et)
                     self.check_assignable(et, at, e, "Vec 元素")
                 e.ty = T.vec_of(et)
                 return e.ty
@@ -959,9 +961,10 @@ class Sema:
                 if len(e.args) % 2:
                     self.error("Map 字面量要成对写：Map<K, V>[键: 值, ...]", e)
                 for i in range(0, len(e.args), 2):
-                    self.check_assignable(kt, self.expr(e.args[i]), e.args[i], "Map 的键")
-                    self.check_assignable(vt, self.expr(e.args[i + 1]), e.args[i + 1],
-                                          "Map 的值")
+                    self.check_assignable(kt, self.expr(e.args[i], expect=kt),
+                                          e.args[i], "Map 的键")
+                    self.check_assignable(vt, self.expr(e.args[i + 1], expect=vt),
+                                          e.args[i + 1], "Map 的值")
                 e.ty = T.map_of(kt, vt)
                 return e.ty
             self.error(f"未知构造器 '{e.name}'", e)
