@@ -194,8 +194,9 @@ def gen_cxx_shim(sema: Sema, out_dir: str, base_dir: str) -> Optional[str]:
         lines.append(f"#include \"{h}\"")
     lines.append("")
     for d in sema.cxx_shims:
-        params = [c_param_decl(p.name, d.sym.params[i]) for i, p in enumerate(d.params)]
-        ret = c_type_of(d.sym.ret) if d.sym.ret else "void"
+        params = ["%s %s" % (ffi_c_type(d.sym.params[i]), p.name)
+                  for i, p in enumerate(d.params)]
+        ret = ffi_c_type(d.sym.ret) if d.sym.ret else "void"
         args = ", ".join(p.name for p in d.params)
         body = f"return {d.name}({args});" if (d.sym.ret and d.sym.ret.kind != "void") \
             else f"{d.name}({args});"
@@ -206,12 +207,14 @@ def gen_cxx_shim(sema: Sema, out_dir: str, base_dir: str) -> Optional[str]:
     return path
 
 
-def dl_c_type(ty) -> str:
-    """dlopen 转发 shim 里用的 C 类型。
+def ffi_c_type(ty) -> str:
+    """自动生成的 shim（C++ / dlopen）里用的 C 类型。
 
     和 c_type_of 的区别只有 str：代码生成那边对 extern 函数的 str 参数会先转成
-    char*（返回值反过来从 char* 拷一份成 FaStr），所以 shim 必须按 char* 声明，
-    不然 C 库里那个 `int f(const char*)` 收到的是一个 FaStr 指针，读到的是乱码。
+    char*（返回值反过来从 char* 拷一份成 FaStr），所以 shim 必须按 char* 声明。
+    C++ shim 以前直接用 c_type_of，于是 `fn name_len(s: str) -> i32` 生成的是
+    `int32_t fa_name_len(FaStr* s) { return name_len(s); }` —— g++ 当场报
+    「cannot convert FaStr* to const char*」，任何收字符串的 C++ 函数都用不了。
     """
     if ty is not None and ty.kind == "str":
         return "const char*"
@@ -259,11 +262,11 @@ def gen_dl_shim(sema: Sema, out_dir: str, base_dir: str) -> Optional[str]:
             else os.path.abspath(os.path.join(base_dir, path))
         h = handles[lib]
         sym = sema.fns[d.name]
-        ps = [dl_c_type(sym.params[i]) for i in range(len(d.params))]
+        ps = [ffi_c_type(sym.params[i]) for i in range(len(d.params))]
         names = [p.name for p in d.params]
         sig = ", ".join("%s %s" % (t, n) for t, n in zip(ps, names)) or "void"
         psig = ", ".join(ps) or "void"
-        ret = dl_c_type(sym.ret) if sym.ret else "void"
+        ret = ffi_c_type(sym.ret) if sym.ret else "void"
         args = ", ".join(names)
         slot = "fa_dl_p%d" % idx
         has_ret = bool(sym.ret) and sym.ret.kind != "void"
@@ -413,6 +416,14 @@ def build(src_path: str, out_path: str = None, emit_asm: bool = False,
 
     # 链接
     link_flags += ["-lm", "-ldl", "-lpthread"]
+    if sema.cxx_shims:
+        # shim 是 g++ 编的，可最后这一步链接用的是 cc（gcc），只带了 -lm/-ldl/-lpthread。
+        # 于是只要 C++ 那头用到 new/delete、STL 容器或者异常，链接就是一串
+        # undefined reference（`operator delete(void*, unsigned long)`、
+        # `__cxa_allocate_exception`、`std::__throw_length_error`……）。
+        # 以前只有「C++ 库自己是 g++ 链出来的 .so」这种情况能蒙对 —— 库的
+        # DT_NEEDED 把 libstdc++ 带进来了；纯头文件（inline / 模板）的用法必然失败。
+        link_flags.append("-lstdc++")
     if with_py:
         _, pyld = py_config()
         link_flags += pyld
