@@ -2530,45 +2530,56 @@ class FnGen:
         if name in self.VEC_GLOBAL_FNS and t0 is not None and t0.kind == "vec":
             return self._builtin_on_container(name, e)
         if name in ("print", "println"):
-            for i, a in enumerate(e.args):
-                if i:
-                    sp = self.make_str(" ")
-                    self.emit("CALL", None, [Sym("fa_print_str"), sp])
+            # 分两趟：先把每个实参求值成「要打印的东西」，再一个一个写出去。
+            #
+            # 以前是「求一个写一个」，两处会露馅：
+            # 1) print("返回", f()) 里 f() 自己要打印时，它的输出会插进外层 print
+            #    中间 —— 实测打出来是「返回 defer 跑了」换行「0」，看着像 print 坏了；
+            # 2) 容器/聚合值是在「写」的那一步才转字符串的，于是 print(v, v.pop())
+            #    打出的是 pop 之后的 v。
+            # 现在实参（含 to_str 转换）在第一趟全部算完，顺序和 C 的
+            # printf("%s %d", a, f()) 一致。
+            items = []
+            for a in e.args:
                 v = self.gen_expr(a)
-                if a.ty == STR:
-                    self.emit("CALL", None, [Sym("fa_print_str"), v])
-                elif a.ty.kind == "float":
-                    self.emit("CALL", None, [Sym("fa_print_f64"), self.coerce(v, a.ty, F64)])
-                elif a.ty.kind == "bool":
-                    self.emit("CALL", None, [Sym("fa_print_bool"), v])
-                elif a.ty == CHAR:
-                    self.emit("CALL", None, [Sym("fa_print_char"), v])
-                elif a.ty.kind == "ptr":
-                    if self._is_cstr_ptr(a.ty):
+                t = a.ty
+                if t.kind in ("vec", "map", "pyobj", "jobj", "struct", "arr", "enum"):
+                    items.append(("str", self.gen_to_str(v, t)))
+                elif t == STR:
+                    items.append(("str", v))
+                elif t.kind == "float":
+                    items.append(("f64", self.coerce(v, t, F64)))
+                elif t.kind == "bool":
+                    items.append(("bool", v))
+                elif t == CHAR:
+                    items.append(("char", v))
+                elif t.kind == "ptr":
+                    if self._is_cstr_ptr(t):
                         cs = self.new_temp(STR)
                         self.emit("CALL", cs, [Sym("fa_str_from_cstr"), v], ty=STR)
-                        self.emit("CALL", None, [Sym("fa_print_str"), cs])
                         # fa_str_from_cstr 拷出一份新 FaStr，打完就得放：
                         # 以前没登记，print 一个 C 的 char* 就漏一份拷贝。
                         self.mark_owned(cs, STR)
+                        items.append(("str", cs))
                     else:
-                        self.emit("CALL", None, [Sym("fa_print_ptr"), v])
-                elif a.ty.kind in ("vec", "map", "pyobj", "jobj"):
-                    s = self.gen_to_str(v, a.ty)
-                    self.emit("CALL", None, [Sym("fa_print_str"), s])
-                elif a.ty.kind in ("struct", "arr", "enum"):
-                    s = self.gen_to_str(v, a.ty)
-                    self.emit("CALL", None, [Sym("fa_print_str"), s])
+                        items.append(("ptr", v))
                 else:
-                    self.emit("CALL", None, [Sym("fa_print_i64"),
-                                             self.coerce(v, a.ty, I64)])
+                    items.append(("i64", self.coerce(v, t, I64)))
+            for i, (kind, v) in enumerate(items):
+                if i:
+                    sp = self.make_str(" ")
+                    self.emit("CALL", None, [Sym("fa_print_str"), sp])
+                self.emit("CALL", None, [Sym("fa_print_" + kind), v])
             self.emit("CALL", None, [Sym("fa_print_nl")])
             return self.const(0, VOID)
         if name == "write":
+            # 同 print：实参（含 to_str 转换）全部算完再写出去
+            vals = []
             for a in e.args:
                 v = self.gen_expr(a)
-                s = v if a.ty == STR else self.gen_to_str(v, a.ty)
-                self.emit("CALL", None, [Sym("fa_print_str"), s])
+                vals.append(v if a.ty == STR else self.gen_to_str(v, a.ty))
+            for sv in vals:
+                self.emit("CALL", None, [Sym("fa_print_str"), sv])
             return self.const(0, VOID)
         if name == "len":
             a = self.gen_expr(e.args[0])

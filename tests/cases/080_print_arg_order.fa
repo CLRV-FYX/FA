@@ -1,0 +1,32 @@
+# 回归：print 的实参必须**全部求值完**再输出。
+# 以前是「求一个写一个」，两处露馅：
+#   print("返回", f()) 里 f() 自己打印时，输出插到外层中间（「返回 defer 跑了」/「0」）；
+#   容器是在「写」那步才 to_str 的，于是 print(v, v.pop()) 打出 pop 之后的 v。
+fn noisy() -> i64:
+    print("  noisy 先说完")
+    return 33
+
+fn with_defer() -> str:
+    defer print("  defer 也先说完")
+    return "值"
+
+fn main() -> i64:
+    print("外层 =", noisy())
+    print("外层:", with_defer())
+
+    let v = Vec<i64>[1, 2, 3]
+    print(v, v.len(), v.pop(), v.len())
+
+    let m = Map<str, i64>()
+    m.set("a", 1)
+    print(m, m.len())
+    m.set("b", 2)
+    print(m, m.len())
+
+    let mut n = 0
+    print(n, n + 1, n + 2)
+
+    let s = "abc"
+    print(s, s.upper(), s.len(), s.slice(0, 1))
+    write("write 也是: ", noisy(), "\n")
+    return 0
