@@ -1,0 +1,32 @@
+# 内存压力：大量创建/释放 + 提前 return（这条路径以前一个引用都不释放）
+struct Node:
+    name: str
+    kids: Vec<i64>
+    meta: Map<str,i64>
+
+fn mk(i: i64) -> Node:
+    let n = Node { name: "node{i}", kids: Vec<i64>[], meta: Map<str,i64>() }
+    n.kids.push(i)
+    n.meta.set("i", i)
+    return n
+
+fn early(i: i64) -> str:
+    let s = "p{i}".replace("p", "prefix-")
+    let v = Vec<str>()
+    v.push(s)
+    if i >= 0:
+        return s                    # 早退：s / v 必须被正确释放
+    return "none"
+
+fn main() -> i64:
+    let acc = 0
+    let i = 0
+    while i < 200000:
+        let n = mk(i)
+        acc = acc + n.kids.get(0) + n.meta.get("i")
+        let r = early(i)
+        let a: [str; 2] = [n.name, r]
+        acc = acc + len(a[0])
+        i = i + 1
+    print("ok", acc)
+    return 0

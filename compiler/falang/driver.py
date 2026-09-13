@@ -5,6 +5,8 @@ import os
 import sys
 import glob
 import shutil
+import tempfile
+import threading
 import subprocess
 import sysconfig
 from typing import List, Optional, Tuple
@@ -64,6 +66,24 @@ def py_config() -> Tuple[List[str], List[str]]:
     return cflags, ldflags
 
 
+def py_available() -> Tuple[bool, str]:
+    """`use py` 能否真正链接：必须有 Python.h（python3-dev）。
+
+    只报「检测到了 include 目录」是不够的 —— Debian/Ubuntu 上装了 python3 但
+    没装 python3-dev 时，sysconfig 依然给出 include 路径，直到 gcc 才炸出
+    `fatal error: Python.h: No such file or directory`。这里提前判定，
+    好给用户一句可执行的安装建议。
+    """
+    inc = sysconfig.get_paths().get("include") or ""
+    if inc and os.path.exists(os.path.join(inc, "Python.h")):
+        return True, os.path.join(inc, "Python.h")
+    return False, (f"未找到 Python.h（sysconfig include = {inc or '空'}）。"
+                   f"请安装 Python 开发头文件：\n"
+                   f"    Debian/Ubuntu: sudo apt install python3-dev\n"
+                   f"    Fedora/RHEL  : sudo dnf install python3-devel\n"
+                   f"    macOS        : brew install python")
+
+
 def java_config() -> Tuple[List[str], List[str], str]:
     home = os.environ.get("JAVA_HOME")
     cands = []
@@ -90,6 +110,11 @@ def cxx() -> str:
 
 
 # --------------------------------------------------------------- 运行时构建
+# 运行时 .o 是全进程共享的缓存：同一进程内的多线程（tests/run_tests.py 并行）
+# 与不同进程（同时跑多个 fa）都可能同时构建它，因此既要加锁，也要用唯一临时名。
+_RUNTIME_LOCK = threading.Lock()
+
+
 def build_runtime(build_dir: str, with_py: bool, with_java: bool) -> List[str]:
     os.makedirs(build_dir, exist_ok=True)
     py_cflags, _ = py_config()
@@ -97,14 +122,23 @@ def build_runtime(build_dir: str, with_py: bool, with_java: bool) -> List[str]:
 
     def obj(name: str, src: str, extra: List[str], tag: str) -> str:
         out = os.path.join(build_dir, f"{name}{tag}.o")
-        if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(src):
-            return out
-        cmd = [cc(), "-O2", "-std=gnu11", "-fno-strict-aliasing",
-               f"-I{RUNTIME_DIR}", f"-I{os.path.dirname(RUNTIME_DIR)}"]
-        cmd += extra + ["-c", src, "-o", out]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"运行时编译失败 ({src}):\n{r.stderr}")
+        with _RUNTIME_LOCK:
+            if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(src):
+                return out
+            # 唯一临时名（进程 + 线程）+ 原子改名：并行构建时既不会读到半截 .o，
+            # 也不会两个线程抢同一个临时文件。
+            tmp_out = f"{out}.{os.getpid()}.{threading.get_ident()}.tmp"
+            cmd = [cc(), "-O2", "-std=gnu11", "-fno-strict-aliasing",
+                   f"-I{RUNTIME_DIR}", f"-I{os.path.dirname(RUNTIME_DIR)}"]
+            cmd += extra + ["-c", src, "-o", tmp_out]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode != 0:
+                    raise RuntimeError(f"运行时编译失败 ({src}):\n{r.stderr}")
+                os.replace(tmp_out, out)
+            finally:
+                if os.path.exists(tmp_out):
+                    os.unlink(tmp_out)
         return out
 
     objs = [obj("fa_runtime", os.path.join(RUNTIME_DIR, "fa_runtime.c"), [], ""),
@@ -142,6 +176,8 @@ def frontend(src: str, filename: str, opt: int = 2) -> CompileResult:
         res.ok = False; res.stage = "语法分析"; res.error = e.pretty(src)
     except FaTypeError as e:
         res.ok = False; res.stage = "语义分析"; res.error = e.pretty(src)
+    except CG.FaCodegenError as e:
+        res.ok = False; res.stage = "代码生成"; res.error = e.pretty(src)
     except Exception as e:
         import traceback
         res.ok = False; res.stage = "代码生成"
@@ -158,8 +194,9 @@ def gen_cxx_shim(sema: Sema, out_dir: str, base_dir: str) -> Optional[str]:
         lines.append(f"#include \"{h}\"")
     lines.append("")
     for d in sema.cxx_shims:
-        params = [c_param_decl(p.name, d.sym.params[i]) for i, p in enumerate(d.params)]
-        ret = c_type_of(d.sym.ret) if d.sym.ret else "void"
+        params = ["%s %s" % (ffi_c_type(d.sym.params[i]), p.name)
+                  for i, p in enumerate(d.params)]
+        ret = ffi_c_type(d.sym.ret) if d.sym.ret else "void"
         args = ", ".join(p.name for p in d.params)
         body = f"return {d.name}({args});" if (d.sym.ret and d.sym.ret.kind != "void") \
             else f"{d.name}({args});"
@@ -169,6 +206,86 @@ def gen_cxx_shim(sema: Sema, out_dir: str, base_dir: str) -> Optional[str]:
         f.write("\n".join(lines) + "\n")
     return path
 
+
+def ffi_c_type(ty) -> str:
+    """自动生成的 shim（C++ / dlopen）里用的 C 类型。
+
+    和 c_type_of 的区别只有 str：代码生成那边对 extern 函数的 str 参数会先转成
+    char*（返回值反过来从 char* 拷一份成 FaStr），所以 shim 必须按 char* 声明。
+    C++ shim 以前直接用 c_type_of，于是 `fn name_len(s: str) -> i32` 生成的是
+    `int32_t fa_name_len(FaStr* s) { return name_len(s); }` —— g++ 当场报
+    「cannot convert FaStr* to const char*」，任何收字符串的 C++ 函数都用不了。
+    """
+    if ty is not None and ty.kind == "str":
+        return "const char*"
+    return c_type_of(ty)
+
+
+def gen_dl_shim(sema: Sema, out_dir: str, base_dir: str) -> Optional[str]:
+    """`use lib "./x.so":` 声明的函数 -> 运行时 dlopen + dlsym 的转发 shim。
+
+    这些符号不参与链接（库要等程序跑起来才打开），所以代码生成那边照常
+    `call add2`，链接时找到的就是这个 shim：第一次调用时 dlopen 库、dlsym 符号，
+    之后走缓存下来的函数指针。路径在编译期解析成绝对路径（相对源文件），
+    这样可执行文件换个目录跑也找得到库。
+    """
+    if not sema.lazy_syms:
+        return None
+    L = []
+    L.append("/* FA 自动生成：use lib 的运行时 dlopen 转发 */")
+    L.append("#include <dlfcn.h>")
+    L.append("#include <stdint.h>")
+    L.append("#include <stdbool.h>")
+    L.append("#include <stdlib.h>")
+    L.append("#include <stdio.h>")
+    L.append("")
+    L.append("static void fa_dl_die(const char *what, const char *where) {")
+    L.append('    fputs("panic: ", stderr);')
+    L.append("    fputs(what, stderr);")
+    L.append('    if (where && *where) { fputs(" ", stderr); fputs(where, stderr); }')
+    L.append('    fputs("\\n", stderr);')
+    L.append("    exit(1);")
+    L.append("}")
+    L.append("")
+    # 每个库一个句柄变量，第一次用到时 dlopen
+    handles = {}
+    for d, path in sema.lazy_syms:
+        lib = path if (os.path.isabs(path) or "/" not in path) \
+            else os.path.abspath(os.path.join(base_dir, path))
+        if lib not in handles:
+            handles[lib] = "fa_dl_h%d" % len(handles)
+    for lib, h in handles.items():
+        L.append('static void *%s = 0;   /* %s */' % (h, lib))
+    L.append("")
+    for idx, (d, path) in enumerate(sema.lazy_syms):
+        lib = path if (os.path.isabs(path) or "/" not in path) \
+            else os.path.abspath(os.path.join(base_dir, path))
+        h = handles[lib]
+        sym = sema.fns[d.name]
+        ps = [ffi_c_type(sym.params[i]) for i in range(len(d.params))]
+        names = [p.name for p in d.params]
+        sig = ", ".join("%s %s" % (t, n) for t, n in zip(ps, names)) or "void"
+        psig = ", ".join(ps) or "void"
+        ret = ffi_c_type(sym.ret) if sym.ret else "void"
+        args = ", ".join(names)
+        slot = "fa_dl_p%d" % idx
+        has_ret = bool(sym.ret) and sym.ret.kind != "void"
+        L.append("static %s (*%s)(%s) = 0;" % (ret, slot, psig))
+        L.append("%s %s(%s) {" % (ret, d.name, sig))
+        L.append("    if (!%s) {" % slot)
+        L.append('        if (!%s) %s = dlopen("%s", RTLD_NOW | RTLD_GLOBAL);' % (h, h, lib))
+        L.append('        if (!%s) fa_dl_die("打不开动态库", "%s");' % (h, lib))
+        L.append('        %s = (%s (*)(%s))dlsym(%s, "%s");' % (slot, ret, psig, h, d.name))
+        L.append('        if (!%s) fa_dl_die("动态库里找不到这个符号", "%s（在 %s 里）");'
+                 % (slot, d.name, lib))
+        L.append("    }")
+        L.append("    %s%s(%s);" % ("return " if has_ret else "", slot, args))
+        L.append("}")
+        L.append("")
+    out = os.path.join(out_dir, "_fa_dl_shim.c")
+    with open(out, "w") as f:
+        f.write("\n".join(L) + "\n")
+    return out
 
 # --------------------------------------------------------------- main 引导
 def gen_main_shim(sema: Sema, out_dir: str) -> str:
@@ -218,6 +335,25 @@ def build(src_path: str, out_path: str = None, emit_asm: bool = False,
         return 1
     sema = r.sema
 
+    # 依赖预检：把「还缺什么才能编译」说成人话，而不是让 gcc 抛一堆 fatal error
+    if sema.py_used:
+        ok, info = py_available()
+        if not ok:
+            sys.stderr.write(f"[依赖缺失] 源码用了 `use py`，需要内嵌 CPython。\n{info}\n")
+            return 1
+    if sema.java_used:
+        _, _, jh = java_config()
+        if not jh:
+            sys.stderr.write("[依赖缺失] 源码用了 `use java`，但找不到 JDK"
+                             "（需要 <jdk>/include/jni.h 与 libjvm.so）。\n"
+                             "    Debian/Ubuntu: sudo apt install default-jdk\n"
+                             "    或：export JAVA_HOME=/path/to/jdk\n")
+            return 1
+    if sema.cxx_shims and shutil.which(cxx()) is None:
+        sys.stderr.write(f"[依赖缺失] 源码用了 `use cxx`（需要自动生成并编译 shim），"
+                         f"但找不到 {cxx()}。\n")
+        return 1
+
     asm_path = os.path.join(work, base + ".s")
     with open(asm_path, "w") as f:
         f.write(r.asm)
@@ -251,6 +387,18 @@ def build(src_path: str, out_path: str = None, emit_asm: bool = False,
             return 1
         link_objs.append(shim_obj)
 
+    # `use lib "./x.so"` 的运行时 dlopen 转发
+    dlshim = gen_dl_shim(sema, work, os.path.dirname(src_path))
+    if dlshim:
+        dl_obj = os.path.join(work, "_fa_dl_shim.o")
+        cmd = [cc(), "-O2", f"-I{RUNTIME_DIR}", "-c", dlshim, "-o", dl_obj]
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if p.returncode != 0:
+            sys.stderr.write(f"[dlopen shim 编译失败] {p.stderr}\n")
+            sys.stderr.write(f"  已生成的 shim：{dlshim}\n")
+            return 1
+        link_objs.append(dl_obj)
+
     # main 引导
     main_c = gen_main_shim(sema, work)
     main_obj = os.path.join(work, "_fa_main_shim.o")
@@ -268,6 +416,14 @@ def build(src_path: str, out_path: str = None, emit_asm: bool = False,
 
     # 链接
     link_flags += ["-lm", "-ldl", "-lpthread"]
+    if sema.cxx_shims:
+        # shim 是 g++ 编的，可最后这一步链接用的是 cc（gcc），只带了 -lm/-ldl/-lpthread。
+        # 于是只要 C++ 那头用到 new/delete、STL 容器或者异常，链接就是一串
+        # undefined reference（`operator delete(void*, unsigned long)`、
+        # `__cxa_allocate_exception`、`std::__throw_length_error`……）。
+        # 以前只有「C++ 库自己是 g++ 链出来的 .so」这种情况能蒙对 —— 库的
+        # DT_NEEDED 把 libstdc++ 带进来了；纯头文件（inline / 模板）的用法必然失败。
+        link_flags.append("-lstdc++")
     if with_py:
         _, pyld = py_config()
         link_flags += pyld
@@ -301,13 +457,23 @@ def build(src_path: str, out_path: str = None, emit_asm: bool = False,
     return 0
 
 
-def run_file(src_path: str, args=None) -> int:
-    """编译并运行（用于测试与 fa run）"""
-    import tempfile
+def run_file(src_path: str, args=None, opt: int = 2, keep: bool = False,
+             verbose: bool = False) -> int:
+    """编译到临时目录并运行（`fa run` 与测试都走这里）。
+
+    刻意**不在源码目录留任何产物**：以前 `fa run x.fa` 会在 x.fa 旁边生成
+    可执行文件和 .fa_work/，跑一次示例就把仓库弄脏了。
+    """
     tmp = tempfile.mkdtemp(prefix="fa_run_")
-    out = os.path.join(tmp, "a.out")
-    rc = build(src_path, out, keep=True, verbose=False)
-    if rc != 0:
-        return rc
-    args = args or []
-    return subprocess.run([out] + list(args), cwd=os.path.dirname(os.path.abspath(src_path))).returncode
+    try:
+        out = os.path.join(tmp, "a.out")
+        rc = build(src_path, out, opt=opt, keep=True, verbose=verbose)
+        if rc != 0:
+            return rc
+        return subprocess.run([out] + list(args or []),
+                              cwd=os.path.dirname(os.path.abspath(src_path))).returncode
+    finally:
+        if keep:
+            print(f"[FA] 中间产物保留在 {tmp}")
+        else:
+            shutil.rmtree(tmp, ignore_errors=True)

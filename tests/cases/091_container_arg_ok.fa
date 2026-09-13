@@ -1,0 +1,38 @@
+# 容器实参收紧之后，**这些**照样成立（别把合法的写法一起拒了）：
+# 数值间隐式提升、bool/char 当整数、any、同类型，以及写明白的转换。
+struct P:
+    x: i64
+
+fn main() -> i64:
+    let v = Vec<i64>[1]
+    v.push(2.9)                 # f64 -> i64 截断（和 let n: i64 = 2.9 一个规矩）
+    v.push(true)                # bool 当整数
+    v.push('A')                 # char 当整数
+    v.push("42".to_i64())       # 要解析就写明白
+    print("i64 表:", v.to_str())
+
+    let s = Vec<str>["a"]
+    s.push(str(7))              # 要字符串化就写明白
+    s.push("{7}")
+    s.push("b")
+    print("str 表:", s.to_str())
+
+    let f = Vec<f64>[1.0]
+    f.push(2)                   # i64 -> f64
+    print("f64 表:", f.to_str(), f.sum())
+
+    let ps = Vec<P>[]
+    ps.push(P{x: 1})
+    ps.resize(2, P{x: 9})       # 填充值也按元素类型查
+    print("struct 表:", ps.to_str())
+
+    let m = Map<str, i64>()
+    m.set("k", 1)
+    m.set("j", 2.7)             # 值同样允许数值提升
+    print("map:", m.len(), m.has("k"), m.get("k"))
+
+    let n = Vec<Vec<i64>>[]
+    n.push(Vec<i64>[1, 2])      # 嵌套：整张表当元素
+    n.resize(2)                 # 不给填充值就补零值（空表）
+    print("嵌套:", n.to_str())
+    return 0

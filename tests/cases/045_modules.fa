@@ -1,0 +1,22 @@
+# 多文件模块：use "xxx.fa" 把另一个文件的顶层声明导入进来
+# （以前 sema 直接忽略这种 use，调用导入的函数只会报「未定义的标识符」）
+use "mod/vecmath.fa"
+
+fn describe(l: Level) -> str:
+    match l:
+        Level.Low:
+            return "low"
+        Level.High(n):
+            return "high {n}"
+        Level.Named(tag):
+            return "named {tag}"
+    return "?"
+
+fn main() -> i64:
+    let v = Vec2 { x: 3.0, y: 4.0 }
+    print(v.norm())                     # 5.0    —— 导入的结构体 + 方法
+    print(v.scaled(SCALE_DEFAULT).x)    # 6.0    —— 孙模块的常量与函数
+    print(circle_area(2.0))             # 导入的函数用了导入的常量
+    print(TAU)
+    print(describe(Level.Low), describe(Level.High(7)), describe(Level.Named("x")))
+    return 0

@@ -1,0 +1,9 @@
+# expect-exit: 1
+# expect-stdout: 1
+# expect-stderr: index out of range
+# Vec 越界读：先打印出合法的那次，再明确报错退出（不能静默返回垃圾）
+fn main() -> i64:
+    let v = Vec<i64>[1, 2, 3]
+    print(v.get(0))
+    print(v.get(9))
+    return 0

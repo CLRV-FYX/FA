@@ -1,0 +1,8 @@
+# raise "消息" 就是 panic("消息") 的糖。
+# 以前它被降成一个叫 __fa_panic 的调用（运行时里没这东西），报「未定义的标识符」。
+# expect-exit: 1
+# expect-stderr: panic: 自己抛出来的消息
+fn main() -> i64:
+    print("这一行还是会打出来")
+    raise "自己抛出来的消息"
+    return 0

@@ -1,0 +1,12 @@
+# expect-compile-error: Vec 元素: 类型不匹配，期望 i64，实际 str
+# 回归：内建方法以前只查参数**个数**，不查类型，于是容器这条路比赋值松得多 ——
+# `let n: i64 = "42"` 是编译错误，`Vec<i64>` 上 `v.push("42")` 却编得过
+# （coerce 把它当 fa_str_to_i64 解析，解析不出数字就静默存 0，实测
+# `Vec<i64>[1].push("x")` 打出 [1, 0]）；反过来 `Vec<str>.push(7)` 也悄悄 to_str。
+# 下标赋值 `v[0] = "x"` 倒是查的，同一个意思两种规矩。
+# 现在统一：能赋给 T 变量的，才能推进 Vec<T> / 当 Map<K,V> 的键值。
+fn main() -> i64:
+    let v = Vec<i64>[1]
+    v.push("42")
+    print(v.to_str())
+    return 0

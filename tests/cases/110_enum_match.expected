@@ -1,0 +1,9 @@
+Green true false true
+true false 绿
+Dot Circle(r: 2.0) Rect(w: 3.0, h: 4.0) Tagged(s: 甲, xs: [1, 2])
+0.0 12.0 12.0 -1.0
+三 别的 绿
+0.0
+[Dot, Circle(r: 2.0)]
+{"k": Blue} 蓝
+3 0

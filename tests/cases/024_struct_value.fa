@@ -1,0 +1,44 @@
+# 结构体是值类型：拷贝 / 赋值 / 嵌套 / 反复创建都必须各自独立地管理引用
+struct Inner:
+    tag: str
+    n: i64
+
+struct Outer:
+    inner: Inner
+    name: str
+    items: Vec<i64>
+
+impl Outer:
+    fn label(self) -> str:
+        return "{self.name}/{self.inner.tag}"
+
+fn make(i: i64) -> Outer:
+    let o = Outer {
+        inner: Inner { tag: "t{i}", n: i },
+        name: "obj{i}",
+        items: Vec<i64>[]
+    }
+    o.items.push(i)
+    return o
+
+fn main() -> i64:
+    let a = make(1)
+    print(a.label(), a.inner.n, a.items.get(0))
+
+    let b = a                    # 拷贝：两份各自持有引用
+    b.name = "renamed"
+    b.inner.n = 99
+    print(a.name, a.inner.n)     # a 不受影响
+    print(b.name, b.inner.n)
+
+    a = b                        # 覆盖赋值：旧值要正确释放
+    print(a.name, a.inner.n)
+
+    let sum = 0
+    let i = 0
+    while i < 5000:              # 反复创建/释放，任何计数错误都会在这里炸掉
+        let t = make(i)
+        sum = sum + t.inner.n
+        i = i + 1
+    print(sum)
+    return 0

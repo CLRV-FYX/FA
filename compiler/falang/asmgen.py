@@ -4,10 +4,12 @@ from __future__ import annotations
 import struct
 from typing import List, Dict, Optional, Tuple
 from .ir import Temp, Const, Sym, StrConst, Label, Instr, IRFunc, IRModule
+from . import types as T
 from .types import Type, TYPES
 from .regalloc import (allocate, lower_params, Reg, GP_REGS, FP_REGS, SCRATCH,
                        VOLATILE_GP, CALLEE_SAVED, compute_intervals, is_float_ty)
 from .sema import Sema
+from .codegen import FaCodegenError
 
 I64 = TYPES["i64"]
 INT_REGS = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
@@ -161,7 +163,9 @@ class AsmGen:
             self.R("    .section .data")
             for t in self.mod.descs:
                 self.R(f"__fa_desc_{t.name}:")
-                for fname, fty, off in t.fields:
+                # 枚举没有扁平字段表（载荷偏移取决于 tag），它的释放/加引用
+                # 完全由下面生成的 __fa_drop_/__fa_retain_ 函数负责，这里只留终止符。
+                for fname, fty, off in (t.fields or []):
                     k = fty.rc_kind
                     if k == 0 and fty.kind == "struct" and fty.is_refcounted:
                         k = 1000 + fty.desc_id
@@ -169,23 +173,22 @@ class AsmGen:
                         self.R(f"    .quad {off}")
                         self.R(f"    .quad {k}")
                 self.R("    .quad -1")
-        # 懒绑定符号全局槽
-        if getattr(self.sema, "lazy_syms", None):
-            self.R("    .section .data")
-            for name, path in self.sema.lazy_syms:
-                self.R(f"__fa_lazy_{name}:")
-                self.R("    .quad 0")
-                self.R(f"__fa_lazy_name_{name}:")
-                self.R(f"    .asciz \"{name}\"")
-            self.R("__fa_lazy_lib:")
-            self.R(f"    .asciz \"{self.sema.lazy_syms[0][1]}\"")
+        # 顶层 let 的全局变量槽（.bss 天然清零，所以「没写初值」就等于零值）
+        gvars = getattr(self.mod, "gvar_slots", None)
+        if gvars:
+            self.R("    .section .bss")
+            self.R("    .align 8")
+            for label, size in gvars:
+                self.R(f"{label}:")
+                self.R(f"    .zero {size}")
         # 函数
         self.R("    .text")
         for f in self.mod.funcs:
             self.emit_func(f)
-        # 结构体/枚举析构函数
+        # 结构体/枚举的析构与 retain 函数
         for t in self.mod.descs:
             self.emit_drop_func(t)
+            self.emit_retain_func(t)
         # 模块初始化（.init_array）
         self.emit_init()
         # 浮点常量区
@@ -198,38 +201,123 @@ class AsmGen:
         self.R("    .section .note.GNU-stack,\"\",@progbits")
         return "\n".join(o) + "\n"
 
-    # ---------------------------------------------------------------- 析构函数
-    def emit_drop_func(self, t: Type):
-        self.R(f"    .globl __fa_drop_{t.name}")
-        self.R(f"__fa_drop_{t.name}:")
+    # ------------------------------------------------- 析构 / retain 函数
+    # 结构体是值类型，但可能含有引用计数字段（str / Vec / Map / 嵌套 struct）。
+    # 编译器为每个这类的结构体生成两个函数：
+    #   __fa_drop_<T>    逐字段释放一次引用（作用域结束 / 覆盖赋值时调用）
+    #   __fa_retain_<T>  逐字段各加一次引用（**拷贝**结构体时调用）
+    # 有 drop 没 retain，`let b = a` 就会让两个变量共享同一份引用而不加计数
+    # —— 作用域结束时双重释放（实测 `free(): double free detected`）。
+    #
+    # 两个函数都必须把结构体基址放进 rbx：循环里每次 `call` 之后 rdi 都是垃圾
+    # （rdi 是调用者保存寄存器），以前直接用 [rdi+off] 读第二个字段 -> 段错误。
+    def _field_ops(self, t: Type, base: str, mode: str, fields=None,
+                   add: int = 0, tag: str = ""):
+        """生成对每个引用计数字段的 inc/dec 指令。mode = 'drop' | 'retain'
+
+        fields/add/tag 给枚举用：枚举的字段偏移是「相对载荷区」的，
+        要加上 8 字节的 tag，而且只能处理当前变体的那些字段。
+        """
+        for fname, fty, foff in (t.fields if fields is None else fields):
+            off = foff + add
+            lbl = f".fa{'d' if mode == 'drop' else 'r'}{t.name}_{tag}{off}"
+            if fty.kind == "arr" and T.t_is_refcounted(fty.elem):
+                # 数组字段：交给运行时按元素类型循环处理
+                fn = "fa_drop_arr" if mode == "drop" else "fa_retain_arr"
+                ek = fty.elem.rc_kind
+                nested = (fty.elem.kind == "struct" and fty.elem.is_refcounted)
+                self.R(f"    lea rdi, [{base}+{off}]")
+                self.R(f"    mov rsi, {fty.count}")
+                self.R(f"    mov rdx, {max(fty.elem.size, 1)}")
+                self.R(f"    mov rcx, {0 if nested else ek}")
+                if nested:
+                    self.R(f"    lea r8, [rip+__fa_drop_{fty.elem.name}]"
+                           if mode == "drop" else
+                           f"    lea r8, [rip+__fa_retain_{fty.elem.name}]")
+                else:
+                    self.R("    xor r8d, r8d")
+                self.R(f"    call {fn}")
+                continue
+            k = fty.rc_kind
+            nested_struct = (k == 0 and fty.kind == "struct" and fty.is_refcounted)
+            if k == 0 and not nested_struct:
+                continue
+            if nested_struct:
+                # 嵌套结构体是**内联**的：地址就是 base+off，不是 [base+off]
+                # （以前这里 mov rax,[rdi+off] 取到的是内层结构体的第一个字段）
+                callee = f"__fa_drop_{fty.name}" if mode == "drop" else f"__fa_retain_{fty.name}"
+                self.R(f"    lea rdi, [{base}+{off}]")
+                self.R(f"    call {callee}")
+                continue
+            self.R(f"    mov rax, [{base}+{off}]")
+            self.R("    test rax, rax")
+            self.R(f"    jz {lbl}")
+            self.R("    mov rdi, rax")
+            if mode == "drop":
+                self.R(f"    mov rsi, {k}")
+                self.R("    call fa_rc_dec")
+            else:
+                self.R("    call fa_rc_inc")
+            self.R(f"{lbl}:")
+
+    def _agg_func_header(self, name: str):
+        self.R(f"    .globl {name}")
+        self.R(f"{name}:")
         self.R("    test rdi, rdi")
-        self.R("    jz __fa_drop_ret_%s" % t.name)
+        self.R(f"    jz {name}_null")
         self.R("    push rbp")
         self.R("    mov rbp, rsp")
-        for fname, fty, off in t.fields:
-            k = fty.rc_kind
-            if k == 0 and fty.kind == "struct" and fty.is_refcounted:
-                k = 1000 + fty.desc_id
-                self.R(f"    mov rdi, [rdi+{off}]" if False else f"    mov rax, [rdi+{off}]")
-                self.R(f"    test rax, rax")
-                self.R(f"    jz .fad{t.name}{off}")
-                self.R(f"    mov rdi, rax")
-                self.R(f"    call __fa_drop_{fty.name}")
-                self.R(f".fad{t.name}{off}:")
-                continue
-            if k != 0:
-                self.R(f"    mov rax, [rdi+{off}]")
-                self.R(f"    test rax, rax")
-                self.R(f"    jz .fad{t.name}{off}")
-                self.R(f"    mov rdi, rax")
-                self.R(f"    mov rsi, {k}")
-                self.R(f"    call fa_rc_dec")
-                self.R(f".fad{t.name}{off}:")
-        self.R("    mov rsp, rbp")
+        self.R("    push rbx")
+        self.R("    sub rsp, 8")          # 3 次压栈后 rsp 回到 16 字节对齐
+        self.R("    mov rbx, rdi")
+
+    def _agg_func_footer(self, name: str):
+        self.R("    lea rsp, [rbp-8]")
+        self.R("    pop rbx")
         self.R("    pop rbp")
         self.R("    ret")
-        self.R(f"__fa_drop_ret_%s:" % t.name)
+        self.R(f"{name}_null:")
         self.R("    ret")
+
+    def _enum_ops(self, t: Type, base: str, mode: str):
+        """枚举：先读 tag，只碰当前变体的载荷。
+
+        别的变体在载荷区里留下的是**上一个值的垃圾字节**（栈槽是复用的），
+        按扁平字段表去释放它们 = free 一个野指针。
+        """
+        pfx = "d" if mode == "drop" else "r"
+        variants = [(vn, fl, i) for (vn, fl, i) in (t.variants or []) if fl]
+        if not variants:
+            return
+        out = f".fae{pfx}{t.name}_out"
+        self.R(f"    mov rax, [{base}]")               # tag
+        for vi, (vn, fl, i) in enumerate(variants):
+            self.R(f"    cmp rax, {i}")
+            self.R(f"    je .fae{pfx}{t.name}_{vi}")
+        self.R(f"    jmp {out}")
+        for vi, (vn, fl, i) in enumerate(variants):
+            self.R(f".fae{pfx}{t.name}_{vi}:")
+            self._field_ops(t, base, mode, fields=fl, add=8, tag=f"v{vi}_")
+            self.R(f"    jmp {out}")
+        self.R(f"{out}:")
+
+    def emit_drop_func(self, t: Type):
+        name = f"__fa_drop_{t.name}"
+        self._agg_func_header(name)
+        if t.kind == "enum":
+            self._enum_ops(t, "rbx", "drop")
+        else:
+            self._field_ops(t, "rbx", "drop")
+        self._agg_func_footer(name)
+
+    def emit_retain_func(self, t: Type):
+        name = f"__fa_retain_{t.name}"
+        self._agg_func_header(name)
+        if t.kind == "enum":
+            self._enum_ops(t, "rbx", "retain")
+        else:
+            self._field_ops(t, "rbx", "retain")
+        self._agg_func_footer(name)
 
     # ---------------------------------------------------------------- 初始化
     def emit_init(self):
@@ -257,16 +345,15 @@ class AsmGen:
             self.R(f"    mov rdi, {t.desc_id}")
             self.R(f"    lea rsi, [rip+__fa_desc_{t.name}]")
             self.R("    call fa_register_desc")
-        lazy = getattr(self.sema, "lazy_syms", None)
-        if lazy:
-            self.R("    lea rdi, [rip+__fa_lazy_lib]")
-            self.R("    call fa_dl_open")
-            self.R("    mov rbx, rax")
-            for name, path in lazy:
-                self.R(f"    mov rdi, rbx")
-                self.R(f"    lea rsi, [rip+__fa_lazy_{name}]")
-                self.R(f"    lea rdx, [rip+__fa_lazy_name_{name}]")
-                self.R("    call fa_dl_bind")
+            # retain 函数必须在 .init_array 里注册：容器 (Vec/Map) 在运行时
+            # 需要靠它给装箱的结构体元素加引用，编译器不知道那些调用点。
+            self.R(f"    mov rdi, {t.desc_id}")
+            self.R(f"    lea rsi, [rip+__fa_retain_{t.name}]")
+            self.R("    call fa_register_retain")
+            # 容器里装箱的结构体/枚举在 fa_rc_dec 时也要走这个函数
+            self.R(f"    mov rdi, {t.desc_id}")
+            self.R(f"    lea rsi, [rip+__fa_drop_{t.name}]")
+            self.R("    call fa_register_drop")
         self.R("    mov rsp, rbp")
         self.R("    pop rbp")
         self.R("    ret")
@@ -280,6 +367,8 @@ class AsmGen:
             licm(f)                      # 必须在 lower_params 之前：形参此时还是「无定义点」
         lower_params(f)
         self.loc, self.spills, self.intervals, used_callee = allocate(f)
+        # 序言 push 的就是这一份，RET 的尾声必须用**同一份**（见 epilogue 调用处）
+        self.used_callee = used_callee
         self.cur = f
         self.alloca_off = {}
         self.save_slots = {}
@@ -528,6 +617,20 @@ class AsmGen:
             return rr
         raise Exception(f"bad operand {v}")
 
+    def mem_word(self, sz) -> str:
+        """内存操作数的大小前缀（byte/word/dword/qword ptr）。
+
+        查不到就说明有人想把一个**多字宽的聚合值**当标量存取 —— 例如结构体当
+        Map 的键时，循环变量被绑成了一个 16 字节的「值」。以前这里直接
+        KeyError: 16，用户看到的是一整页 Python traceback；现在给一句人话。
+        """
+        w = {1: "byte", 2: "word", 4: "dword", 8: "qword"}.get(sz)
+        if w is None:
+            raise FaCodegenError(
+                f"内部错误：{sz} 字节的值被当成标量存取了（聚合值应该按地址传）。"
+                f"把这段代码提给作者；能绕开的话先绕开（例如别拿结构体当 Map 的键）")
+        return w + " ptr"
+
     def addr_str(self, base: str, off, ctx: Ctx) -> str:
         """[base + off]，off 可以是 int、已加载的寄存器名（Temp），
         或 (下标 Temp, 比例) —— 后者直接生成 x86 比例变址 [base + idx*scale]。"""
@@ -595,10 +698,15 @@ class AsmGen:
         if op == "NOP":
             return
         if op == "LABEL":
-            # 循环头对齐到 16 字节：实测同一个循环因起始地址不同可差 40% 以上
+            # 循环头对齐到 **32** 字节：同一个循环只因起始地址不同就能差 40%。
+            # 16 字节对齐不够 —— Intel 的 uop cache (DSB) 以 32 字节为窗口，
+            # 循环头落在窗口中间时前端会退回传统译码路径。
+            # 实测「1 亿次算术循环」（本机 gcc -O2 = 86 ms）：
+            #   .p2align 4 -> 123 ms（1.43x）   .p2align 5 -> 98 ms（1.15x）
+            #   .p2align 6 -> 104 ms（1.22x，还白占 icache）
             if self.opt >= 1 and isinstance(ins.extra, str) \
                     and ins.extra in getattr(self, "loop_headers", ()):
-                self.R("    .p2align 4")
+                self.R("    .p2align 5")
             self.R(f"{ins.extra}:")
             return
         if op == "ASM":
@@ -744,16 +852,18 @@ class AsmGen:
                 s = self.opreg(srcv, ctx)
                 self.L(f"movsd {a}, {s}" if ty.name == "f64" else f"movss {a}, {s}")
             else:
-                s = self.opreg(srcv, ctx, allow_imm=True)
                 sz = ty.size if ty else 8
-                if isinstance(srcv, Const) and -2 ** 31 <= int(srcv.val) < 2 ** 31 and sz == 8:
-                    self.L(f"mov qword ptr {a}, {int(srcv.val)}")
+                word = self.mem_word(sz)
+                if (isinstance(srcv, Const) and not isinstance(srcv.val, float)
+                        and -2 ** 31 <= int(srcv.val) < 2 ** 31):
+                    self.L(f"mov {word} {a}, {int(srcv.val)}")
                 else:
-                    word = {1: "byte", 2: "word", 4: "dword", 8: "qword"}[sz] + " ptr"
-                    if isinstance(srcv, Const):
-                        self.L(f"mov {word} {a}, {int(srcv.val)}")
-                    else:
-                        self.L(f"mov {word} {a}, {rn(s, sz)}")
+                    # mov 到内存只接受 32 位有符号立即数。放不下的（例如 f64 的
+                    # 位模式 4621537642612260864，也就是 `fv[0] = 9.5` 走内联
+                    # 写元素那条路）必须先 movabs 进寄存器，否则汇编器报
+                    # `operand type mismatch for 'mov'`。
+                    s = self.opreg(srcv, ctx, allow_imm=False)
+                    self.L(f"mov {word} {a}, {rn(s, sz)}")
             return
         if op == "LEA":
             ptr = self.opreg(ins.args[0], ctx)
@@ -805,14 +915,26 @@ class AsmGen:
         if op == "RET":
             if ins.args:
                 v = ins.args[0]
-                if is_float_ty(v.ty if isinstance(v, Temp) else None):
+                # 返回值的类型以 RET 指令自己带的 ty 为准：`return 1.5` 传下来的是
+                # 一个 Const（不是 Temp），只看 v.ty 会把它当整数返回，
+                # 于是生成 `mov rax, xmm8` —— GNU as 直接报 operand type mismatch。
+                vty = ins.ty if is_float_ty(ins.ty) else \
+                    (v.ty if isinstance(v, Temp) else None)
+                if is_float_ty(vty):
                     s = self.opreg(v, ctx)
                     self.L(f"movsd xmm0, {s}")
                 else:
                     s = self.opreg(v, ctx)
                     if s != "rax":
                         self.L(f"mov rax, {s}")
-            self.epilogue(f, [r for r in CALLEE_SAVED if r in set(self.loc.values())])
+            # 必须用序言 push 的那一份列表：以前这里按「此刻 self.loc 里出现过哪些
+            # 被调用者保存寄存器」重新算一遍，两者并不总是相同（某个寄存器在序言里
+            # push 了，但走到这条 RET 时它分到的临时值已经溢出/死亡）。
+            # push 了 4 个却只 pop 3 个 -> 最后那个（比如 r14）永远不会被还原，
+            # 而 rbx/r12-r15 是**被调用者保存**的：调用方正拿着它存活跃值，
+            # 于是一层递归回来数据就变了（实测递归求字符串长度：轻则算错，
+            # 重则段错误 / malloc 报堆损坏）。
+            self.epilogue(f, self.used_callee)
             return
         if op == "RCINC":
             v = self.opreg(ins.args[0], ctx)
@@ -971,6 +1093,11 @@ class AsmGen:
                     self.L(f"mov {d}, {a}")
                 self.L(f"neg {d}")
         elif op == "!":
+            # cmp 的左操作数不能是立即数：`not true` 会生成 cmp 1, 0
+            if _is_imm(a):
+                ta = ctx.scratch()
+                self.L(f"mov {ta}, {a}")
+                a = ta
             self.L(f"cmp {a}, 0")
             self.L("sete al")
             self.L(f"movzx {d}, al")
@@ -1009,7 +1136,11 @@ class AsmGen:
     def emit_conv(self, ins: Instr, ctx: Ctx):
         src_ty = ins.extra
         dst_ty = ins.ty
-        a = self.opreg(ins.args[0], ctx)
+        # cvtsi2sd / movsx 都不接受立即数，而整数常量默认就是按立即数给出的
+        # （`p.combine(1, 2.5, ...)` 里那个 1 要转成 f64）——
+        # 于是汇编器报 `operand type mismatch for 'cvtsi2sd'`。
+        # 转换的源一律先落到寄存器里。
+        a = self.opreg(ins.args[0], ctx, allow_imm=False)
         d = self.dst_reg(ins, ctx)
         # int -> float
         if src_ty.kind in ("int", "bool", "char") and dst_ty.is_float:
@@ -1121,45 +1252,82 @@ class AsmGen:
                     _ni += 1
                 else:
                     nstack += 1
-        stack_bytes = align16(nstack * 8) if nstack else 0
-        if stack_bytes:
-            self.L(f"sub rsp, {stack_bytes}")
+        # 每个实参的目标位置：前 6 个整数走 rdi/rsi/rdx/rcx/r8/r9，
+        # 前 8 个浮点走 xmm0-7，其余按原顺序进栈。
+        # 间接调用（CALLPTR）的函数指针也要先求出来：它可能正待在某个实参的
+        # 目标寄存器里（rdi 是最常见的），等实参搬完再取就已经被冲掉了。
+        pv = self.opreg(callee, ctx) if is_ptr else None
 
-        # 先把所有实参求到寄存器（避免后续覆盖）
-        vals = []
+        plan = []                       # (实参, 当前所在, 目标寄存器 or None=进栈)
+        ireg_i = freg_i = stack_i = 0
         for a in args:
-            vals.append(self.opreg(a, ctx))
-
-        ireg_i = 0
-        freg_i = 0
-        stack_i = 0
-        for a, v in zip(args, vals):
+            v = self.opreg(a, ctx)      # 先全部求值，避免后面互相覆盖
             if is_float_ty(getattr(a, "ty", None)):
-                if freg_i < 8:
-                    tgt = f"xmm{freg_i}"
-                    if v != tgt:
-                        self.L(f"movsd {tgt}, {v}")
-                else:
-                    self.L(f"movsd [rsp+{stack_i*8}], {v}")
-                    stack_i += 1
+                tgt = f"xmm{freg_i}" if freg_i < 8 else None
                 freg_i += 1
             else:
-                if ireg_i < 6:
-                    tgt = INT_REGS[ireg_i]
-                    if v != tgt:
-                        self.L(f"mov {tgt}, {v}")
-                else:
-                    self.L(f"mov qword ptr [rsp+{stack_i*8}], {v}")
-                    stack_i += 1
+                tgt = INT_REGS[ireg_i] if ireg_i < 6 else None
                 ireg_i += 1
+            plan.append([a, v, tgt, stack_i if tgt is None else -1])
+            if tgt is None:
+                stack_i += 1
+
+        # 「并行搬运」冲突：某个实参此刻正待在**另一个实参的目标寄存器**里。
+        # 典型场景是方法里再调函数 —— 形参 k 被固定在 xmm0，而第一个实参也要进
+        # xmm0，顺序搬运会把 k 冲掉（实测 `scale(self.x, k)` 算出 x*x）。
+        # 办法：把这些值先挪到栈上暂存，再从暂存处搬到目标寄存器。
+        tgt_regs = {p[2] for p in plan if p[2]}
+        stage_them = [p for p in plan if p[2] and p[1] != p[2] and p[1] in tgt_regs]
+        stage_pv = pv is not None and pv in tgt_regs
+        nstage = len(stage_them) + (1 if stage_pv else 0)
+        stage_base = nstack * 8
+        frame = align16(stage_base + nstage * 8) if (nstack or nstage) else 0
+        if frame:
+            self.L(f"sub rsp, {frame}")
+
+        # 进栈的实参先写：此时还没有任何目标寄存器被覆盖
+        for a, v, tgt, soff in plan:
+            if tgt is None:
+                if is_float_ty(getattr(a, "ty", None)):
+                    self.L(f"movsd [rsp+{soff * 8}], {v}")
+                else:
+                    self.L(f"mov qword ptr [rsp+{soff * 8}], {v}")
+
+        # 需要暂存的实参（以及函数指针）
+        si = 0
+        if stage_pv:
+            self.L(f"mov qword ptr [rsp+{stage_base}], {pv}")
+            pv = f"qword ptr [rsp+{stage_base}]"
+            si += 1
+        for p in stage_them:
+            a, v, tgt, _soff = p
+            slot = f"[rsp+{stage_base + si * 8}]"
+            if is_float_ty(getattr(a, "ty", None)):
+                self.L(f"movsd {slot}, {v}")
+            else:
+                self.L(f"mov qword ptr {slot}, {v}")
+            p[1] = slot
+            si += 1
+
+        for a, v, tgt, _soff in plan:
+            if tgt is None or v == tgt:
+                continue
+            if is_float_ty(getattr(a, "ty", None)):
+                self.L(f"movsd {tgt}, {v}")
+            else:
+                self.L(f"mov {tgt}, {v}")
         fs = ins.extra
         varargs = getattr(fs, "varargs", False) if fs is not None else False
         # al 只在「可变参数」调用里才有意义（= 使用的向量寄存器个数）。
         # 已知被调函数不是可变参数时直接省掉这条 mov（gcc 也不生成）。
-        if varargs or is_ptr or fs is None:
+        # **间接调用一律省掉**：FA 的函数指针类型表达不了可变参数，目标函数根本不读
+        # al；更要紧的是函数指针此刻可能正好待在 rax 里 —— 以前这里先来一句
+        # `mov eax, 0` 再 `call rax`，等于跳到地址 0。实测「把比较函数当参数传进
+        # 排序函数」必定段错误，而同一段代码写成直接调用就没事（直接调用的符号
+        # 不占 rax）。
+        if not is_ptr and (varargs or fs is None):
             self.L(f"mov eax, {freg_i if varargs else 0}")
         if is_ptr:
-            pv = self.opreg(callee, ctx)
             if pv == "rax":
                 self.L("call rax")
             else:
@@ -1168,8 +1336,8 @@ class AsmGen:
         else:
             name = callee.name if isinstance(callee, Sym) else str(callee)
             self.L(f"call {name}")
-        if stack_bytes:
-            self.L(f"add rsp, {stack_bytes}")
+        if frame:
+            self.L(f"add rsp, {frame}")
         # 返回值
         if ins.dst is not None:
             if is_float_ty(ret_ty):

@@ -1,0 +1,12 @@
+# `use c "头文件" lib "库名"` = 链接期导入：lib 后面可以是 -l 的名字（"m" -> -lm）、
+# 也可以是 .so/.a 的路径。str 参数自动转 char*，C 返回的 char* 自动拷成 FA 的 str。
+use c "string.h" lib "c":
+    fn strlen(s: str) -> u64
+    fn strcmp(a: str, b: str) -> i32
+use c "math.h" lib "m":
+    fn floor(x: f64) -> f64
+
+fn main() -> i64:
+    print(strlen("你好abc"), strcmp("abc", "abc"), strcmp("a", "b"))
+    print(floor(3.9))
+    return 0

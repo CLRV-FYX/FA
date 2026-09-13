@@ -1,0 +1,35 @@
+# match 分支里 return 浮点值（曾经生成 `mov rax, xmm8`，汇编直接报错）
+enum Op:
+    Add
+    Mul
+    Neg
+
+fn f(n: i64) -> f64:
+    match n:
+        1:
+            return 1.5
+        2:
+            return 2.25
+        _:
+            return 0.125
+    return 0.0
+
+fn calc(o: Op, a: f64, b: f64) -> f64:
+    match o:
+        Op.Add:
+            return a + b
+        Op.Mul:
+            return a * b
+        Op.Neg:
+            return 0.0 - a
+    return 0.0
+
+fn g(x: f64) -> f64:          # 走到函数末尾的隐式返回
+    if x > 0.0:
+        return x * 2.0
+
+fn main() -> i64:
+    print(f(1), f(2), f(9))
+    print(calc(Op.Add, 1.5, 2.0), calc(Op.Mul, 3.0, 4.0), calc(Op.Neg, 2.5, 0.0))
+    print(g(2.0), g(0.0 - 1.0))
+    return 0

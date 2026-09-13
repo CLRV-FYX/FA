@@ -1,0 +1,79 @@
+# 词频统计器（教程 §24 的那个程序，原样搬过来当回归用例）。
+#
+# 一次验的东西不少：Map<str,i64> 计数、按字节扫字符串、把「次数 + 词」编成一个
+# 能排序的字符串键（次数取补 + 补零，于是 Vec<str>.sort() 排出来就是次数从高到低、
+# 同次数按字母序）、const 用在插值和循环上界里、while + and 的短路。
+# 排序键这个花招是必要的：Map 的遍历是哈希顺序，Vec<结构体>.sort() 又不支持。
+const WIDTH: i64 = 7            # 排序键里给次数留的位数
+const TOP: i64 = 5              # 印前几名
+const BIGGEST: i64 = 9999999    # 用来把「次数大」翻成「字符串小」
+
+# 数字补零到固定宽度：这样「按字符串排序」就等于「按数字排序」
+fn pad(n: i64) -> str:
+    let s = n.to_str()
+    let out = ""
+    for i in 0..(WIDTH - s.len()):
+        out += "0"
+    return out + s
+
+# char 是一个 UTF-8 字节。ASCII 的字母数字好认，非 ASCII 的字节都 >= 128，
+# 一律当词字符 —— 这样带重音的拉丁字母、中文都不会被切开。
+fn is_word_char(c: char) -> bool:
+    if c >= 'a' and c <= 'z':
+        return true
+    if c >= 'A' and c <= 'Z':
+        return true
+    if c >= '0' and c <= '9':
+        return true
+    return c >= 128
+
+fn split_words(text: str) -> Vec<str>:
+    let out = Vec<str>[]
+    let cur = ""
+    for c in text:
+        if is_word_char(c):
+            cur += c.to_str().lower()
+        else:
+            if cur.len() > 0:
+                out.push(cur)
+                cur = ""
+    if cur.len() > 0:
+        out.push(cur)
+    return out
+
+fn main() -> i64:
+    let text = ("The quick brown fox jumps over the lazy dog. "
+                + "The dog barks, and the fox runs away. "
+                + "A quick fox is a happy fox, and a lazy dog is a sleepy dog.")
+
+    let words = split_words(text)
+    let counts = Map<str, i64>()
+    for w in words:
+        if counts.has(w):
+            counts.set(w, counts.get(w) + 1)
+        else:
+            counts.set(w, 1)
+
+    # 把「次数 + 词」拼成一个能排序的键：次数取补（BIGGEST - n）再补零，
+    # 于是升序排出来就是次数从高到低，次数相同的按词的字母序。
+    let keys = Vec<str>[]
+    for w in counts.keys():
+        keys.push(pad(BIGGEST - counts.get(w)) + " " + w)
+    keys.sort()
+
+    print("总词数 =", words.len(), " 不同词 =", counts.len())
+    print("前 {TOP} 名：")
+    let i = 0
+    while i < TOP and i < keys.len():
+        let k = keys[i]
+        let sp = k.find(" ")
+        let word = k.slice(sp + 1, k.len())
+        let n = BIGGEST - k.slice(0, sp).to_i64()
+        print("  {i + 1}. {word}  {n} 次")
+        i += 1
+
+    print("全部（按次数）：")
+    for k in keys:
+        let sp = k.find(" ")
+        print("  {k.slice(sp + 1, k.len())}={BIGGEST - k.slice(0, sp).to_i64()}")
+    return 0

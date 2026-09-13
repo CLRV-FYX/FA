@@ -1,0 +1,73 @@
+# 结构体的值语义与方法：拷贝在哪、就地改在哪。
+#
+# 这几条互相看着矛盾，放在一起跑一遍才算数：
+#   * `let b = a` / 传参 / 返回 都是拷贝（改副本不动原对象）；
+#   * 拷贝是**浅**的：Vec / Map / str / 指针字段拷的是引用，两份指同一个容器；
+#   * 方法的 self 是指针，`p.bump(1)` 改的是原对象；
+#   * `for e in v`（v 是 Vec<结构体>）拿到的是**元素本身**，改它就改了表里那份；
+#     而 `let w = v[0]` 是拷贝；标量循环变量仍然是拷贝。
+struct Task:
+    name: str
+    prio: i64 = 3
+    tags: Vec<str> = []
+
+impl Task:
+    fn bump(self, k: i64):
+        self.prio += k
+
+    fn label(self) -> str:
+        return "{self.name}#{self.prio}"
+
+fn touch(t: Task):
+    t.prio = 99
+
+fn raised(t: Task) -> Task:
+    t.bump(1)
+    return t
+
+fn main() -> i64:
+    let a = Task { name: "甲", prio: 1 }
+    let b = a
+    b.prio = 50
+    print(a.prio, b.prio)
+
+    touch(a)
+    print(a.prio)
+
+    let c = raised(a)
+    print(a.prio, c.prio, c.label())
+
+    a.bump(10)
+    print(a.label())
+
+    # 浅拷：tags 是同一个表
+    a.tags.push("急")
+    print(b.tags.to_str(), b.tags.len())
+
+    # Vec<结构体>：for 改的是元素本身，取出来改的是副本
+    let v = Vec<Task>[Task { name: "乙", prio: 1 }]
+    for e in v {
+        e.bump(5)
+        e.tags.push("x")
+    }
+    print(v[0].prio, v[0].tags.to_str())
+    let w = v[0]
+    w.prio = -1
+    print(v[0].prio, w.prio)
+
+    # Map<str, 结构体>：get 出来的是副本，改完要 set 回去
+    let m = Map<str, Task>()
+    m.set("k", Task { name: "丙", prio: 1 })
+    let t = m.get("k")
+    t.bump(10)
+    print(t.prio, m.get("k").prio)
+    m.set("k", t)
+    print(m.get("k").prio, m.to_str())
+
+    # 标量循环变量还是拷贝
+    let ns = Vec<i64>[1, 2, 3]
+    for n in ns {
+        n = 100
+    }
+    print(ns.to_str())
+    return 0

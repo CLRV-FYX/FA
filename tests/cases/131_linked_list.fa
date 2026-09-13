@@ -1,0 +1,77 @@
+# 单向链表：递归结构体只能用指针（struct 里不能有自己，*Node 可以）。
+#
+# 这一例把「指针 + new/free」这条路上容易翻车的地方都走了一遍：
+#   * 方法里 self 的静态类型是 Node（不是 *Node），要和 nil 比、要当指针存，
+#     得先 `self as *Node`；
+#   * find 返回的可能是最后一个节点（next 是 nil），读 next.value 之前必须判 nil ——
+#     不判就是段错误（安全网会报「非法内存访问 / 野指针」，但那已经是崩溃了）；
+#   * free 要顺着 next 走，先存下一个再释放当前，否则释放完就没法往前走了。
+struct Node:
+    value: i64 = 0
+    next: *Node = nil
+
+impl Node:
+    # 在表头插入，返回新的表头
+    fn push_front(head: *Node, v: i64) -> *Node:
+        let n = new Node { value: v, next: head }
+        return n
+
+    fn len(self) -> i64:
+        let n = 0
+        let p = self as *Node      # self 的静态类型是 Node，当指针用要 as 一下
+        while p != nil:
+            n += 1
+            p = p.next
+        return n
+
+    fn to_str(self) -> str:
+        let parts = Vec<str>[]
+        let p = self as *Node
+        while p != nil:
+            parts.push(p.value.to_str())
+            p = p.next
+        return "[" + parts.join(" -> ") + "]"
+
+    # 找到第一个等于 v 的节点，找不到返回 nil
+    fn find(self, v: i64) -> *Node:
+        let p = self as *Node
+        while p != nil:
+            if p.value == v:
+                return p
+            p = p.next
+        return nil
+
+    fn free_all(self):
+        let p = self as *Node
+        while p != nil:
+            let nxt = p.next
+            free(p)
+            p = nxt
+
+fn main() -> i64:
+    let head: *Node = nil
+    for v in [3, 1, 2]:
+        head = Node.push_front(head, v)
+    print("表：", head.to_str())
+    print("长度：", head.len())
+
+    let hit = head.find(1)
+    if hit != nil:
+        if hit.next != nil:
+            print("找到 1，它的下一个是", hit.next.value)
+        else:
+            print("找到 1，它是最后一个")
+    else:
+        print("没找到 1")
+
+    let last = head.find(3)
+    if last != nil and last.next == nil:
+        print("3 是最后一个（next 是 nil，这时候别去读 next.value）")
+    if head.find(99) == nil:
+        print("99 不在表里")
+
+    head = Node.push_front(head, 0)
+    print("插入 0 之后：", head.to_str(), "长度", head.len())
+
+    head.free_all()
+    return 0

@@ -1,0 +1,20 @@
+# expect-exit: 1
+# expect-stderr: 要变长就得给填充值
+# 装箱元素（结构体/枚举）不给填充值时，**截断是合法的**（编译期不知道 n 和长度
+# 谁大，所以不在编译期拦），真要变长就 panic 一句人话。
+# 以前这里拿常量 0 当结构体值装箱，实测当场段错误（连 len() 都崩）。
+struct P:
+    x: i64
+    name: str
+
+fn main() -> i64:
+    let ps = Vec<P>[P{x: 1, name: "一"}, P{x: 2, name: "二"}]
+    ps.resize(1)                            # 截断：没问题
+    print("截断:", ps.to_str())
+    ps.resize(3, P{x: 0, name: ""})         # 变长给了填充值：每格一份新盒子
+    ps[1].x = 100
+    print("补回来:", ps.to_str())
+    let d = Vec<P>()
+    d.resize(2)                             # 变长又不给填充值：panic
+    print("不会到这一行")
+    return 0

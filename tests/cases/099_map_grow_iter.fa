@@ -1,0 +1,80 @@
+# Map 长大之后还得对：扩容搬家、墓碑、按槽位遍历。
+#
+# 三个回归，都在「表大到需要扩容」时才现形，小表一律看不出来：
+#
+#   1) **扩容会漏掉所有键值**。map_grow 搬家时调 fa_map_set，而 fa_map_set 要
+#      fa_agg_inc —— 每扩容一次，活着的键和值都多背一个引用计数，表释放时只减一次，
+#      全漏在堆上。ASan 实测 2000 项的 Map<str, i64>（键是 str(i)）漏 1433 个
+#      FaStr / 29 KB。初始容量 16、装到 12 项就扩容，所以任何十来项以上的 Map
+#      都在漏 —— 词频统计这种最常见的用法首当其冲。
+#   2) **keys() / values() / for k in m / to_str 是 O(n·cap)**。它们都靠
+#      fa_map_key_at(m, i) 取「第 i 个占用槽」，而那函数每调一次都从头扫一遍表。
+#      实测 keys() 五万个键要 **12.3 秒**（同一张表 sort 只要 6 毫秒）。
+#      现在改成扫槽位 + 跳过空槽/墓碑，一趟 O(cap)：五万个键 1.0 毫秒。
+#      下面这段二十万项就是给这个装的绊网（退回 ordinal 写法要跑三分多钟）。
+#   3) **聚合元素的 to_str 是 O(n²) 字符串拷贝**：累积串每轮 concat 都要重拷一遍，
+#      一万个结构体元素 563 毫秒。改成逐项收进 Vec<str> 再一次 join，3.7 毫秒。
+struct P:
+    x: i64
+    name: str = "无名"
+
+fn main() -> i64:
+    # ---- 1) 二十万项：扩容几十次之后，键值都还得查得到、遍历得到
+    let big = Map<i64, i64>()
+    for i in 0..200000 { big.set(i, i * 2) }
+    print("len:", big.len())
+    print("抽查:", big.get(0), big.get(199999), big.has(123456), big.has(999999))
+    let ks = big.keys()
+    ks.sort()
+    print("keys:", ks.len(), ks[0], ks[199999])
+    let vs = big.values()
+    print("values:", vs.len(), vs.sum())
+    let s = 0
+    for k in big { s += big.get(k) }
+    print("遍历求和:", s)
+
+    # ---- 2) 字符串键：扩容 + 覆盖 + 删除，引用计数要对得上（ASan 盯着）
+    let m = Map<str, str>()
+    for i in 0..2000 { m.set(str(i), "值" + str(i)) }
+    print("str 键值:", m.len(), m.get("1999"), m.get("0"))
+    m.set("1999", "改过")
+    print("覆盖:", m.get("1999"), m.len())
+    for i in 0..2000 {
+        if i % 2 == 0 { m.del(str(i)) }
+    }
+    print("删一半:", m.len(), m.keys().len(), m.has("1"), m.has("2"))
+    # 墓碑留着的时候遍历，只能数到活着的键
+    let cnt = 0
+    for k in m { cnt += 1 }
+    print("遍历到:", cnt)
+    # 墓碑不影响再写进去
+    m.set("2", "回来了")
+    print("填回墓碑:", m.len(), m.get("2"))
+
+    # ---- 3) 遍历中删：按槽位走，每个键都轮得到（以前按序号取会漏掉一半）
+    let d = Map<str, i64>()
+    d.set("a", 1)
+    d.set("b", 2)
+    d.set("c", 3)
+    for k in d { d.del(k) }
+    print("遍历中删:", d.len(), d.to_str())
+
+    # ---- 4) 值是结构体：to_str 由编译器展开，一万项也得是一趟
+    let mp = Map<str, P>()
+    for i in 0..10000 { mp.set(str(i), P{x: i}) }
+    let txt = mp.to_str()
+    print("Map<str,P> to_str 长度:", txt.len(), "len:", mp.len())
+    print("抽查:", mp.get("7").x, mp.get("7").name)
+
+    # ---- 5) 分组惯用法：没有就建一张空表
+    let g = Map<str, Vec<i64>>()
+    let words = Vec<i64>[3, 1, 3, 7, 1, 3]
+    for i in 0..words.len() {
+        let key = "余" + str(words[i] % 3)
+        if not g.has(key) { g.set(key, Vec<i64>()) }
+        g.get(key).push(words[i])
+    }
+    let gks = g.keys()
+    gks.sort()
+    for k in gks { print("  ", k, "->", g.get(k).to_str()) }
+    return 0

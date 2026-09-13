@@ -1,0 +1,62 @@
+# 内嵌汇编：汇编里看不见 FA 的局部变量，交换数据要走全局（标签 __fa_g_名字）。
+# 这一例把四条路都走一遍：
+#   1) 自己发系统调用（write）；
+#   2) 在汇编里 call C 函数（strlen，libc 总是链着）；
+#   3) 在汇编里 call FA 函数（标签是 fa_<名字>，System V 约定）；
+#   4) 汇编里带标号的循环。
+# 只用暂存寄存器（rax rcx rdx rsi rdi r8 r9）；rbx/r12-r15 里放着 FA 的活跃值，动了就是错答案。
+let buf: [u8; 8]
+let n: i64 = 0
+let count: i64 = 5
+let total: i64 = 0
+let r: i64 = 0
+
+fn add3(a: i64, b: i64, c: i64) -> i64:
+    return a + b + c
+
+fn main() -> i64:
+    # 1) 汇编直接发 write(1, buf, 7)
+    buf[0] = 'a'
+    buf[1] = 's'
+    buf[2] = 'm'
+    buf[3] = ':'
+    buf[4] = 'o'
+    buf[5] = 'k'
+    buf[6] = 10
+    asm """
+        mov eax, 1
+        mov edi, 1
+        lea rsi, [rip+__fa_g_buf]
+        mov edx, 7
+        syscall
+    """
+
+    # 2) 汇编里调 C 的 strlen
+    asm """
+        lea rdi, [rip+__fa_g_buf]
+        call strlen
+        mov [rip+__fa_g_n], rax
+    """
+    print("strlen =", n)
+
+    # 3) 汇编里调 FA 函数
+    asm """
+        mov rdi, 10
+        mov rsi, 20
+        mov rdx, 30
+        call fa_add3
+        mov [rip+__fa_g_r], rax
+    """
+    print("fa_add3 =", r)
+
+    # 4) 汇编里的循环：1+2+...+count
+    asm """
+        mov rcx, [rip+__fa_g_count]
+        xor rax, rax
+    .Lsum_loop:
+        add rax, rcx
+        loop .Lsum_loop
+        mov [rip+__fa_g_total], rax
+    """
+    print("1..{count} 的和 =", total)
+    return 0

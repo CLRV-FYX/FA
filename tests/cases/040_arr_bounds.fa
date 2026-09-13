@@ -1,0 +1,8 @@
+# expect-exit: 1
+# expect-stderr: 下标越界
+# 定长数组越界同样要有明确信息
+fn main() -> i64:
+    let a: [i64; 2] = [1, 2]
+    print(a[0])
+    print(a[7])
+    return 0

@@ -1,0 +1,57 @@
+# 函数体里再定义 fn（README「已知限制」里的一条）。
+# 实现方式是**提升**：内层函数变成一个普通的顶层函数，符号名 `fa_外层__内层`，
+# 所以它能调用别的函数、能递归、能当函数指针传，但看不见外层的局部变量
+# （要传值就当参数传 —— 捕获型的见 065_nested_capture 的编译期错误）。
+struct P:
+    x: i64
+    y: i64
+
+let hits = 0                         # 嵌套函数照样能用全局
+
+fn twice(f: fn(i64) -> i64, v: i64) -> i64:
+    return f(f(v))
+
+fn outer(n: i64) -> i64:
+    fn square(x: i64) -> i64:        # 最普通的嵌套函数
+        hits += 1
+        return x * x
+
+    fn cube(x: i64) -> i64:
+        return square(x) * x         # 调用兄弟嵌套函数
+
+    fn countdown(k: i64) -> i64:     # 自己递归
+        if k <= 0 { return 0 }
+        return k + countdown(k - 1)
+
+    fn deep3(a: i64) -> i64:         # 三层嵌套
+        fn inner2(b: i64) -> i64:
+            fn inner3(c: i64) -> i64:
+                return c + 1
+            return inner3(b) * 2
+        return inner2(a) + square(a)
+
+    fn mk(p: i64) -> P:              # 返回结构体（走 sret）
+        return P { x: p, y: p * 10 }
+
+    print("square:", square(n))
+    print("cube:", cube(3))
+    print("countdown:", countdown(5))
+    print("deep3:", deep3(4))
+    let q = mk(n)
+    print("结构体:", q.x, q.y)
+    print("当函数指针:", twice(square, 3))
+    return square(n) + cube(2)
+
+impl P:
+    fn scaled(self, k: i64) -> P:
+        fn mul(v: i64, k: i64) -> i64:   # 方法里的嵌套函数（self 也不是它的）
+            return v * k
+        return P { x: mul(self.x, k), y: mul(self.y, k) }
+
+fn main() -> i64:
+    print("outer(5) =", outer(5))
+    let p = P { x: 1, y: 2 }
+    let s = p.scaled(7)
+    print("方法里的嵌套:", s.x, s.y)
+    print("全局 hits =", hits)
+    return 0

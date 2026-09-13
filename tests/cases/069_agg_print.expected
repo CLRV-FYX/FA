@@ -1,0 +1,10 @@
+Outer { tag: 外, inner: Inner { a: 7, b: 七 }, list: [1, 2], arr: [9, 8, 7], ratio: 0.25, ok: true }
+Inner { a: 7, b: 七 } [9, 8, 7] [1, 2] 0.25 true
+Nothing One(v: 5) Two(s: 二, n: 1.5) Nest(i: Inner { a: 7, b: 七 })
+[Inner { a: 7, b: 七 }, Inner { a: 1, b: 一 }] | Inner { a: 7, b: 七 } 一
+插值 外 / Inner { a: 7, b: 七 } / One(v: 3)
+str(): Inner { a: 7, b: 七 } 17
+[1, 2, 3] ["甲", "乙"] 1
+1 2 false true
+批量: 51780
+堆检查: 3000 102

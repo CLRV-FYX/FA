@@ -114,11 +114,29 @@ def lower_params(fn: IRFunc):
             return mapping[v.id]
         return v
 
+    def repl_deep(v):
+        """把藏在元组/列表里的 Temp 也换掉。
+
+        `extra` 不只可能是 Temp 或标量：比例变址的 LOAD/STORE 用的是
+        `(下标 Temp, scale)`。以前这里只处理「extra 本身就是 Temp」的情况，
+        于是**用形参当下标**（`fn f(rows: Vec<str>, i: i64): rows[i]`）时，
+        那条 LOAD 仍然指向换号之前的旧 Temp —— 活性分析看得到它（instr_uses
+        会钻进元组），却找不到它的定义，分配器随手给了个没人写过的寄存器。
+        实测生成 `mov r11, [r10+r13*8]`，r13 里是垃圾：轻则读到错的元素
+        （递归求长度算出 0），重则段错误 / 堆损坏。
+        """
+        if isinstance(v, Temp):
+            return repl(v)
+        if isinstance(v, tuple):
+            return tuple(repl_deep(x) for x in v)
+        if isinstance(v, list):
+            return [repl_deep(x) for x in v]
+        return v
+
     for ins in fn.instrs:
         ins.dst = repl(ins.dst)
-        ins.args = [repl(a) for a in ins.args]
-        if isinstance(ins.extra, Temp):
-            ins.extra = repl(ins.extra)
+        ins.args = [repl_deep(a) for a in ins.args]
+        ins.extra = repl_deep(ins.extra)
         new_instrs.append(ins)
     fn.instrs = new_instrs
     fn.params = [mapping[p.id] for p in fn.params]

@@ -1,0 +1,44 @@
+# 字面花括号，以及 impl 里不带 self 的「静态」方法（用类型名调用）。
+#
+# 两个回归：
+#   1) `{{` / `}}` / `\{` / `\}` 应当打出**字面**花括号（和 Python / Rust / C# 一个规矩）。
+#      以前 `{{` 只让第一个花括号变字面，第二个照样开插值：`"{{n}}"` 于是去找标识符 n，
+#      报一句「未定义的标识符 'n'」，位置还指到文件头；而没有配对 `}` 的 `"P{a="`
+#      会把后面的引号当成插值里的字符串一路吞到行尾，报「字符串未闭合」。
+#      结果就是 JSON、带花括号的示例文本根本没法写（只能 chr(123) 拼）。
+#   2) impl 里不带 self 的方法以前只有语义层放行，代码生成把类型名当变量去取值，
+#      崩在「代码生成错误：未定义变量 'P'」；而语义层给这类方法的参数对位时，
+#      按「第一个形参一定是 self」硬减一 —— `fn make(x: f64, y: f64)` 把实参 x
+#      对到了形参 y 上（传 3.0 读出来是 0.0），悄悄算错。
+struct P:
+    x: f64 = 0.0
+    y: f64 = 0.0
+
+impl P:
+    fn make(x: f64, y: f64) -> P:
+        return P { x: x, y: y }
+
+    fn zero() -> P:
+        return P {}
+
+    fn norm2(self) -> f64:
+        return self.x * self.x + self.y * self.y
+
+    fn describe(self) -> str:
+        return "P({self.x}, {self.y})"
+
+fn main() -> i64:
+    let n = 42
+
+    # 字面花括号：两种写法等价
+    print("{{n}} 和 \{n\} 都是字面的；{{{n}}} 才是插值包花括号")
+    print("空花括号 {{}}，JSON 直接写 {{\"k\": {n}}}")
+    let t = """多行里也有 \{n\} 和 {n}"""
+    print(t)
+
+    # 静态方法 + 普通方法混在一个 impl 里，参数按名字对位
+    let p = P.make(3.0, 4.0)
+    print(p.describe(), p.norm2())
+    print(P.zero().describe())
+    print(P.make(1.0, 2.0).norm2())
+    return 0

@@ -1,0 +1,64 @@
+# 容器里装着结构体/枚举时的 to_str：以前一律打成 {...}（运行时不知道字段表），
+# 现在由编译器展开循环逐元素格式化，格式和运行时的容器输出逐字对齐
+# （str 元素加双引号、char 元素加单引号、", " 分隔、[] / {} 包裹）。
+struct Inner:
+    a: i64
+    b: str
+
+struct Outer:
+    tag: str
+    list: Vec<i64>
+
+enum Ev:
+    Nothing
+    One(i64)
+    Two(str, f64)
+
+fn main() -> i64:
+    let vs = Vec<Inner>[]
+    vs.push(Inner{a: 1, b: "一"})
+    vs.push(Inner{a: 2, b: "二"})
+    print("Vec<struct>:", vs.to_str())
+    print("print 路径:", vs)
+
+    let es = Vec<Ev>[]
+    es.push(Ev.Nothing)
+    es.push(Ev.One(5))
+    es.push(Ev.Two("二", 1.5))
+    print("Vec<enum>:", es.to_str())
+
+    let m = Map<str, Inner>()
+    m.set("甲", Inner{a: 1, b: "一"})
+    m.set("乙", Inner{a: 2, b: "二"})
+    print("Map<str,struct>:", m.to_str(), "len =", m.len())
+
+    let mv = Map<str, Vec<i64>>()
+    mv.set("k", Vec<i64>[1, 2])
+    print("Map<str,Vec>:", mv.to_str())
+
+    let nested = Vec<Vec<Inner>>[]
+    nested.push(vs)
+    nested.push(Vec<Inner>[Inner{a: 3, b: "三"}])
+    print("Vec<Vec<struct>>:", nested.to_str())
+
+    let outer = Vec<Outer>[]
+    outer.push(Outer{tag: "外", list: Vec<i64>[7]})
+    print("结构体里带容器:", outer.to_str())
+
+    # 混合：容器里同时有 str / char / 数值元素时，格式和纯标量容器一致
+    let cs = Vec<char>['a', 'b']
+    print("Vec<char>:", cs.to_str())
+
+    # 空容器
+    let ev = Vec<Inner>[]
+    let em = Map<str, Inner>()
+    print("空的:", ev.to_str(), em.to_str(), ev.len(), em.len())
+
+    # 大一点：确认循环里的中间字符串是**当轮释放**的（RSS 不涨）
+    let many = Vec<Inner>[]
+    for i in 0..2000 {
+        many.push(Inner{a: i, b: "x"})
+    }
+    let s = many.to_str()
+    print("2000 个:", s.len() > 20000, s.slice(0, 24))
+    return 0

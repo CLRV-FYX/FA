@@ -1,0 +1,54 @@
+# impl 方法：带参数、返回聚合值、混合浮点/字符串实参
+# （这三件事以前各有一个 bug：带参数的方法直接 IndexError 崩编译器；
+#   多参数方法按错一位的类型做实参转换；返回结构体的方法里整数参数
+#   会拿到 sret 指针，也就是一个栈地址。）
+struct P:
+    x: i64
+    name: str
+
+struct V2:
+    x: f64
+    y: f64
+
+impl P:
+    fn add(self, k: i64) -> i64:
+        return self.x + k
+
+    fn combine(self, a: i64, b: f64, c: str) -> str:
+        return "{self.name}/{a}/{b}/{c}"
+
+    fn clone_scaled(self, k: i64) -> P:
+        return P { x: self.x * k, name: "clone{k}" }
+
+    fn take(self, other: P) -> i64:
+        return self.x + other.x
+
+    fn bump(self, k: i64):
+        self.x = self.x + k
+
+impl V2:
+    fn scaled(self, k: f64) -> V2:
+        return V2 { x: self.x * k, y: self.y * k }
+
+    fn dot(self, o: V2) -> f64:
+        return self.x * o.x + self.y * o.y
+
+fn main() -> i64:
+    let p = P { x: 10, name: "p" }
+    print(p.add(5))
+    print(p.combine(1, 2.5, "tail"))
+    let c = p.clone_scaled(3)
+    print(c.x, c.name, p.x, p.name)     # 原值不受影响
+    print(p.take(P { x: 7, name: "q" }))
+    p.bump(2)
+    print(p.x)
+
+    let v = V2 { x: 3.0, y: 4.0 }
+    let w = v.scaled(2.0)
+    print(w.x, w.y, v.x)
+    print(v.scaled(0.5).y)
+    print(v.dot(V2 { x: 1.0, y: 1.0 }))
+
+    # 6 个以上的实参（超出寄存器，要走栈）
+    print(p.combine(1, 2.0, "a"), p.add(1), p.add(2), p.add(3), p.add(4))
+    return 0

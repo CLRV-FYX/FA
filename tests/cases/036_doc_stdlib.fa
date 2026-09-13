@@ -1,0 +1,98 @@
+# 文档一致性：docs/03_标准库.md 里每个「示例 + 注释里的期望输出」都在这里跑一遍
+fn main() -> i64:
+    # --- 1. 输出 ---
+    print("a", 1, 2.5, true)              # a 1 2.5 true
+    write("无"); write("空格"); print("")   # 无空格
+
+    # --- 2. 数学 ---
+    print(abs(-5), min(3, 9), max(3, 9), gcd(12, 18))    # 5 3 9 6
+    print(floor(2.7), ceil(2.2), sqrt(9.0))              # 2.0 3.0 3.0
+    print(round(2.5), trunc(2.9), log2(8.0), log10(100.0), exp2(3.0))
+    print(hypot(3.0, 4.0), pow(2.0, 10.0), 2.0 ** 10.0)
+    print(clamp(15, 0, 10), clamp(-3, 0, 10), sign(-9), sign(0), sign(3))
+    print(hex(255), oct(8), bin(5), random() >= 0)
+
+    # --- 3. 字符串 ---
+    let s = "  Hello, FA  "
+    print(s.trim())                        # Hello, FA
+    print(s.replace("FA", "世界"))          # "  Hello, 世界  "
+    print("a,b,c".split(",").get(2))        # c
+    print(i64("123") + 1)                  # 124
+    print(s.len(), s.bytes(), s.at(2))      # 13 13 72
+    print(s.trim_start().len(), s.trim_end().len())
+    print("abc".slice(0, 2), "abc".find("c"), "abc".contains("b"))
+    print("abc".starts_with("a"), "abc".ends_with("c"), "abc".eq("abc"))
+    print("ab".repeat(3), "abcabc".count("b"), "a\nb\n".lines().len())
+    print("abc".chars().len(), "ABC".lower(), "abc".upper())
+    print(str(1) + str(2.5) + str(true), "x{1 + 1}y")
+
+    # --- 4. Vec ---
+    let v = Vec<i64>[5, 3, 9]
+    let sv = Vec<i64>[5, 3, 9]
+    sv.sort()
+    print(sv.get(0), sv.min(), sv.max(), sv.sum())       # 3 3 9 17
+    let fruits = Vec<str>["香蕉", "苹果"]
+    fruits.sort()
+    print(fruits.join(" + "))                            # 苹果 + 香蕉（UTF-8 字节序）
+    v.push(4)
+    print(v.get(3))                                      # 4
+    let total = 0
+    for x in v:
+        total = total + x
+    print(total, v.len(), v.contains(9), v.index_of(3))
+    print(v.pop(), v.len())
+    v.clear()
+    print(v.len())
+    let w = Vec<i64>[1]
+    w.resize(3, 7)
+    print(w)
+    # 紧凑存储：窄类型取出来不能被截断或变号
+    let vi8 = Vec<i8>[-1, 2]
+    let vu8 = Vec<u8>[255, 1]
+    let vb = Vec<bool>[true, false]
+    let vc = Vec<char>['a', 'b']
+    print(vi8.get(0), vu8.get(0), vb.get(0), vc.get(1))   # -1 255 true b
+
+    # --- 5. Map ---
+    let m = Map<str,i64>()
+    m.set("苹果", 5)
+    print(m.get("苹果"), m.has("香蕉"))                     # 5 false
+    for k in m:
+        print(k, m.get(k))
+    m.set("梨", 3)
+    m.del("梨")
+    print(m.len(), keys(m).len(), values(m).len())
+    let mm = Map<i64,i64>()
+    mm.set(1, 100)
+    let pv = Vec<i64>[1, 2]
+    push(pv, 3)
+    print(pv, pop(pv), len(mm), len("abcd"), len(v))
+
+    # --- 6. 数组 ---
+    let a: [i64; 5] = [10, 20, 30, 40, 50]
+    print(a[0], a[4])                    # 10 50
+    print(len(a))                        # 5
+    let acc = 0
+    for x in a:
+        acc = acc + x
+    print(acc)
+    let b = a                            # 值类型：整体拷贝
+    b[0] = 99
+    print(a[0], b[0])                    # 10 99
+    let p = &a[0]
+    print(p[1])                          # 20
+
+    # --- 7. 文件与系统 ---
+    file_write("/tmp/fa_036_doc.txt", "内容")
+    print(file_read("/tmp/fa_036_doc.txt"))     # 内容
+    print(cmd("echo hi").trim())                # hi
+    print(env("PATH").len() > 0)
+    let t0 = now()
+    sleep(2)
+    print(now() - t0 >= 0.0)
+    print(args().len() >= 1)
+
+    # --- 8. 断言 ---
+    assert(1 + 1 == 2)
+    assert(v.len() == 0, "v 应该已经被清空")
+    return 0

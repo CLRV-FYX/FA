@@ -1,0 +1,84 @@
+# 定长数组：嵌套、值语义、越界，以及「容器里装着数组」的 to_str。
+#
+# 两个回归：
+#   1) `grid[i][j]` 直接把编译器打崩（AttributeError: 'tuple' object has no
+#      attribute 'kind'）。gen_addr 的数组分支写成了
+#         return base, self.add_off(...), ot.elem if isinstance(off0, int) else (base, ..., ot.elem)
+#      Python 把三元式只当成**元组最后一个元素**，于是外层偏移是 Temp 时
+#      返回的「类型」是那个三元组本身，is_agg 一读 .kind 就炸。
+#      而且 else 那条还把 off0 丢了 —— 就算不崩，地址也算错（读到第 0 行）。
+#   2) Vec<[i64; 3]> / Map<str, [i64; 2]> 的 to_str 打成 [{...}, {...}]：
+#      运行时只认元素 kind，不知道数组有多长；而 print(v[0]) 明明是 [1, 2, 3]。
+#      现在数组元素也走编译器展开那条路（和结构体/枚举一样）。
+struct Row:
+    vals: [i64; 3]
+    tag: str = "行"
+
+fn takes(a: [i64; 3]) -> i64:
+    a[0] = 999                  # 改的是副本
+    return a[0]
+
+fn make() -> [i64; 3]:
+    return [7, 8, 9]
+
+fn main() -> i64:
+    let a: [i64; 3] = [1, 2, 3]
+    print("基本:", a.to_str(), a.len(), len(a), a[0], a[2])
+    a[1] = 20
+    print("改一格:", a.to_str())
+
+    # 值语义：赋值、传参都是**拷贝**（Vec / Map 是共享，正好相反）
+    let b = a
+    b[0] = 100
+    print("赋值是拷贝:", b.to_str(), a.to_str())
+    print("传参是拷贝:", takes(a), a.to_str())
+
+    # 不写标注也推得出数组（不是 Vec：下面改 b 不影响 a 就是证据）
+    let c = [1, 2, 3]
+    let d = c
+    d[2] = 9
+    print("无标注:", c.to_str(), d.to_str())
+
+    # 遍历
+    let s = 0
+    for x in a { s += x }
+    print("遍历求和:", s)
+
+    # 嵌套：二维、三维
+    let g: [[i64; 3]; 2] = [[1, 2, 3], [4, 5, 6]]
+    print("二维:", g.to_str(), g[1][2], g[0][0])
+    g[1][0] = 40
+    g[0][2] = 300
+    print("改两格:", g.to_str())
+    let h: [[[i64; 2]; 2]; 2] = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]
+    print("三维:", h.to_str(), h[1][0][1], h[0][1][0])
+    let t = 0
+    for i in 0..2 {
+        for j in 0..2 {
+            for k in 0..2 { t += h[i][j][k] }
+        }
+    }
+    print("三维求和:", t)
+
+    # 元素是结构体 / 字符串
+    let ps: [Row; 2] = [Row{vals: [1, 2, 3]}, Row{vals: [4, 5, 6], tag: "第二行"}]
+    print("结构体数组:", ps.to_str())
+    ps[0].vals[1] = 20
+    print("改字段里的一格:", ps[0].vals.to_str(), ps[0].tag)
+    let ss: [str; 2] = ["甲", "乙"]
+    print("字符串数组:", ss.to_str(), ss[0].len())
+
+    # 函数返回数组
+    print("返回:", make().to_str())
+
+    # 容器里装着数组
+    let v = Vec<[i64; 3]>()
+    v.push([1, 2, 3])
+    v.push([4, 5, 6])
+    print("Vec<[i64;3]>:", v.to_str(), v[1][0])
+    v[0][1] = 20
+    print("改一格:", v[0].to_str())
+    let m = Map<str, [i64; 2]>()
+    m.set("甲", [1, 2])
+    print("Map<str,[i64;2]>:", m.to_str(), m.get("甲")[1])
+    return 0

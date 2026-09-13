@@ -1,0 +1,13 @@
+# expect-compile-error: 全局变量暂不支持结构体/枚举类型
+# 顶层 let 支持标量 / str / Vec / Map / 数组；结构体与枚举是值类型，
+# 槽要按 ty.size 开、读写还得走「拷贝 + 逐字段引用计数」那套，
+# 与其生成半对的代码，不如在语义阶段给一句明确的错。
+struct P:
+    x: i64
+    y: i64
+
+let origin = P { x: 0, y: 0 }
+
+fn main() -> i64:
+    print(origin.x)
+    return 0

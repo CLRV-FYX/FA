@@ -1,0 +1,25 @@
+# 多文件模块：use "路径" 把另一个文件的顶层声明整个导入进来。
+#
+# 这里一次验四件事：
+#   1) 嵌套导入（util2.fa 又 use 了 shared.fa，所以本文件同时拿到两个文件的声明）；
+#   2) 跨文件共享的**全局状态**（hits 是 shared.fa 里的全局，make 每调一次加一，
+#      本文件读到的就是同一个变量）；
+#   3) 循环导入不会无限递归（cyc_a use cyc_b，cyc_b 又 use cyc_a）；
+#   4) 导入的结构体/枚举/常量/方法用起来和本文件里声明的没区别。
+use "mod/util2.fa"
+use "mod/cyc_a.fa"
+
+fn main() -> i64:
+    let p = make(1, 2)
+    print(p.x, p.y, p.sum())
+    print(describe(p))
+
+    let q = make(3, 4)
+    print(hits, q.sum(), describe(q))
+
+    print(level(Level.Low), level(Level.High(7)))
+    print(from_a(), from_b())
+
+    let r = Pt { x: 5 }
+    print(r, r.sum(), SCALE)
+    return 0

@@ -1,0 +1,15 @@
+# expect-compile-error: 的元素不能 sum()
+# sort / min / max / contains / index_of / sum 都要按**内容**比较或累加元素。
+# 结构体、枚举、容器在 Vec 里存的是装箱指针，于是这些方法一个都不成立 ——
+# 而且**没有一个会报错**：sort 排的是堆地址（实测调完原样返回），
+# contains/index_of 永远 false / -1（实测两张表里内容相同的 Vec<i64> 判不出来），
+# sum 把指针加起来（实测打出 8454172 这种垃圾数）。静默的错答案比崩溃难查，
+# 所以编译期就拦下来，并在报错里说清楚为什么、以及该怎么做。
+struct P:
+    x: i64
+    name: str
+
+fn main() -> i64:
+    let v = Vec<P>[P{x: 5, name: "五"}, P{x: 3, name: "三"}]
+    print(v.sum())
+    return 0

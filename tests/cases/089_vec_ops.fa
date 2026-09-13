@@ -1,0 +1,88 @@
+# Vec 的常用操作：把教程 §9 里写下的语义逐条钉在这里，改坏了就会红。
+struct P:
+    x: i64
+
+fn bump(v: Vec<i64>):
+    v.push(99)
+
+fn main() -> i64:
+    # 查找：index_of 给第一个匹配，找不到是 -1（不是 panic、不是 Option）
+    let v = Vec<i64>[5, 3, 5, 9]
+    print("index_of:", v.index_of(5), v.index_of(9), v.index_of(777), v.contains(3))
+
+    # 空表：len/sum/min/max 都返回 0，contains 返回 false —— 不 panic
+    let e = Vec<i64>[]
+    print("空表:", e.len(), e.sum(), e.min(), e.max(), e.contains(1))
+
+    # 排序：整数、浮点按数值；str 按 UTF-8 字节序（也就是码点序）；char/bool/u8 也行
+    let n = Vec<i64>[3, 1, 2]
+    n.sort()
+    let f = Vec<f64>[3.5, 1.25, 2.0]
+    f.sort()
+    let s = Vec<str>["甲", "乙", "丙"]
+    s.sort()
+    let c = Vec<char>['d', 'a', 'c']
+    c.sort()
+    let b = Vec<bool>[true, false, true]
+    b.sort()
+    let u = Vec<u8>[200, 3, 100]
+    u.sort()
+    print("排序:", n.to_str(), f.to_str(), s.to_str(), c.to_str(), b.to_str(), u.to_str())
+
+    # 全局写法和方法写法等价
+    let n2 = Vec<i64>[3, 1, 2]
+    sort(n2)
+    reverse(n2)
+    print("全局:", n2.to_str(), len(n2), sum(n2), min(n2), max(n2))
+
+    # resize：变长补零值（或指定的填充值），变短就截断
+    let r = Vec<i64>[1, 2]
+    r.resize(4)
+    print("resize(4):", r.to_str())
+    r.resize(1)
+    print("resize(1):", r.to_str())
+    let r2 = Vec<i64>()
+    r2.resize(3, 7)
+    print("resize(3, 7):", r2.to_str())
+    let rs = Vec<str>["a"]
+    rs.resize(3)
+    print("resize 字符串表:", rs.to_str())
+
+    # join：把表拼成一条字符串（数值自动转，str 元素不加引号）
+    print("join:", join(Vec<str>["甲", "乙"], ", "), Vec<i64>[1, 2].join("-"))
+
+    # 表是引用语义：赋值和传参都共享同一份缓冲区
+    let a = Vec<i64>[1, 2]
+    let alias = a
+    alias.push(3)
+    bump(a)
+    print("共享:", a.to_str(), alias.to_str(), a.len())
+
+    # 要独立的副本用 copy()；嵌套时内层仍共享（拷的是把手）
+    let cp = a.copy()
+    cp.push(100)
+    print("copy:", a.to_str(), cp.to_str())
+
+    # 元素是结构体：装箱存放，可以按下标改字段，也可以直接遍历
+    let ps = Vec<P>[P{x: 1}]
+    ps[0].x = 42
+    for p in ps { print("结构体元素:", p.x) }
+
+    # 嵌套表
+    let nested = Vec<Vec<i64>>[]
+    nested.push(Vec<i64>[1])
+    nested.push(Vec<i64>[2, 3])
+    for row in nested { print("行:", row.to_str(), row.sum()) }
+    print("嵌套:", nested.to_str(), nested[1][0])
+
+    # 遍历中 push：迭代走的是进循环时的长度，新元素本轮不会被遍历到
+    let grow = Vec<i64>[1, 2, 3]
+    for x in grow { grow.push(x * 10) }
+    print("边遍历边 push:", grow.to_str())
+
+    # pop 返回被弹出的值
+    let st = Vec<i64>[1, 2, 3]
+    print("pop:", st.pop(), st.to_str())
+    st.clear()
+    print("clear:", st.len(), st.to_str())
+    return 0

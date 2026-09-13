@@ -1,0 +1,32 @@
+# 内建方法完整性：sema 声明过的每个方法都得有实现（以前有一批直接报「未实现」）
+fn main() -> i64:
+    let v = Vec<i64>[3, 1, 2]
+    print(v.to_str(), v.sum(), v.min(), v.max(), v.index_of(2))
+    v.resize(5)
+    print(v)
+    v.resize(2)
+    print(v)
+    let vf = Vec<f64>[1.0]
+    vf.resize(3, 1.5)
+    print(vf, vf.to_str())
+
+    let m = Map<i64,i64>()
+    m.set(1, 10)
+    m.set(2, 20)
+    print(m.to_str(), m.len(), m.has(1))
+
+    let i = -7
+    let f = 1.5
+    print(i.to_str(), i.abs(), i.to_f64())
+    print(f.to_str(), f.abs(), f.to_i64(), f.ceil(), f.floor())
+    print(f.round(), f.trunc(), f.sqrt())
+    print((2.5).to_i64(), (-3).abs(), (1.2).ceil())
+
+    let s = "Hello, World"
+    print(s.len(), s.upper(), s.lower(), s.trim())
+    print(s.find("World"), s.contains("o"), s.count("l"))
+    print(s.slice(0, 5), s.replace("World", "FA"), s.repeat(2))
+    print(s.starts_with("He"), s.ends_with("ld"), s.at(1))   # at() 是「第 i 个字节」-> 101
+    print(s.split(", "), s.lines().len(), s.chars().len())
+    print("42".to_i64(), "1.5".to_f64(), s.eq("Hello, World"))
+    return 0

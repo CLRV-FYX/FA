@@ -1,0 +1,5 @@
+# 被 vecmath.fa 导入的「孙模块」：验证嵌套 use
+fn scale(x: f64, k: f64) -> f64:
+    return x * k
+
+const SCALE_DEFAULT: f64 = 2.0

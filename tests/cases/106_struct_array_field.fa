@@ -1,0 +1,40 @@
+# 结构体里的定长数组字段：读写元素、嵌套结构体里的数组、Vec<结构体> 元素里的数组。
+#
+# 回归：add_offs 把常量偏移**直接**当 IR 操作数塞进 BIN（没包成 Const），
+# 汇编生成器认不出来，抛「bad operand 16」把编译器崩掉。触发条件很平常 ——
+# 结构体里有个数组字段，而它**不是第一个**字段（偏移非 0）：
+#     struct S:
+#         n: i64 = 0
+#         a: [i64; 3] = [0, 0, 0]
+#     s.a[1] = 7        # 崩
+# 外层偏移是常量 8、内层下标偏移是运行时算的 Temp，两边一相加就撞上那条路；
+# 数组正好是第一个字段（偏移 0）时前面几个分支短路，于是看着像好的。
+struct Inner:
+    n: i64 = 0
+    a: [i64; 3] = [0, 0, 0]
+
+struct Outer:
+    tag: str = "t"
+    inner: Inner = Inner {}
+    tail: [f64; 2] = [0.0, 0.0]
+
+fn main() -> i64:
+    let o = Outer {}
+    print(o.inner.a.to_str(), o.tail.to_str())
+
+    o.inner.a[0] = 3
+    o.inner.a[1] = 7
+    o.tail[1] = 2.5
+    print(o.inner.a.to_str(), o.tail.to_str(), o.inner.a[1])
+
+    # Vec<结构体> 的元素是另一份（构造表时拷进去的），改它不动 o
+    let v = Vec<Outer>[o]
+    v[0].inner.a[2] = 99
+    print(v[0].inner.a.to_str(), o.inner.a.to_str())
+
+    let s = 0
+    for i in 0..o.inner.a.len() {
+        s += o.inner.a[i]
+    }
+    print(s)
+    return 0

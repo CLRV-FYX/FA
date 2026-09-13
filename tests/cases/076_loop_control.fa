@@ -1,0 +1,81 @@
+# 循环控制的两个定点回归（都是写教程时跑出来的）：
+#
+# 1) for-in 里的 continue 曾经**死循环挂住**：下标自增是发在循环体之后的，
+#    而 continue 跳的是循环头 top —— 于是永远不自增。while / C 风格 for / loop
+#    三种都对，只有 for-in 这条把 continue 目标写成了 top。现在 continue 跳到
+#    专门的 step 标签（清理 + 自增之前）。
+#
+# 2) break / continue 会跳过块作用域的收尾：那层块里的 defer 不执行、
+#    局部引用不释放（`while ... { let s = "a"+"b"; break }` 每轮漏一个 FaStr）。
+#    现在跳转之前先就地补一份清理（unwind_to），与 return 的 unwind_scopes 同理；
+#    027_defer_return 的标题就是「defer 必须在任何离开作用域的路径上执行」。
+fn main() -> i64:
+    # continue：五种可迭代对象都要走对
+    let out = Vec<i64>[]
+    for k in 0..5:
+        if k == 2 { continue }
+        out.push(k)
+    print(out)
+
+    let picked = ""
+    for x in Vec<str>["a", "b", "c"]:
+        if x == "b" { continue }
+        picked = picked + x
+    print(picked)
+
+    let keys = ""
+    for k in Map<str, i64>["x": 1, "y": 2]:
+        if k == "x" { continue }
+        keys = keys + k
+    print(keys)
+
+    let chars = ""
+    for c in "abcd":
+        if c == 'b' { continue }
+        chars = chars + chr(c)
+    print(chars)
+
+    let arr_hit = 0
+    for v in [1, 2, 3]:
+        if v == 2 { continue }
+        arr_hit += v
+    print(arr_hit)
+
+    # break：嵌套循环各跳各的
+    let pairs = ""
+    for i in 0..3:
+        for j in 0..3:
+            if j == 1 { break }
+            pairs = pairs + "{i}{j} "
+        if i == 1 { break }
+    print(pairs)
+
+    # defer 在 continue / break 路径上也要执行
+    for i in 0..3:
+        defer write("d{i} ")
+        if i == 1 { continue }
+        if i == 2 { break }
+        write("b{i} ")
+    print("")
+
+    # while / C 风格 for / loop 的 continue 一直是对的，一并钉住
+    let n = 0
+    let i = 0
+    while i < 5:
+        i += 1
+        if i % 2 == 0 { continue }
+        n += i
+    print(n)
+
+    let total = 0
+    for (let j = 0; j < 5; j = j + 1):
+        if j == 2 { continue }
+        total += j
+    print(total)
+
+    let hits = 0
+    loop:
+        hits += 1
+        if hits >= 3 { break }
+    print(hits)
+    return 0

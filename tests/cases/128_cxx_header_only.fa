@@ -1,0 +1,20 @@
+# C++ 互操作：纯头文件（inline / 模板 / 类 / STL），不给 lib 也能编。
+#
+# 这一例钉住三个以前会翻车的地方：
+#   - shim 是 g++ 编的，可最后链接用的是 cc，只带 -lm/-ldl/-lpthread：
+#     只要 C++ 那头用到 new/delete 或 STL，就是一串 undefined reference。
+#   - FA 的 str 到 C++ 那边必须是 const char*（以前 shim 声明成 FaStr*，
+#     g++ 直接报 cannot convert）。
+#   - 类、模板、std::vector 都能在头文件里用，FA 只看见那几个 extern "C" 包装。
+use cxx "cpp/strutil.hpp":
+    fn sum_of_squares(n: i32) -> i32
+    fn counter_demo(a: i32, b: i32) -> i32
+    fn char_count(s: str) -> i32
+    fn shout(s: str) -> str
+
+fn main() -> i64:
+    print(sum_of_squares(10))          # 1+4+...+100
+    print(counter_demo(3, 4))
+    print(char_count("你好abc"))        # UTF-8 字节数
+    print(shout("hello"))
+    return 0

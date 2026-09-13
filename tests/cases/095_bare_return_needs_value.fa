@@ -1,0 +1,9 @@
+# expect-compile-error: 函数声明返回 i64，但 return 没有值
+# 花括号里的光秃 return 现在过得去语法分析，但非 void 函数照样要在语义阶段拦下来。
+fn f(i: i64) -> i64:
+    if i > 100 { return }
+    return i
+
+fn main() -> i64:
+    print(f(1))
+    return 0

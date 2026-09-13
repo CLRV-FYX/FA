@@ -1,0 +1,9 @@
+# expect-exit: 1
+# expect-stdout: 20320
+# expect-stderr: index out of range
+# 按码点取下标越界，和 v[i] / s[i] 一样明确报错退出，不静默返回垃圾
+fn main() -> i64:
+    let s = "你好"
+    print(s.char_at(0))
+    print(s.char_at(5))
+    return 0

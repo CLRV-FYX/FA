@@ -1,0 +1,31 @@
+# 标准库：容器的全局函数形式 + 容器格式化输出
+fn main() -> i64:
+    let v = Vec<i64>[3, 1, 2]
+    print(sum(v), min(v), max(v))
+    print(contains(v, 3), contains(v, 9), len(v))
+    sort(v)
+    print(v, join(v, "/"))
+    reverse(v)
+    print(v)
+
+    let vf = Vec<f64>[1.5, 2.5, 3.0]
+    print(sum(vf), min(vf), join(vf, ","))
+    print(vf)
+
+    let vs = Vec<str>["b", "a", "c"]
+    sort(vs)
+    print(vs, join(vs, "-"), contains(vs, "a"))
+
+    let vb = Vec<bool>[true, false, true]
+    let vc = Vec<char>['x', 'y']
+    print(vb, vc)
+
+    let s = "hello world"
+    print(contains(s, "world"), contains(s, "xyz"))
+    print(sum(Vec<i64>[10, 20, 30]))
+
+    # 数字/字符串互转
+    print(i64("42") + 1, f64("1.5") * 2.0, str(7))
+    print(hex(255), oct(8), bin(5))
+    print(abs(-3), clamp(15, 0, 10), sign(-9), gcd(12, 18))
+    return 0

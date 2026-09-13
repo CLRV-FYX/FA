@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 from typing import List, Optional
-from .lexer import tokenize, split_interpolation, FaSyntaxError
+from .lexer import tokenize, Token, split_interpolation, FaSyntaxError
 from .ast import *
+from .ast import stamp_positions, Node
 
 KW = "KW"
 NAME = "NAME"
@@ -37,6 +38,7 @@ class Parser:
         self.toks = tokenize(src)
         self.pos = 0
         self.in_braces = 0          # 处于 {} 内部时，换行无意义，需要 ';'
+        self.no_struct_lit = 0      # >0 时 `Name {` 不当结构体字面量（见 parse_match）
 
     # ---------------------------------------------------------- 工具
     def peek(self, k: int = 0):
@@ -121,6 +123,10 @@ class Parser:
         return Module(decls)
 
     def parse_decl(self) -> Optional[Decl]:
+        tok = self.cur()
+        return self.stamp(self._parse_decl(), tok)
+
+    def _parse_decl(self) -> Optional[Decl]:
         t = self.cur()
         if t.kind in ("NEWLINE", "INDENT", "DEDENT"):
             self.next()
@@ -146,12 +152,15 @@ class Parser:
             return self.parse_impl()
         if self.at_kw("const"):
             return self.parse_const()
+        if self.at_kw("let"):
+            # 顶层 let = 全局可变变量（函数体内的 let 还是普通局部变量）
+            return self.parse_global()
         if self.at_kw("extern"):
             return self.parse_extern_block()
         if self.at_kw("unsafe"):
             self.next()
             return self.parse_decl()
-        self.err(f"顶层只允许 use/fn/struct/enum/impl/const/extern 声明，得到 '{t.value}'")
+        self.err(f"顶层只允许 use/fn/struct/enum/impl/const/let/extern 声明，得到 '{t.value}'")
 
     # ---------------------------------------------------------- use
     def parse_use(self) -> Use:
@@ -361,6 +370,7 @@ class Parser:
         self.expect_kw("struct")
         name = self.expect(NAME).value
         fields = []
+        defaults = {}
         if self.at(P, "{") and not self._block_follows():
             self.next()
             self.in_braces += 1
@@ -371,7 +381,16 @@ class Parser:
                 fn = self.expect(NAME).value
                 self.expect(P, ":")
                 fields.append((fn, self.parse_type()))
+                if self.at_op("="):
+                    self.next()
+                    defaults[fn] = self.parse_expr()
                 self.skip_terms()
+                if self.at(P, ","):
+                    # 花括号写法允许用逗号分隔字段（Rust 风格）：
+                    # `struct P { a: i64, b: i64 = 2 }`。默认值里的逗号
+                    # （`v: Vec<i64> = [1, 2]`）已经被 parse_expr 吃掉了，不会歧义。
+                    self.next()
+                    self.skip_terms()
             self.expect(P, "}")
             self.in_braces -= 1
         else:
@@ -387,9 +406,12 @@ class Parser:
                 fn = self.expect(NAME).value
                 self.expect(P, ":")
                 fields.append((fn, self.parse_type()))
+                if self.at_op("="):          # x: i64 = 3 —— 字段默认值
+                    self.next()
+                    defaults[fn] = self.parse_expr()
                 self.skip_terms()
             self.accept("DEDENT")
-        return StructDef(name=name, fields=fields)
+        return StructDef(name=name, fields=fields, defaults=defaults)
 
     def parse_enum(self) -> EnumDef:
         self.expect_kw("enum")
@@ -485,6 +507,22 @@ class Parser:
         init = self.parse_expr()
         return Const(name=name, ty=ty, init=init)
 
+    def parse_global(self) -> Global:
+        """顶层 `let name[: ty] [= init]` —— 全局可变变量。"""
+        self.expect_kw("let")
+        name = self.expect(NAME).value
+        ty = None
+        if self.at(P, ":"):
+            self.next()
+            ty = self.parse_type()
+        init = None
+        if self.at_op("="):
+            self.next()
+            init = self.parse_expr()
+        if ty is None and init is None:
+            self.err(f"全局变量 '{name}' 需要初值或类型标注（例如 `let n = 0`）")
+        return Global(name=name, ty=ty, init=init)
+
     # ---------------------------------------------------------- 块与语句
     def parse_block(self, scope: str = "block") -> Block:
         if self.at(P, "{"):
@@ -495,6 +533,11 @@ class Parser:
                 self.skip_terms()
                 if self.at(P, "}"):
                     break
+                if self.at("EOF"):
+                    # 少写一个 } 时，以前会一路吃到文件末尾，然后报
+                    # 「无法解析的表达式起始 token 'None'」，完全看不出是括号没闭合。
+                    raise FaSyntaxError("缺少 '}'（块未闭合）",
+                                        self.cur().line, self.cur().col)
                 s = self.parse_stmt()
                 if s is not None:
                     stmts.append(s)
@@ -507,8 +550,16 @@ class Parser:
         if self.at("NEWLINE"):
             self.next()
         if not self.at("INDENT"):
-            raise FaSyntaxError("这里需要一个缩进代码块（或用 {} 包裹）",
-                                self.cur().line, self.cur().col)
+            # 单行块：`Color.Red: return "红"`、`if x > 0: return 1`、`else: y = 2`。
+            # 以前这里一律报错，只有「换行 + 缩进」和 `{}` 两种写法能用，
+            # 而单行分支恰恰是 match 最常见的写法。
+            if (self.at("EOF") or self.at("DEDENT") or self.at("NEWLINE")
+                    or self.at(P, "}") or self.at(P, ")")):
+                raise FaSyntaxError("这里需要一个缩进代码块（或用 {} 包裹）",
+                                    self.cur().line, self.cur().col)
+            s1 = self.parse_stmt()
+            self.skip_terms()
+            return Block([s1] if s1 is not None else [])
         self.expect("INDENT")
         stmts = []
         while not self.at("DEDENT") and not self.at("EOF"):
@@ -523,6 +574,10 @@ class Parser:
         return Block(stmts)
 
     def parse_stmt(self) -> Optional[Stmt]:
+        tok = self.cur()
+        return self.stamp(self._parse_stmt(), tok)
+
+    def _parse_stmt(self) -> Optional[Stmt]:
         t = self.cur()
         if t.kind in ("NEWLINE", "INDENT") or self.at(P, ";"):
             self.next()
@@ -531,17 +586,31 @@ class Parser:
             return None
         if self.at_kw("let"):
             return self.parse_let()
+        if self.at_kw("fn"):
+            # 函数体里再定义 fn：会被提升成一个独立函数（名字 = 外层__内层），
+            # 因此不能捕获外层局部变量 —— FA 还没有闭包。
+            return self.parse_fn()
+        if self.at(P, "{"):
+            # 裸块语句：开一个新作用域（`{ let x = 1 }` 里的 x 出了块就没了）。
+            # sema / codegen 早就支持 Block 当语句用，只有语法分析这里没接上，
+            # 于是文档里写的「{} 是空块」实际上会报「无法解析的表达式起始 token '{'」。
+            return self.parse_block("block")
         if self.at_kw("return"):
             self.next()
             val = None
-            if not (self.at("NEWLINE") or self.at(P, ";") or self.at("DEDENT")):
+            # 花括号块里的 `{ return }` 也算「后面没有值」：以前只认 NEWLINE / ; /
+            # DEDENT，于是 `if i < 0 { return }` 报「无法解析的表达式起始 token '}'」，
+            # 而同样意思的冒号缩进写法（单独一行 return）却是好的 —— 两种块写法
+            # 应该一个样。
+            if not (self.at("NEWLINE") or self.at(P, ";") or self.at("DEDENT")
+                    or self.at(P, "}")):
                 val = self.parse_expr()
             return Return(value=val)
         if self.at_kw("if"):
             return self.parse_if()
         if self.at_kw("while"):
             self.next()
-            cond = self.parse_expr()
+            cond = self.parse_head_expr()
             body = self.parse_block()
             return While(cond=cond, body=body)
         if self.at_kw("for"):
@@ -571,7 +640,11 @@ class Parser:
             return Asm(code=code)
         if self.at_kw("raise"):
             self.next()
-            return ExprStmt(expr=Call(callee=NameRef("__fa_panic"),
+            # `raise "出事了"` 就是 panic 的另一种写法。以前这里造了一个叫
+            # __fa_panic 的调用，可运行时和内建表里都没有这个名字，
+            # 于是语义阶段报「未定义的标识符 '__fa_panic'」—— 一个内部名字
+            # 漏到用户面前，还看不出是 raise 的事。
+            return ExprStmt(expr=Call(callee=NameRef("panic"),
                                       args=[self.parse_expr()]))
         # 赋值 / 复合赋值 / 表达式语句
         e = self.parse_expr()
@@ -638,23 +711,37 @@ class Parser:
             return True
         return False
 
+    def parse_head_expr(self) -> Expr:
+        """解析 if / while / for-in / match 的头部表达式。
+
+        这些结构后面紧跟的 `{` 是**块**的开始，可 `Name {` 恰好也是结构体字面量
+        的开头 —— 于是 `if done { ... }`、`while ok { ... }`、`for x in items { ... }`
+        会被解析成 `if (done {...})`，报一句莫名其妙的「期望 'NAME'，实际得到 'true'」。
+        解析头部时禁掉结构体字面量（真要写字面量就加括号：`if (P { a: 1 }) == q`）。
+        """
+        self.no_struct_lit += 1
+        try:
+            return self.parse_expr()
+        finally:
+            self.no_struct_lit -= 1
+
     def parse_if(self) -> If:
         self.expect_kw("if")
-        cond = self.parse_expr()
+        cond = self.parse_head_expr()
         body = self.parse_block()
         elifs = []
         orelse = None
         while True:
             if self.at_kw("elif"):
                 self.next()
-                c = self.parse_expr()
+                c = self.parse_head_expr()
                 b = self.parse_block()
                 elifs.append((c, b))
             elif self.at_kw("else"):
                 self.next()
                 if self.at_kw("if"):
                     self.next()
-                    c = self.parse_expr()
+                    c = self.parse_head_expr()
                     b = self.parse_block()
                     elifs.append((c, b))
                 else:
@@ -686,13 +773,16 @@ class Parser:
             return ForC(init=init, cond=cond, step=step, body=body)
         var = self.expect(NAME).value
         self.expect_kw("in")
-        it = self.parse_expr()
+        it = self.parse_head_expr()
         body = self.parse_block()
         return For(var=var, iter=it, body=body)
 
     def parse_match(self) -> Match:
         self.expect_kw("match")
-        subj = self.parse_expr()
+        # `match x { ... }` 的花括号形式以前根本走不到：解析主语时 `x {`
+        # 被当成结构体字面量吃掉了，于是报「期望 'NAME'，实际得到 'NUM'」。
+        # 解析 match 主语时暂时禁掉结构体字面量（要匹配字面量可以加括号）。
+        subj = self.parse_head_expr()
         arms = []
         if self.at(P, "{"):
             self.next()
@@ -710,14 +800,27 @@ class Parser:
                 self.next()
             if self.at("NEWLINE"):
                 self.next()
-            self.expect("INDENT")
-            while not self.at("DEDENT"):
-                self.skip_terms()
-                if self.at("DEDENT"):
-                    break
-                arms.append(self.parse_arm())
-                self.skip_terms()
-            self.accept("DEDENT")
+            if self.at("INDENT"):
+                self.expect("INDENT")
+                while not self.at("DEDENT"):
+                    self.skip_terms()
+                    if self.at("DEDENT"):
+                        break
+                    arms.append(self.parse_arm())
+                    self.skip_terms()
+                self.accept("DEDENT")
+            else:
+                # 在括号里（`print(match s: ...)`）换行和缩进都不算数 —— 词法层
+                # 在括号内根本不发 NEWLINE / INDENT，这里等不到 INDENT。
+                # 以前一律 expect("INDENT")，报「期望 'INDENT'，实际得到 'STR'」，
+                # 指着模式那个字面量，谁也看不出是「在括号里」这件事。
+                # 现在一路解析分支到右括号为止（和花括号写法同一条路）。
+                while not self.at("EOF"):
+                    self.skip_terms()
+                    if self.at(P, ")") or self.at("EOF"):
+                        break
+                    arms.append(self.parse_arm())
+                    self.skip_terms()
         return Match(subject=subj, arms=arms)
 
     def parse_arm(self) -> MatchArm:
@@ -780,6 +883,7 @@ class Parser:
                     if self.at(P, ","):
                         self.next(); continue
                     break
+                self.split_gt()
                 self.expect_op(">")
             t = TName(name, args)
             if self.at_op("?"):
@@ -792,13 +896,33 @@ class Parser:
             t = TOptional(t)
         return t
 
+    def split_gt(self):
+        """`Vec<Vec<i64>>` / `Map<str, Vec<i64>>` 的收尾 `>>` 会被词法分析当成
+        一个移位运算符，于是嵌套泛型根本写不出来（C++ 早年也有同样的坑）。
+        在**类型参数**位置遇到 `>>`/`>>>` 时就地拆成 `>` + 余下部分。"""
+        t = self.cur()
+        if t.kind == OP and t.value in (">>", ">>>"):
+            self.toks[self.pos] = Token(OP, ">", t.line, t.col)
+            self.toks.insert(self.pos + 1,
+                             Token(OP, t.value[1:], t.line, t.col + 1))
+
     def expect_op(self, op):
         if self.at_op(op):
             return self.next()
         self.err(f"期望运算符 '{op}'")
 
     # ---------------------------------------------------------- 表达式
+    def stamp(self, node, tok):
+        """给还没有位置的节点盖上 tok 的行/列（AST 基类默认 line=col=0）"""
+        if isinstance(node, Node) and not getattr(node, "line", 0) and tok is not None:
+            node.line, node.col = tok.line, tok.col
+        return node
+
     def parse_expr(self, min_prec: int = 0) -> Expr:
+        tok = self.cur()
+        return self.stamp(self._parse_expr(min_prec), tok)
+
+    def _parse_expr(self, min_prec: int = 0) -> Expr:
         lhs = self.parse_unary()
         while True:
             t = self.cur()
@@ -823,6 +947,10 @@ class Parser:
         return lhs
 
     def parse_unary(self) -> Expr:
+        tok = self.cur()
+        return self.stamp(self._parse_unary(), tok)
+
+    def _parse_unary(self) -> Expr:
         t = self.cur()
         if t.kind == OP and t.value in ("-", "+", "!", "~"):
             self.next()
@@ -857,6 +985,10 @@ class Parser:
         return e
 
     def parse_postfix(self, e: Expr) -> Expr:
+        tok = self.cur()
+        return self.stamp(self._parse_postfix(e), tok)
+
+    def _parse_postfix(self, e: Expr) -> Expr:
         while True:
             if self.at(P, "("):
                 args = self.parse_args()
@@ -895,6 +1027,10 @@ class Parser:
         return args
 
     def parse_primary(self) -> Expr:
+        tok = self.cur()
+        return self.stamp(self._parse_primary(), tok)
+
+    def _parse_primary(self) -> Expr:
         t = self.cur()
         if t.kind == "NUM":
             self.next()
@@ -931,6 +1067,7 @@ class Parser:
                         if self.at(P, ","):
                             self.next(); continue
                         break
+                    self.split_gt()
                     if not self.at_op(">"):
                         raise FaSyntaxError("泛型参数需要以 '>' 结束")
                     self.next()
@@ -941,7 +1078,14 @@ class Parser:
                         self.next()
                         items = []
                         while not self.at(P, "]"):
-                            items.append(self.parse_expr())
+                            first = self.parse_expr()
+                            if name == "Map" and self.at(P, ":"):
+                                # Map 字面量：[键: 值, ...]，展平成 k1,v1,k2,v2
+                                self.next()
+                                items.append(first)
+                                items.append(self.parse_expr())
+                            else:
+                                items.append(first)
                             if self.at(P, ","):
                                 self.next()
                                 continue
@@ -956,7 +1100,7 @@ class Parser:
                 # 内置转换，如 i64(x)
                 args = self.parse_args()
                 return Cast(args[0] if args else NilLit(), TName(name))
-            if self.at(P, "{"):
+            if self.at(P, "{") and not self.no_struct_lit:
                 self.next()
                 fields = []
                 while not self.at(P, "}"):
@@ -989,6 +1133,17 @@ class Parser:
                 break
             self.expect(P, "]")
             return ArrayLit(elems)
+        if t.kind == KW and t.value in ("if", "match"):
+            # if / match 也能当表达式用：`let x = if c { 1 } else { 2 }`。
+            # 语句位置由 _parse_stmt 先截走，所以这里只在「= 右边 / 实参 / return」
+            # 这类真正的表达式位置生效，两种写法的解析完全共用一套代码。
+            return self.parse_if() if t.value == "if" else self.parse_match()
+        if t.kind == KW and t.value in ("else", "elif"):
+            # 右花括号单独一行、else 另起一行 —— 从 C/Java 带过来的习惯写法，
+            # 报「无法解析的表达式起始 token 'else'」完全看不出问题在哪。
+            self.err(f"'{t.value}' 接不上前面的 if：花括号写法要和右花括号同一行"
+                     f"（写成 `}} {t.value} ...`），缩进写法要紧跟在 if 块的下一行、"
+                     f"和 if 同缩进")
         self.err(f"无法解析的表达式起始 token '{t.value}'")
 
     def make_string(self, raw: str, line: int, col: int) -> Expr:
@@ -1002,6 +1157,13 @@ class Parser:
             if kind == "lit":
                 out.append(("lit", text))
             else:
+                if not text.strip():
+                    # `print("{}")` 以前会拿空文本去 parse_expr，报一条
+                    # 「无法解析的表达式起始 token 'None'」，看不出问题在花括号里
+                    raise FaSyntaxError(
+                        "字符串插值 {} 里是空的：花括号里要放表达式（如 \"{n}\"）；"
+                        "要打印字面花括号请用 chr(123) / chr(125) 或字符串拼接",
+                        line, col)
                 sub = Parser(text + "\n", self.filename)
                 sub.pos = 0
                 e = sub.parse_expr()
@@ -1011,4 +1173,6 @@ class Parser:
 
 def parse(src: str, filename: str = "<input>") -> Module:
     p = Parser(src, filename)
-    return p.parse_module()
+    mod = p.parse_module()
+    stamp_positions(mod)          # 兜底：任何还没位置的节点继承父节点的位置
+    return mod
