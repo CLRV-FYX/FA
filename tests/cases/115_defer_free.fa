@@ -1,0 +1,43 @@
+# defer：作用域退出时执行，配 new / free 用最省心。
+#
+# 要验证的是三条路都不漏：正常走到结尾、中途 return、块作用域结束。
+# 漏一个 ASan 就报 detected memory leaks（这个用例在 run_asan.py 里跑）。
+struct P:
+    x: i64 = 0
+
+fn early(n: i64) -> i64:
+    let p = new P { x: n }
+    defer free(p)
+    if n > 0:
+        return n * 2          # 中途 return 也要执行 defer
+    return -1
+
+fn blocky() -> i64:
+    let s = 0
+    {
+        let p = new P { x: 7 }
+        defer free(p)
+        s = p.x
+    }                          # 块结束就释放
+    return s
+
+fn main() -> i64:
+    print(early(3), early(-1), blocky())
+
+    let a = new P { x: 1 }
+    let b = new P { x: 2 }
+    defer free(a)
+    defer free(b)
+    print(a.x, b.x)
+
+    let v = Vec<i64>[1, 2]
+    let u = v.copy()
+    u.push(3)
+    print(v.to_str(), u.to_str())
+
+    # copy() 只深一层：嵌套容器还是共享的
+    let vv = Vec<Vec<i64>>[Vec<i64>[1]]
+    let ww = vv.copy()
+    ww[0].push(9)
+    print(vv.to_str(), ww.to_str())
+    return 0
