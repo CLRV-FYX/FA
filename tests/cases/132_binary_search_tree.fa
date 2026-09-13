@@ -1,0 +1,89 @@
+# 二叉搜索树：插入、查找、中序遍历（出来就是升序）、高度、后序释放。
+#
+# 递归的树只能用指针：*Tree 是 nil 表示空子树，new Tree {...} 建节点。
+# insert 返回（可能新的）根，所以调用方要写 root = Tree.insert(root, v)；
+# 释放必须后序（先两个孩子再自己），否则孩子就再也找不到了。
+# 中序遍历的结果必须是升序 —— 这一条就是这棵树的正确性检查。
+struct Tree:
+    value: i64 = 0
+    left: *Tree = nil
+    right: *Tree = nil
+
+impl Tree:
+    # 插入：返回（可能新的）根。root 是 nil 时就新建一个节点当根
+    fn insert(root: *Tree, v: i64) -> *Tree:
+        if root == nil:
+            return new Tree { value: v }
+        if v < root.value:
+            root.left = Tree.insert(root.left, v)
+        else:
+            if v > root.value:
+                root.right = Tree.insert(root.right, v)
+            # 相等就什么也不做：这棵树不存重复值
+        return root
+
+    fn contains(self, v: i64) -> bool:
+        let p = self as *Tree
+        while p != nil:
+            if v == p.value:
+                return true
+            if v < p.value:
+                p = p.left
+            else:
+                p = p.right
+        return false
+
+    # 中序遍历：左 -> 根 -> 右，BST 这么走出来就是升序
+    fn inorder(self, out: Vec<i64>):
+        let p = self as *Tree
+        if p == nil:
+            return
+        if p.left != nil:
+            p.left.inorder(out)
+        out.push(p.value)
+        if p.right != nil:
+            p.right.inorder(out)
+
+    fn height(self) -> i64:
+        let p = self as *Tree
+        if p == nil:
+            return 0
+        let l = 0
+        let r = 0
+        if p.left != nil:
+            l = p.left.height()
+        if p.right != nil:
+            r = p.right.height()
+        if l > r:
+            return l + 1
+        return r + 1
+
+    # 后序释放：先两个孩子，再自己
+    fn free_all(self):
+        let p = self as *Tree
+        if p == nil:
+            return
+        if p.left != nil:
+            p.left.free_all()
+        if p.right != nil:
+            p.right.free_all()
+        free(p)
+
+fn main() -> i64:
+    let root: *Tree = nil
+    for v in [50, 30, 70, 20, 40, 60, 80, 50]:
+        root = Tree.insert(root, v)
+
+    let out = Vec<i64>[]
+    root.inorder(out)
+    print("中序遍历：", out)
+    print("高度：", root.height())
+    print("有 40 吗：", root.contains(40), " 有 99 吗：", root.contains(99))
+
+    root = Tree.insert(root, 35)
+    let out2 = Vec<i64>[]
+    root.inorder(out2)
+    print("插入 35 之后：", out2, " 高度", root.height())
+
+    root.free_all()
+    return 0
