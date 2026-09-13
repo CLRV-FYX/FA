@@ -129,7 +129,18 @@ python3 tests/run_tests.py            # 跑全部用例（68 个）
 python3 tests/run_tests.py --opt 0    # 换个优化级别再跑一遍（差分测试）
 python3 tests/run_tests.py 010        # 只跑名字里含 010 的用例
 python3 tests/run_tests.py --record   # 把当前输出记录为期望输出（改动需人工复核）
+python3 tests/check_docs.py           # 把文档里的 ```fa 代码块逐个喂给 fa check
 ```
+
+`check_docs.py` 是「文档不许说谎」的自动化守卫：它扫 `README.md` 与 `docs/*.md`
+里的每个 ` ```fa ` 代码块，按可信度顺序补全成完整程序（原样 / 整块包进 `main` /
+声明留顶层而语句搬进 `main`），任意一种通过 `fa check` 就算通过。
+含 `fn main` 的**完整程序必须严格通过**（读者会直接复制去跑）；教学片段放宽
+「引用了别处才定义的名字、依赖不存在的头文件/动态库」这类节选现象；
+反面教材（带 ❌ 或 `expect-compile-error`）、`名字`/`类型` 这类模板占位、
+左右并排对照两种语法的排版、以及引用块里的演示，都跳过。
+一个块里写了多个文件（`// math.fa` 接 `// main.fa`）会按标记拆开各写各的文件再查。
+出错时打印 `文件:行号` 和编译器自己的报错，退出码非 0。
 
 用例有两种断言方式：`tests/cases/<名字>.expected` 存期望输出；或者在源码开头写指令
 （`# expect-compile-error: 关键字`、`# expect-exit: 3`、`# expect-stderr: 越界`），
