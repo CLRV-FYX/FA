@@ -177,6 +177,16 @@ void    fa_vec_resize(FaVec *v, int64_t n, uint64_t val);
 FaMap *fa_map_new(int64_t kkind, int64_t vkind, int64_t kty, int64_t vty);
 FaMap *fa_map_clone(FaMap *m, int64_t kbox, int64_t vbox);   /* m.copy() */
 int64_t fa_map_len(FaMap *m);
+/* 按**槽位**遍历：fa_map_key_at/val_at 那种「第 idx 个占用槽」每调一次都要从头扫，
+   整个 keys() / for k in m 就是 O(n·cap) —— 五万个键实测 12 秒。下面这组是 O(1) 一次，
+   调用方自己扫 0..fa_map_cap 并跳过未占用的槽（空槽与墓碑），一趟 O(cap)。 */
+int64_t fa_map_cap(FaMap *m);
+int64_t fa_map_slot_used(FaMap *m, int64_t i);
+uint64_t fa_map_slot_key(FaMap *m, int64_t i);
+uint64_t fa_map_slot_val(FaMap *m, int64_t i);
+/* 一趟建出所有键 / 值的 Vec（构造参数与 fa_vec_new 一致） */
+FaVec *fa_map_keys_vec(FaMap *m, int64_t kind, int64_t esz, int64_t sgn, int64_t ety);
+FaVec *fa_map_vals_vec(FaMap *m, int64_t kind, int64_t esz, int64_t sgn, int64_t ety);
 uint64_t fa_map_get(FaMap *m, uint64_t key);
 void    fa_map_set(FaMap *m, uint64_t key, uint64_t val);
 int64_t fa_map_has(FaMap *m, uint64_t key);

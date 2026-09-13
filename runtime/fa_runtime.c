@@ -1080,6 +1080,9 @@ FaMap *fa_map_new(int64_t kkind, int64_t vkind, int64_t kty, int64_t vty) {
     return m;
 }
 
+static int64_t map_probe(FaMap *m, uint64_t key, int64_t for_insert);
+static void map_put(FaMap *m, uint64_t key, uint64_t val, int inc);
+
 static void map_grow(FaMap *m) {
     int64_t nc = m->cap * 2;
     FaMapEntry *ne = (FaMapEntry *)fa_alloc((int64_t)sizeof(FaMapEntry) * nc);
@@ -1088,7 +1091,14 @@ static void map_grow(FaMap *m) {
     int64_t oc = m->cap;
     m->entries = ne; m->cap = nc; m->len = 0;
     for (int64_t i = 0; i < oc; i++) {
-        if (oe[i].state == 1) fa_map_set(m, oe[i].key, oe[i].val);
+        /* 搬家**不加引用**（inc = 0）：旧槽里那一份所有权直接挪到新槽。
+           以前这里调 fa_map_set，而 fa_map_set 是要 fa_agg_inc 的 ——
+           每扩容一次，所有活着的键和值都多背一个引用计数，等表释放时只减一次，
+           于是全都漏在堆上。ASan 实测：一个 2000 项的 Map<str, i64>（键是 str(i)）
+           漏 1433 个 FaStr / 29 KB，正好是「经历过至少一次扩容的那些键」。
+           初始容量 16、装到 12 项就扩容，所以任何超过十来项的 Map 都在漏 ——
+           词频统计这种最常见的用法首当其冲。 */
+        if (oe[i].state == 1) map_put(m, oe[i].key, oe[i].val, 0);
     }
     fa_free(oe);
 }
@@ -1144,24 +1154,34 @@ FaMap *fa_map_clone(FaMap *m, int64_t kbox, int64_t vbox) {
     return r;
 }
 
-void fa_map_set(FaMap *m, uint64_t key, uint64_t val) {
-    if (!m) return;
-    if ((m->len + 1) * 10 > m->cap * 7) map_grow(m);
+/* 写入。inc = 1 表示「调用方交出一份所有权，表里再加一次引用」（fa_map_set 的语义）；
+   inc = 0 表示「所有权直接搬进来」（扩容搬家用的，见 map_grow）。 */
+static void map_put(FaMap *m, uint64_t key, uint64_t val, int inc) {
     int64_t i = map_probe(m, key, 1);
     if (i < 0) return;
     if (m->entries[i].state == 1) {
         uint64_t ok = m->entries[i].key, ov = m->entries[i].val;
-        fa_agg_inc((void *)(uintptr_t)key, m->kkind);
-        fa_agg_inc((void *)(uintptr_t)val, m->vkind);
+        if (inc) {
+            fa_agg_inc((void *)(uintptr_t)key, m->kkind);
+            fa_agg_inc((void *)(uintptr_t)val, m->vkind);
+        }
         m->entries[i].key = key; m->entries[i].val = val;
         if (m->kkind) fa_rc_dec((void *)(uintptr_t)ok, m->kkind);
         if (m->vkind) fa_rc_dec((void *)(uintptr_t)ov, m->vkind);
     } else {
-        fa_agg_inc((void *)(uintptr_t)key, m->kkind);
-        fa_agg_inc((void *)(uintptr_t)val, m->vkind);
+        if (inc) {
+            fa_agg_inc((void *)(uintptr_t)key, m->kkind);
+            fa_agg_inc((void *)(uintptr_t)val, m->vkind);
+        }
         m->entries[i].key = key; m->entries[i].val = val; m->entries[i].state = 1;
         m->len++;
     }
+}
+
+void fa_map_set(FaMap *m, uint64_t key, uint64_t val) {
+    if (!m) return;
+    if ((m->len + 1) * 10 > m->cap * 7) map_grow(m);
+    map_put(m, key, val, 1);
 }
 
 void fa_map_del(FaMap *m, uint64_t key) {
@@ -1172,6 +1192,39 @@ void fa_map_del(FaMap *m, uint64_t key) {
     if (m->vkind) fa_rc_dec((void *)(uintptr_t)m->entries[i].val, m->vkind);
     m->entries[i].state = -1; m->entries[i].key = 0; m->entries[i].val = 0;
     m->len--;
+}
+
+int64_t fa_map_cap(FaMap *m) { return m ? m->cap : 0; }
+
+int64_t fa_map_slot_used(FaMap *m, int64_t i) {
+    if (!m || i < 0 || i >= m->cap) return 0;
+    return m->entries[i].state == 1;
+}
+
+uint64_t fa_map_slot_key(FaMap *m, int64_t i) {
+    if (!m || i < 0 || i >= m->cap) return 0;
+    return m->entries[i].key;
+}
+
+uint64_t fa_map_slot_val(FaMap *m, int64_t i) {
+    if (!m || i < 0 || i >= m->cap) return 0;
+    return m->entries[i].val;
+}
+
+FaVec *fa_map_keys_vec(FaMap *m, int64_t kind, int64_t esz, int64_t sgn, int64_t ety) {
+    FaVec *v = fa_vec_new(kind, esz, sgn, ety);
+    if (!m) return v;
+    for (int64_t i = 0; i < m->cap; i++)
+        if (m->entries[i].state == 1) fa_vec_push(v, m->entries[i].key);
+    return v;
+}
+
+FaVec *fa_map_vals_vec(FaMap *m, int64_t kind, int64_t esz, int64_t sgn, int64_t ety) {
+    FaVec *v = fa_vec_new(kind, esz, sgn, ety);
+    if (!m) return v;
+    for (int64_t i = 0; i < m->cap; i++)
+        if (m->entries[i].state == 1) fa_vec_push(v, m->entries[i].val);
+    return v;
 }
 
 uint64_t fa_map_val_at(FaMap *m, int64_t idx) {
@@ -1198,6 +1251,8 @@ void fa_map_clear(FaMap *m) {
     m->len = 0;
 }
 
+/* 第 idx 个占用槽：每调一次都从头扫一遍（O(cap)）。编译器已经不用它了
+   （keys/values/for-in/to_str 都改成扫槽位），留着只为兼容旧的手写调用。 */
 uint64_t fa_map_key_at(FaMap *m, int64_t idx) {
     if (!m) return 0;
     int64_t c = 0;

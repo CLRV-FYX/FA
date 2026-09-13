@@ -1228,6 +1228,9 @@ class FnGen:
         top = self.new_label("for")
         body = self.new_label("fbody")
         end = self.new_label("fend")
+        # step 提前建好：Map 是按槽位遍历的，循环体开头就要能跳到「自增那一步」
+        # （标签只是个名字，真正 LABEL 出来的位置没变）
+        step = self.new_label("fstep")
         idx = self.new_temp(I64)
         limit = self.new_temp(I64)
         vloc = None
@@ -1269,7 +1272,9 @@ class FnGen:
             elif ity.kind == "arr":
                 n = self.const(ity.count)
             elif ity.kind == "map":
-                self.emit("CALL", n, [Sym("fa_map_len"), obj], ty=I64)
+                # 按**槽位**数遍历，不是按键数：fa_map_key_at(obj, idx) 那种
+                # 「第 idx 个占用槽」每调一次都从头扫，`for k in m` 就成了 O(n·cap)。
+                self.emit("CALL", n, [Sym("fa_map_cap"), obj], ty=I64)
             else:
                 self.err(f"暂不支持遍历 {ity}", s)
             self.emit("MOV", idx, [self.const(0)], ty=I64)
@@ -1315,15 +1320,24 @@ class FnGen:
             self.emit("CALL", r, [Sym("fa_str_byte"), obj, idx], ty=I64)
             self.emit("MOV", vt, [self.coerce(r, I64, vty)], ty=vty)
         elif ity.kind == "map":
+            # 空槽（state 0）与墓碑（state -1，del 留下的）直接跳到自增。
+            # 作用域已经 push 过了，而 step 那边会 pop，所以配平。
+            used = self.new_temp(I64)
+            self.emit("CALL", used, [Sym("fa_map_slot_used"), obj, idx], ty=I64)
+            unused = self.new_temp(BOOL)
+            self.emit("CMP", unused, [used, self.const(0)], extra="==", ty=I64)
+            proceed = self.new_label("mapslot")
+            self.emit("BR", args=[unused], extra=(step, proceed))
+            self.emit("LABEL", extra=proceed)
             vt = self.new_temp(vty)
             kt = ity.key
             if kt is not None and kt.is_float:
                 raw = self.new_temp(I64)
-                self.emit("CALL", raw, [Sym("fa_map_key_at"), obj, idx], ty=I64)
+                self.emit("CALL", raw, [Sym("fa_map_slot_key"), obj, idx], ty=I64)
                 self.emit("MOV", vt, [self.bitcast(raw, kt)], ty=kt)
             else:
                 r = self.new_temp(vty)
-                self.emit("CALL", r, [Sym("fa_map_key_at"), obj, idx], ty=vty)
+                self.emit("CALL", r, [Sym("fa_map_slot_key"), obj, idx], ty=vty)
                 self.emit("MOV", vt, [self.coerce(r, vty, vty)], ty=vty)
         elif ity.kind == "arr":
             ptr, off = arr_ptr, arr_off
@@ -1355,7 +1369,6 @@ class FnGen:
         # 只有 for-in 这条把 continue 目标写成了 top）。
         # 标签放在 pop_scope 之前，这样 continue 与正常走完一轮一样，
         # 都会执行本次迭代的作用域清理（defer / 块内引用）再自增。
-        step = self.new_label("fstep")
         self.loop_stack.append((step, end, sc, sc.parent))
         self.gen_block(s.body)
         self.loop_stack.pop()
@@ -1659,8 +1672,12 @@ class FnGen:
         return r
 
     def _map_slot_at(self, obj, i, t: Type, is_key: bool):
-        """取 Map 第 i 个占用槽的键 / 值。"""
-        fn = "fa_map_key_at" if is_key else "fa_map_val_at"
+        """取 Map **第 i 个槽位**上的键 / 值（调用方自己跳过未占用的槽）。
+
+        以前这里调 fa_map_key_at(m, i)，那是「第 i 个**占用**槽」—— 每调一次都要
+        从头扫一遍表，于是 Map 的 to_str 是 O(n·cap)：一万个键的表打一次要几秒。
+        """
+        fn = "fa_map_slot_key" if is_key else "fa_map_slot_val"
         if t is not None and is_agg(t):
             p = self.new_temp(ptr_to(t))
             self.emit("CALL", p, [Sym(fn), obj, i], ty=ptr_to(t))
@@ -1689,37 +1706,46 @@ class FnGen:
     def gen_container_to_str_agg(self, v, ty: Type) -> Temp:
         """`[P { x: 1 }, P { x: 2 }]` / `{"甲": P { x: 1 }}`。
 
-        两件事必须照着 gen_enum_to_str 的做法来（第一版两条都没做，实测打出来
-        缺元素、`print(v)` 直接段错误）：
+        元素文本一项项收进一个 Vec<str>，最后 `fa_vec_join` 一次拼起来。
+        第一版是「累积串 + 每轮 concat」：concat 每轮都要把已经拼好的整串重拷一遍，
+        一万个结构体元素就是 3.6 亿字节 memcpy（实测 563 毫秒），十万个元素直接
+        分钟级 —— 典型的静默 O(n²)。join 内部用可增长构造器，是 O(总长度)。
 
-        1) 累积用的字符串放**栈槽**里。它的活跃区间横跨整个循环，留在临时寄存器里
-           会被循环体里的 CALL 冲掉；
-        2) 每轮新建的中间引用（字段名、字段值、拼接结果）要**在本轮内**释放
+        还有两件必须照着 gen_enum_to_str 的做法来的事：
+
+        1) 每轮新建的中间引用（字段名、字段值、拼接结果）要**在本轮内**释放
            （release_new_refs）。它们是语句级登记的，留到语句末尾就已经在循环外面了，
-           那时寄存器里装的是完全无关的值 —— 这正是 if/match 表达式踩过的坑。
+           那时寄存器里装的是完全无关的值 —— if/match 表达式踩过同一个坑。
            顺带也把峰值内存压下来：打印一千个元素不会同时活着几千个 FaStr。
+        2) Map 按**槽位**扫（fa_map_cap + fa_map_slot_used），跳过空槽与墓碑。
+           以前调 fa_map_key_at(m, i) 取「第 i 个占用槽」，那函数每调一次都从头扫，
+           整个 to_str 是 O(n·cap)。
         """
         is_vec = ty.kind == "vec"
         et = ty.elem if is_vec else None
         kt, vt = (ty.key, ty.val) if not is_vec else (None, None)
+        entry_refs = set(self.owned_ids)
+        entry_aggs = set(self.agg_owned_ids)
 
-        slot = self.emit_alloca(8)
-        # 槽里第一份也做成**堆上**的串（concat 的返回值 rc=1）：后面每轮覆盖时
-        # 都要 rc_dec 掉旧的那份，而静态串是不能减引用的。
-        head = self.concat_str(self.make_str(""), self.make_str("[" if is_vec else "{"))
-        self.take_owned(head, STR)
-        self.emit("STORE", args=[slot, head], extra=0, ty=STR)
+        # 装元素文本的 Vec<str>
+        pieces = self.new_temp(vec_of(STR))
+        self.emit("CALL", pieces,
+                  [Sym("fa_vec_new"), self.const(elem_kind(STR, self.sema)),
+                   self.const(vec_esz(STR)), self.const(0),
+                   self.const(T.ty_code(STR))], ty=vec_of(STR))
+        self.mark_owned(pieces, vec_of(STR))
 
         n = self.new_temp(I64)
         if is_vec:
             self.emit("LOAD", n, [v], extra=8, ty=I64)
         else:
-            self.emit("CALL", n, [Sym("fa_map_len"), v], ty=I64)
+            self.emit("CALL", n, [Sym("fa_map_cap"), v], ty=I64)
         i = self.new_temp(I64)
         self.emit("MOV", i, [self.const(0)], ty=I64)
 
         top = self.new_label("cts")
         body = self.new_label("ctsb")
+        step = self.new_label("ctsstep")
         end = self.new_label("ctse")
         self.emit("LABEL", extra=top)
         c = self.new_temp(BOOL)
@@ -1727,23 +1753,15 @@ class FnGen:
         self.emit("BR", args=[c], extra=(body, end))
         self.emit("LABEL", extra=body)
 
-        # ---- 分隔符：不是第一个就补 ", "，同时把上一轮那份累积串放掉
-        nz = self.new_temp(BOOL)
-        self.emit("CMP", nz, [i, self.const(0)], extra=">", ty=I64)
-        l_sep = self.new_label("ctssep")
-        l_no = self.new_label("ctsnosep")
-        self.emit("BR", args=[nz], extra=(l_sep, l_no))
-        self.emit("LABEL", extra=l_sep)
-        sep_refs = set(self.owned_ids)
-        sep_aggs = set(self.agg_owned_ids)
-        cur = self.new_temp(STR)
-        self.emit("LOAD", cur, [slot], extra=0, ty=STR)
-        withsep = self.concat_str(cur, self.make_str(", "))
-        self.take_owned(withsep, STR)
-        self.emit("STORE", args=[slot, withsep], extra=0, ty=STR)
-        self.emit_rcdec_val(cur, STR)
-        self.release_new_refs(None, sep_refs, sep_aggs)
-        self.emit("LABEL", extra=l_no)
+        if not is_vec:
+            # 空槽（state 0）与墓碑（state -1，del 留下的）跳过
+            used = self.new_temp(I64)
+            self.emit("CALL", used, [Sym("fa_map_slot_used"), v, i], ty=I64)
+            unused = self.new_temp(BOOL)
+            self.emit("CMP", unused, [used, self.const(0)], extra="==", ty=I64)
+            l_used = self.new_label("ctsused")
+            self.emit("BR", args=[unused], extra=(step, l_used))
+            self.emit("LABEL", extra=l_used)
 
         # ---- 这一轮的元素文本（结构体/枚举由编译器展开字段，其余类型照常）
         ref_before = set(self.owned_ids)
@@ -1755,25 +1773,29 @@ class FnGen:
             piece = self.concat_str(ks, self.make_str(": "))
             piece = self.concat_str(
                 piece, self._elem_to_str(self._map_slot_at(v, i, vt, False), vt))
-        cur2 = self.new_temp(STR)
-        self.emit("LOAD", cur2, [slot], extra=0, ty=STR)
-        acc = self.concat_str(cur2, piece)
-        self.take_owned(acc, STR)
-        self.emit("STORE", args=[slot, acc], extra=0, ty=STR)
-        self.emit_rcdec_val(cur2, STR)
+        # fa_vec_push 自己会加一次引用，所以这一份在本轮末尾放掉正好
+        self.emit("CALL", None, [Sym("fa_vec_push"), pieces, piece])
         self.release_new_refs(None, ref_before, agg_before)
 
+        self.emit("LABEL", extra=step)
         self.emit("BIN", i, [i, self.const(1)], extra="+", ty=I64)
         self.emit("JMP", extra=top)
         self.emit("LABEL", extra=end)
 
-        fin = self.new_temp(STR)
-        self.emit("LOAD", fin, [slot], extra=0, ty=STR)
-        out = self.concat_str(fin, self.make_str("]" if is_vec else "}"))
-        self.emit_rcdec_val(fin, STR)
+        joined = self.new_temp(STR)
+        self.emit("CALL", joined, [Sym("fa_vec_join"), pieces, self.make_str(", ")],
+                  ty=STR)
+        self.mark_owned(joined, STR)
+        out = self.concat_str(self.make_str("[" if is_vec else "{"), joined)
+        out = self.concat_str(out, self.make_str("]" if is_vec else "}"))
+        # 中间那些（pieces / joined / 第一次 concat 的结果）在这里放掉；
+        # **最后这份 out 必须留在语句级所有权表里**交给调用方的语句末尾释放
+        # （concat_str 的约定就是这样）。第一版写成 take_owned(out) 把它摘走了，
+        # 于是没人释放它 —— ASan 实测每次 print 一个容器漏一份结果串
+        # （`Vec<Inner>` 两个元素漏 65 字节，正是那串文本加对象头的大小）。
+        self.release_new_refs(out, entry_refs, entry_aggs)
         return out
 
-    # ------------------------------------------------- 聚合值的可读化打印
     def concat_str(self, a, b) -> Temp:
         """两个 str 拼起来，返回一份**新的拥有**引用（fa_str_concat 的约定）。"""
         r = self.new_temp(STR)
@@ -3152,33 +3174,17 @@ class FnGen:
             if mt.kind != "map":
                 self.err(f"{name}() 需要 Map", e)
             et = mt.key if name == "keys" else mt.val
-            k = elem_kind(et, self.sema)
+            # 一趟扫槽位建出来。以前在编译器里发一个 0..len 的循环、每轮调
+            # fa_map_key_at(m, i) 取「第 i 个占用槽」—— 那个函数每调一次都要从头扫，
+            # 于是 keys() 是 O(n·cap)：**五万个键实测 12.3 秒**（同一张表 sort 只要 6 毫秒）。
             v = self.new_temp(vec_of(et))
-            self.emit("CALL", v, [Sym("fa_vec_new"), self.const(k),
-                                  self.const(vec_esz(et)),
-                                  self.const(1 if (et.kind == "int" and et.is_signed) else 0),
-                                  self.const(T.ty_code(et))],
+            self.emit("CALL", v,
+                      [Sym("fa_map_keys_vec" if name == "keys" else "fa_map_vals_vec"),
+                       m, self.const(elem_kind(et, self.sema)), self.const(vec_esz(et)),
+                       self.const(1 if (et.kind == "int" and et.is_signed) else 0),
+                       self.const(T.ty_code(et))],
                       ty=vec_of(et))
             self.mark_owned(v, vec_of(et))
-            n = self.new_temp(I64)
-            self.emit("CALL", n, [Sym("fa_map_len"), m], ty=I64)
-            i = self.new_temp(I64)
-            self.emit("MOV", i, [self.const(0)], ty=I64)
-            top = self.new_label("keys")
-            body = self.new_label("kbody")
-            end = self.new_label("kend")
-            self.emit("LABEL", extra=top)
-            c = self.new_temp(BOOL)
-            self.emit("CMP", c, [i, n], extra="<", ty=I64)
-            self.emit("BR", args=[c], extra=(body, end))
-            self.emit("LABEL", extra=body)
-            raw = self.new_temp(I64)
-            fn = "fa_map_key_at" if name == "keys" else "fa_map_val_at"
-            self.emit("CALL", raw, [Sym(fn), m, i], ty=I64)
-            self.emit("CALL", None, [Sym("fa_vec_push"), v, raw])
-            self.emit("BIN", i, [i, self.const(1)], extra="+", ty=I64)
-            self.emit("JMP", extra=top)
-            self.emit("LABEL", extra=end)
             return v
         if name == "file_read":
             v = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
