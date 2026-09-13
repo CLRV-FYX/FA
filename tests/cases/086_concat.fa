@@ -1,0 +1,22 @@
+# concat(...)：变参拼接成字符串。
+# 回归：以前 codegen 只把**第一个**参数转成字符串就返回，后面的全被静默丢掉
+# （concat("甲","乙") 打出「甲」），而且没人用、没人测、文档里也没写。
+# 现在按字符串插值那条路逐个拼（fa_str_concat，中间结果语句末尾统一释放）。
+struct P:
+    x: i64
+    name: str
+
+fn main() -> i64:
+    print(concat("甲", "乙", "丙"))
+    print(concat("n=", 42, " ratio=", 0.25, " ok=", true, " c=", 'Z'))
+    let v = Vec<P>[P{x: 1, name: "一"}]
+    print(concat("表:", v, " 长度:", v.len()))
+    let m = Map<str, i64>()
+    m.set("k", 7)
+    print(concat("字典:", m))
+    let s = concat("单独一个")
+    print(s, s.len())
+    # 拼出来的字符串是普通 str，能继续用
+    let t = concat("a", 1).repeat(2)
+    print(t, t.upper())
+    return 0

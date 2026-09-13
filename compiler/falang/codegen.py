@@ -2975,8 +2975,21 @@ class FnGen:
             self.mark_owned(r, STR)
             return r
         if name == "concat":
-            v = self.gen_expr(e.args[0])
-            return self.gen_to_str(v, e.args[0].ty)
+            # concat(a, b, ...) = 各参数转成字符串再依次拼起来。
+            # 以前这里只转**第一个**参数就 return，后面的全被静默丢掉：
+            # concat("甲", "乙") 打出「甲」，concat(v1, v2) 也只是 v1.to_str()。
+            # 拼法跟字符串插值走同一条路（fa_str_concat，返回值 +1 交给语句末尾统一释放；
+            # 两个输入是借来的，绝不能在这里登记释放）。
+            if not e.args:
+                self.err("concat() 至少要一个参数（要拼接的字符串或值）", e)
+            cur = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+            for a in e.args[1:]:
+                s2 = self.gen_to_str(self.gen_expr(a), a.ty)
+                r = self.new_temp(STR)
+                self.emit("CALL", r, [Sym("fa_str_concat"), cur, s2], ty=STR)
+                self.mark_owned(r, STR)
+                cur = r
+            return cur
         if name == "gcd":
             a = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
             b = self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, I64)

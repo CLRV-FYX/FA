@@ -207,6 +207,56 @@ class Sema:
     # 宽度表。与其留着一串坑，编译期就说清楚。
     MAP_KEY_BAD = ("struct", "enum", "vec", "map", "arr")
 
+    # sort / min / max / contains / index_of / sum 都要**按内容**比较或累加元素。
+    # 运行时只实现了三种元素：整数（按位）、浮点（按值）、str（cmp_strp 逐字节
+    # memcmp，contains 里 kind==1 也特判了内容比较）。结构体/枚举/容器在表里存的是
+    # **装箱指针**，于是这些方法一个都不成立，而且**没有一个会报错**：
+    #   sort()            —— qsort 排的是堆地址，实测 Vec<P> 调完原样返回，看不出异常
+    #   contains()/index_of() —— 比地址，实测两张表里内容相同的 Vec<i64> 判 false / -1
+    #   sum()             —— 把指针加起来，实测打出 8454172 这种垃圾数
+    #   min()/max()       —— 返回一个 i64 地址，当结构体用才在别处炸
+    # 静默的错答案比崩溃更难查，所以一律在编译期拦住。
+    VEC_CONTENT_OPS = ("sort", "min", "max", "contains", "index_of", "sum")
+    VEC_BOXED = ("struct", "enum", "vec", "map", "arr")
+
+    def check_vec_content_op(self, et, op, node):
+        """Vec 的元素类型撑不撑得起这个按内容比较的操作。"""
+        if et is None or op not in self.VEC_CONTENT_OPS:
+            return
+        if et.kind in self.VEC_BOXED:
+            why = {
+                "sort": "qsort 排的是堆地址，排不出任何有意义的顺序",
+                "contains": "比的是地址，内容相同的两个值也判不出相等（永远 false）",
+                "index_of": "比的是地址，内容相同的两个值也找不到（永远 -1）",
+                "min": "返回的是一个地址，当不成这个类型用",
+                "max": "返回的是一个地址，当不成这个类型用",
+                "sum": "把地址加起来，得到一个垃圾数",
+            }[op]
+            hint = {
+                "sort": "想按结构体的某个字段排，就自己写一趟排序（教程 §9.6 有插入排序的例子）",
+                "contains": "想找就自己遍历：`for x in v { if x.字段 == 目标 { ... } }`",
+                "index_of": "想找下标就自己遍历，记下 i 再 break",
+                "min": "想取最小就自己遍历比较字段",
+                "max": "想取最大就自己遍历比较字段",
+                "sum": "想累加就自己遍历：`for x in v { total += x.字段 }`",
+            }[op]
+            self.error(
+                f"Vec<{et}> 的元素不能 {op}()：{et} 在表里存的是装箱指针，{why}"
+                f"（不报错，但结果是错的）。能这样用的是 str / 整数 / 浮点 / bool / char / 指针。{hint}",
+                node)
+            return
+        if et.kind == "str":
+            if op == "sum":
+                self.error(
+                    "Vec<str> 不能 sum()：字符串不能相加。要拼成一条用 v.join(分隔符)，"
+                    "要逐条处理就自己遍历", node)
+            elif op in ("min", "max"):
+                self.error(
+                    f"Vec<str> 没有 {op}()：极值只实现了整数和浮点。"
+                    f"先 v.sort() 再取 v[0] / v[v.len() - 1]（sort 对字符串是按 UTF-8 字节序）",
+                    node)
+        # int / float / bool / char / ptr / any：运行时按位处理，成立
+
     def check_map_key(self, kt, node):
         if kt is not None and kt.kind in self.MAP_KEY_BAD:
             self.error(
@@ -1341,6 +1391,8 @@ class Sema:
                 e.ty = TYPES["f64"] if (ats and ats[0].is_float) else TYPES["i64"]
             elif name in ("min", "max"):
                 # min(a, b) -> 标量类型；min(v) -> 容器元素类型
+                if ats and ats[0].kind == "vec":
+                    self.check_vec_content_op(ats[0].elem, name, e)
                 if len(ats) == 1 and ats[0].kind in ("vec", "arr", "map", "str"):
                     e.ty = self._container_elem(ats[0])
                 else:
@@ -1349,6 +1401,8 @@ class Sema:
                 e.ty = TYPES["i64"]
             elif name in ("str", "to_str", "read_line", "concat", "env",
                           "file_read", "cmd", "hex", "oct", "bin", "chr"):
+                if name == "concat" and not e.args:
+                    self.error("concat() 至少要一个参数（要拼接的字符串或值）", e)
                 e.ty = STR
             elif name == "args":
                 e.ty = vec_of(STR)
@@ -1367,10 +1421,16 @@ class Sema:
                           "sleep", "panic"):
                 e.ty = VOID
             elif name == "contains":
+                if ats and ats[0].kind == "vec":
+                    self.check_vec_content_op(ats[0].elem, name, e)
                 e.ty = TYPES["bool"]
             elif name == "sum":
+                if ats and ats[0].kind == "vec":
+                    self.check_vec_content_op(ats[0].elem, name, e)
                 e.ty = self._container_elem(ats[0]) if ats else TYPES["i64"]
             elif name in ("sort", "reverse", "push", "clear", "resize"):
+                if name == "sort" and ats and ats[0].kind == "vec":
+                    self.check_vec_content_op(ats[0].elem, name, e)
                 e.ty = VOID
             elif name == "join":
                 e.ty = STR
@@ -1537,6 +1597,8 @@ class Sema:
                     f"{lo}~{hi} 个" if hi is not None else f"至少 {lo} 个")
                 self.error(f"{ot}.{e.name}() 需要 {want}参数，这里给了 {n} 个", e)
             e.resolved = "builtin-method"
+            if ot.kind == "vec":
+                self.check_vec_content_op(ot.elem, e.name, e)
             if e.name == "to_f64":
                 e.ty = TYPES["f64"]
             elif e.name in ("len", "at", "to_i64", "find", "bytes",
