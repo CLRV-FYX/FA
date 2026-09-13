@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
-"""把文档里的 ```fa 代码块喂给 fa check —— 文档说的必须是编译器真能做的。"""
+"""把文档里的 ```fa 代码块喂给 fa check —— 文档说的必须是编译器真能做的。
+
+再加一条：如果某个含 `fn main` 的代码块后面紧跟一个 ```text 块，就把它当成
+「这段程序的输出」，真的跑一遍逐字比对 —— 文档里印出来的输出必须是真的。
+（含 args() / file_read / now() / random() / cmd() 的示例结果不确定，只编译不比对。）
+
+用法：
+    python3 tests/check_docs.py            # 编译检查 + 输出比对
+    python3 tests/check_docs.py --no-run   # 只做编译检查
+"""
 import os, re, subprocess, sys, tempfile, textwrap
+
+RUN_OUTPUTS = "--no-run" not in sys.argv
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FILES = ["README.md"] + sorted(
@@ -15,6 +26,10 @@ LENIENT_IGNORE = ("未定义的标识符", "找不到要导入的 FA 模块", "�
                   "没有字段", "未定义变量", "未知构造器", "没有变体", "重复定义",
                   "找不到", "No such file", "没有那个", "缺少")
 MULTIFILE = re.compile(r"^//\s*(\S+\.fa)\s*$", re.M)
+# 紧跟在 fa 块后面的 ```text 块 = 这段程序的真实输出
+OUTBLOCK = re.compile(r"\A\s*```(?:text|out)\n(.*?)```", re.S)
+# 结果不确定的示例（读参数/文件/环境/时钟/随机数/外部命令）：只编译，不比对输出
+NONDET = re.compile(r"\b(args|file_read|file_write|now|random|cmd|env|sleep)\s*\(")
 
 
 def indent(code, n=4):
@@ -56,6 +71,17 @@ def candidates(code):
     return out
 
 
+def run_program(src, workdir):
+    """编译并运行，返回 (退出码, stdout)。"""
+    path = os.path.join(workdir, "_doc_run.fa")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(src)
+    env = dict(os.environ, FA_FLUSH="1")
+    r = subprocess.run(["bash", os.path.join(ROOT, "bin/fa"), "run", path],
+                       capture_output=True, text=True, cwd=workdir, env=env)
+    return r.returncode, r.stdout
+
+
 def check(src, workdir):
     path = os.path.join(workdir, "_doc_check.fa")
     with open(path, "w", encoding="utf-8") as f:
@@ -67,6 +93,7 @@ def check(src, workdir):
 
 stats = {"strict": 0, "lenient": 0, "skip": 0}
 bad = []
+problems = 0
 for rel in FILES:
     text = open(os.path.join(ROOT, rel), encoding="utf-8").read()
     for m in BLOCK.finditer(text):
@@ -85,7 +112,6 @@ for rel in FILES:
             continue
         strict = re.search(r"^fn\s+main\b", code, re.M) is not None
         with tempfile.TemporaryDirectory() as work:
-            # 一个块里写了多个文件（`// math.fa` + `// main.fa`）：拆开各写各的
             # 一个块里写了多个文件（`// math.fa` 接着 `// main.fa`）：
             # 按标记拆开，各写各的文件，再查最后一个（主文件）
             parts = MULTIFILE.split(code)
@@ -113,15 +139,31 @@ for rel in FILES:
                     err = out.split("\n")[0]
             if err is None:
                 stats["strict" if strict else "lenient"] += 1
+                # 输出比对：只对「完整程序 + 后面跟着 ```text 块」的做
+                tail = OUTBLOCK.match(text[m.end():])
+                if RUN_OUTPUTS and strict and tail and not NONDET.search(code) \
+                        and len(parts) == 1:
+                    want = tail.group(1).rstrip("\n")
+                    rc, got = run_program(candidates(code)[0], work)
+                    got = got.rstrip("\n")
+                    if rc != 0 or got != want:
+                        why = f"退出码 {rc}" if rc != 0 else "输出对不上"
+                        problems += 1
+                        bad.append((rel, lineno, "输出",
+                                    f"{why}（文档写的 vs 实际跑的，见下）"))
+                        bad.append(("", 0, "  文档", want.replace("\n", "\n         ")))
+                        bad.append(("", 0, "  实际", got.replace("\n", "\n         ")))
                 continue
             if not strict and any(k in err for k in LENIENT_IGNORE):
                 stats["lenient"] += 1              # 片段本来就是节选，缺名字很正常
                 continue
+        problems += 1
         bad.append((rel, lineno, "完整程序" if strict else "教学片段", err))
 
 total = sum(stats.values())
 print(f"文档代码块 {total} 个：完整程序 {stats['strict']}，教学片段 {stats['lenient']}，"
-      f"跳过 {stats['skip']}（反面教材/模板/引用块）；不通过 {len(bad)}")
+      f"跳过 {stats['skip']}（反面教材/模板/引用块）；不通过 {problems} 个块")
 for rel, lineno, mode, msg in bad:
-    print(f"  [{mode}] {rel}:{lineno}  {msg}")
+    where = f"{rel}:{lineno}" if rel else "        "
+    print(f"  [{mode}] {where}  {msg}")
 sys.exit(1 if bad else 0)
