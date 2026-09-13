@@ -739,14 +739,19 @@ class Sema:
         self.cur_fn = sym
         sc = self.enter(sym)
         self.local_fns.append({})
-        if self_type is not None:
+        # impl 里也可以写**不带 self** 的方法（`P.create(1, 2)` 这种工厂/构造器）。
+        # 以前一律按「有 self」处理：作用域里凭空声明一个 self，参数下标还整体减一 ——
+        # `fn mk(name: str, n: i64)` 里 name 拿到的是 sym.params[-1]（也就是 n 的类型），
+        # 类型错位，写 `P.mk("甲", 1)` 时字符串被当整数查。
+        has_self = any(p.name == "self" for p in params)
+        if self_type is not None and has_self:
             st = self.structs.get(self_type) or self.enums.get(self_type)
             v = VarSym("self", st, mutable=True, is_param=True)
             sc.declare("self", v)
         for i, p in enumerate(params):
             if p.name == "self":
                 continue                       # self 已由 self_type 声明
-            ty = sym.params[i if self_type is None else i - 1]
+            ty = sym.params[i - 1] if has_self else sym.params[i]
             sc.declare(p.name, VarSym(p.name, ty, mutable=True, is_param=True))
         self.stmt(body)
         self.leave()

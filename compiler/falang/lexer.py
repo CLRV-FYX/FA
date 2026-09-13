@@ -217,6 +217,8 @@ def tokenize(src: str) -> List[Token]:
                                 hx += src[i]; adv()
                         buf.append(chr(int(hx, 16)) if hx else "")
                         continue
+                    if e in "{}":
+                        buf.append(e * 2); adv(); continue    # 同上：字面花括号
                     buf.append(ESCAPES.get(e, e)); adv(); continue
                 buf.append(src[i]); adv()
             adv(3)
@@ -228,6 +230,10 @@ def tokenize(src: str) -> List[Token]:
             idepth = 0                    # 插值表达式 {...} 的嵌套深度
             while True:
                 if i >= n or src[i] == "\n":
+                    if idepth > 0:
+                        raise FaSyntaxError(
+                            "字符串里的插值 { 没有配对的 }（要打印一个真的花括号，"
+                            "写 {{ 和 }}）", l, c)
                     raise FaSyntaxError("字符串未闭合", l, c)
                 if src[i] == '"' and idepth == 0:
                     adv(); break
@@ -241,11 +247,23 @@ def tokenize(src: str) -> List[Token]:
                         if src[i] == "\\" and i + 1 < n:
                             buf.append(src[i]); adv()
                         buf.append(src[i]); adv()
-                    if i >= n:
-                        raise FaSyntaxError("字符串未闭合", l, c)
+                    if i >= n or src[i] == "\n":
+                        raise FaSyntaxError(
+                            "字符串里的插值 { 没有配对的 }（要打印一个真的花括号，"
+                            "写 {{ 和 }}）", l, c)
                     buf.append(q); adv()
                     continue
-                if src[i] == "{" and not src.startswith("{{", i):
+                # `{{` / `}}` 是**字面量**花括号（Python / Rust / C# 都是这个规矩）。
+                # 以前只写了「`{{` 不开插值」，可它只跳过第一个 `{`，第二个照样开插值 ——
+                # `"{{a}}"` 于是去解析标识符 a，报一句莫名其妙的「未定义的标识符 'a'」，
+                # 位置还指到文件头。而没有配对 `}` 的 `"P{a="` 会把后面的引号当成
+                # 插值里的字符串一路吞到行尾，报「字符串未闭合」。
+                # 原文照抄进 buf，由 split_interpolation 统一还原成一个花括号。
+                if idepth == 0 and src.startswith("{{", i):
+                    buf.append("{{"); adv(2); continue
+                if idepth == 0 and src.startswith("}}", i):
+                    buf.append("}}"); adv(2); continue
+                if src[i] == "{":
                     idepth += 1; buf.append("{"); adv(); continue
                 if src[i] == "}" and idepth > 0:
                     idepth -= 1; buf.append("}"); adv(); continue
@@ -283,6 +301,11 @@ def tokenize(src: str) -> List[Token]:
                                                 "或花括号形式（\\u{4F60}）", l, c)
                         buf.append(chr(int(hx, 16)))
                         continue
+                    if e in "{}":
+                        # \{ \} 也是字面花括号：先写成 {{ }}，split_interpolation
+                        # 再还原成一个。转义是在**词法层**做的，而插值是在字符串值上
+                        # 二次切分的，所以不能直接放一个 { 进去（那会被当成插值的开头）。
+                        buf.append(e * 2); adv(); continue
                     if e in ESCAPES:
                         buf.append(ESCAPES[e]); adv(); continue
                     raise FaSyntaxError(f"未知转义序列 \\{e}", l, c)
@@ -454,12 +477,19 @@ def tokenize(src: str) -> List[Token]:
 
 def split_interpolation(raw: str):
     """把 `a = {x}, b = {y.z}` 切成 [('lit', str) | ('expr', str)] 片段。
-    支持插值表达式里的嵌套大括号（如 {f({1:2})}）。"""
+
+    支持插值表达式里的嵌套大括号（如 {f({1:2})}）；表达式**外面**的 `{{` / `}}`
+    是字面量花括号，各还原成一个（想打印 JSON 或者 `P {{ x: 1 }}` 这种文本就靠它）。
+    """
     parts, buf, depth = [], [], 0
     i = 0
     while i < len(raw):
         ch = raw[i]
-        if ch == "{" and i + 1 < len(raw) and raw[i + 1] != "{":
+        if depth == 0 and raw.startswith("{{", i):
+            buf.append("{"); i += 2; continue        # {{ -> 字面量 {
+        if depth == 0 and raw.startswith("}}", i):
+            buf.append("}"); i += 2; continue        # }} -> 字面量 }
+        if ch == "{":
             if depth == 0:
                 if buf:
                     parts.append(("lit", "".join(buf))); buf = []

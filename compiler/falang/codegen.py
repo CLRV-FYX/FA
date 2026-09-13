@@ -119,7 +119,14 @@ class FnGen:
         self.fnsym = fnsym
         self.body = body
         self.params = params
-        self.self_type = self_type
+        # impl 里**不带 self** 的方法（`P.make(1.0, 2.0)` 这种「静态」方法）没有
+        # self 指针可传。可调用方是按「这是 P 的方法」把 self_type 递进来的，
+        # 于是这里会平白多占一个整数寄存器（sret 时是 rsi），而形参落地那段又按
+        # 「AST 形参第 0 个是 self」对位 —— `fn make(x: f64, y: f64)` 里 x 拿到的是
+        # 那个幽灵 self 的寄存器（rsi），y 拿到 x 的（xmm0），汇编器直接报
+        # `movsd` 操作数类型不匹配；就算类型凑巧对得上，值也是错位的。
+        has_self = any(getattr(p, "name", "") == "self" for p in (params or []))
+        self.self_type = self_type if has_self else None
         self.ir: List[Instr] = []
         self.ntemp = 0
         self.nlabel = 0
@@ -2597,10 +2604,17 @@ class FnGen:
         fs = e.resolved
         if isinstance(fs, FnSym):
             args = []
-            objv = self.gen_expr(e.obj)
-            if is_agg(ot):
-                args.append(objv)
+            decl = getattr(fs, "decl", None)
+            has_self = bool(decl is not None and any(
+                getattr(p, "name", "") == "self" for p in (getattr(decl, "params", None) or [])))
+            if not has_self and isinstance(e.obj, NameRef) \
+                    and e.obj.name in (self.sema.structs or {}) | (self.sema.enums or {}):
+                # `P.create(1, 2)`：接收者是**类型名**，不是值 —— 没有 self 可传。
+                # 以前照样 gen_expr(e.obj)，去查一个叫 P 的变量，报
+                # 「代码生成错误：未定义变量 'P'」（sema 早就放行了）。
+                pass
             else:
+                objv = self.gen_expr(e.obj)
                 args.append(objv)
             for i, a in enumerate(e.args):
                 # 方法的 FnSym.params **不含** self（sema.register_impl 过滤掉了），
