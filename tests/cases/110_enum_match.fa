@@ -92,4 +92,18 @@ fn main() -> i64:
     # 递归枚举：载荷用指针
     let l = new IntList.Cons(1, new IntList.Cons(2, new IntList.Nil()))
     print(total(l), total(nil))
+
+    # 递归枚举的载荷在堆上，自己 new 的自己 free（§15）
+    let p = l
+    while p != nil {
+        let nx: *IntList = nil
+        match *p {
+            IntList.Cons(_, t):
+                nx = t
+            _:
+                nx = nil
+        }
+        free(p)
+        p = nx
+    }
     return 0

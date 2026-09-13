@@ -27,4 +27,12 @@ fn main() -> i64:
     print(sum(head))
     head.next.val = 20
     print(sum(head))
+
+    # new 出来的节点要自己释放（顺着链走，先存下一个再 free 当前这个）
+    let p = head
+    while p != nil {
+        let nx = p.next
+        free(p)
+        p = nx
+    }
     return 0
