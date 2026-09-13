@@ -1,0 +1,11 @@
+  str 的 defer 跑了
+str: [] 0
+i64: 0 f64: 0.0 bool: false
+Vec: [] 0
+  push 之后: [7]
+Map: {} 0
+  set 之后: {"k": 1}
+struct: 0 0
+  改字段之后: 3 0
+enum: A（全零 = 第 0 个变体）
+指针是 nil: true

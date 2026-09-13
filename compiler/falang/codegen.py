@@ -288,14 +288,62 @@ class FnGen:
 
         # 函数体结尾兜底 return
         if not self.ir or self.ir[-1].op != "RET":
-            if ret.kind == "void":
-                self.emit("RET")
-            else:
-                z = self.const_zero(ret)
-                self.emit("RET", args=[z], ty=ret)
+            self.gen_tail_return(ret)
         self.pop_scope()
         self.fn.instrs = self.ir
         return self.fn
+
+    def gen_tail_return(self, ret: Type):
+        """掉到函数体末尾时的兜底返回：给一个**定义良好**的零值，并把该收的尾收了。
+
+        以前这里是 `RET Const(0)`，三个毛病：
+        - Vec/Map/str 拿到的是空指针，调用方一用就段错误（`fv().len()` 实测崩）；
+        - struct/enum 是 sret 约定，压根没往调用方给的缓冲里写，调用方读的是栈上垃圾；
+        - 没有 flush_owned / unwind_scopes —— defer 不执行，局部引用全泄漏。
+        """
+        if ret.kind == "void":
+            self.flush_owned()
+            self.unwind_scopes()
+            self.emit("RET")
+            return
+        if is_agg(ret):
+            # sret：把调用方给的缓冲清零就是「这个类型的零值」
+            self.emit("ZERO", args=[self.fn.params[0]], extra=ret.size)
+            self.flush_owned()
+            self.unwind_scopes()
+            self.emit("RET", args=[self.fn.params[0]])
+            return
+        v = self.tail_zero_value(ret)
+        if T.t_is_refcounted(ret):
+            self.emit_rcinc(v, ret)        # 所有权交给调用方，和 gen_return 一致
+        self.flush_owned()
+        self.unwind_scopes()
+        self.emit("RET", args=[v], ty=ret)
+
+    def tail_zero_value(self, ty: Type):
+        """引用计数类型的零值必须是**真的空对象**，不能是空指针。"""
+        if ty.kind == "str":
+            return self.make_str("")
+        if ty.kind == "vec":
+            et = ty.elem
+            v = self.new_temp(ty)
+            self.emit("CALL", v, [Sym("fa_vec_new"), self.const(elem_kind(et, self.sema)),
+                                  self.const(vec_esz(et)),
+                                  self.const(1 if (et.kind == "int" and et.is_signed) else 0),
+                                  self.const(T.ty_code(et))], ty=ty)
+            self.mark_owned(v, ty)
+            return v
+        if ty.kind == "map":
+            kt, vt = ty.key, ty.val
+            m = self.new_temp(ty)
+            self.emit("CALL", m, [Sym("fa_map_new"),
+                                  self.const(elem_kind(kt, self.sema)),
+                                  self.const(elem_kind(vt, self.sema)),
+                                  self.const(T.ty_code(kt)),
+                                  self.const(T.ty_code(vt))], ty=ty)
+            self.mark_owned(m, ty)
+            return m
+        return self.const_zero(ty)
 
     # ------------------------------------------------------------ 内存辅助
     def emit_alloca(self, size: int, align: int = 8) -> Temp:
