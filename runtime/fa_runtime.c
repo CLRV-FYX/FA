@@ -965,6 +965,44 @@ uint64_t fa_vec_pop(FaVec *v) {
     return vec_load(v, --v->len);
 }
 
+/* 拷贝一个装箱的聚合元素。
+
+   盒子（FA_K_BOX / FA_K_BOXED_STRUCT）**不带引用计数**：fa_agg_inc 对它是空操作，
+   而释放路径会 free 掉盒子。所以两个 Vec 共享同一个盒子 = 释放两次
+   （实测 glibc 报 "double free detected in tcache 2"）。必须另分配一份盒子、
+   按字节拷过来，再给里面的引用计数字段各加一次引用。 */
+static uint64_t fa_clone_boxed(uint64_t val, int64_t box_size, int64_t kind) {
+    void *nb;
+    if (!val) return 0;
+    nb = fa_alloc(box_size);
+    memcpy(nb, (void *)(uintptr_t)val, (size_t)box_size);
+    fa_agg_inc(nb, kind);           /* BOXED_STRUCT：字段各加一次；BOX：空操作 */
+    return (uint64_t)(uintptr_t)nb;
+}
+
+/* v.copy()：另起一份表。
+
+   - 标量元素按字节拷；
+   - str / Vec / Map 这类引用计数元素各加一次引用（str 不可变，共享没问题；
+     嵌套的 Vec/Map 拷的是**把手**，不是深拷贝 —— 想彻底独立要自己再逐层 copy）；
+   - 装箱的 struct / enum 元素另分配盒子（见 fa_clone_boxed）。 */
+FaVec *fa_vec_clone(FaVec *v, int64_t box_size) {
+    int64_t i;
+    if (!v) return fa_vec_new(0, 8, 0, FA_TY_INT);
+    FaVec *r = fa_vec_new(v->kind, v->esz, v->sgn, v->ety);
+    for (i = 0; i < v->len; i++) {
+        uint64_t val = vec_load(v, i);
+        if (r->len == r->cap) vec_grow(r);
+        if (box_size > 0) {
+            val = fa_clone_boxed(val, box_size, v->kind);
+        } else {
+            fa_agg_inc((void *)(uintptr_t)val, v->kind);
+        }
+        vec_store(r, r->len++, val);
+    }
+    return r;
+}
+
 void fa_vec_clear(FaVec *v) {
     if (!v) return;
     if (v->kind) for (int64_t i = 0; i < v->len; i++) fa_rc_dec((void *)vec_load(v, i), v->kind);
@@ -1074,6 +1112,27 @@ int64_t fa_map_has(FaMap *m, uint64_t key) {
     if (!m) return 0;
     int64_t i = map_probe(m, key, 0);
     return (i >= 0 && m->entries[i].state == 1) ? 1 : 0;
+}
+
+/* m.copy()：另起一份字典。按原表的槽位顺序重放 set —— 内容完全一致，但**遍历
+   顺序不保证和原表相同**（Map 的遍历顺序本来就是哈希槽顺序，重放时扩容/落槽
+   可能不一样；实测 {"a":1,"b":2} 拷完再 set 一个键，顺序就成了 c,b,a）。
+   装箱的键 / 值同 Vec 一样要另分配盒子（fa_map_set 只会 fa_agg_inc，
+   对不带引用计数的盒子等于没拷）。 */
+FaMap *fa_map_clone(FaMap *m, int64_t kbox, int64_t vbox) {
+    int64_t i;
+    if (!m) return fa_map_new(0, 0, FA_TY_INT, FA_TY_INT);
+    FaMap *r = fa_map_new(m->kkind, m->vkind, m->kty, m->vty);
+    for (i = 0; i < m->cap; i++) {
+        uint64_t k, v;
+        if (m->entries[i].state != 1) continue;
+        k = m->entries[i].key;
+        v = m->entries[i].val;
+        if (kbox > 0) k = fa_clone_boxed(k, kbox, m->kkind);
+        if (vbox > 0) v = fa_clone_boxed(v, vbox, m->vkind);
+        fa_map_set(r, k, v);
+    }
+    return r;
 }
 
 void fa_map_set(FaMap *m, uint64_t key, uint64_t val) {

@@ -2385,12 +2385,28 @@ class FnGen:
             if name == "clear":
                 self.emit("CALL", None, [Sym("fa_vec_clear"), obj])
                 return self.const(0, VOID)
+            if name == "copy":
+                # 装箱元素（struct / enum）要把盒子大小告诉运行时：盒子不带引用
+                # 计数，共享 = 释放两次。其余类型传 0。
+                box = max(et.size, 8) if et.kind in ("struct", "enum") else 0
+                r = self.new_temp(ot)
+                self.emit("CALL", r, [Sym("fa_vec_clone"), obj, self.const(box)], ty=ot)
+                self.mark_owned(r, ot)          # 新表归调用方，语句末尾别释放
+                return r
         # ---- map
         if ot.kind == "map":
             kt, vt = ot.key, ot.val
             if name == "len":
                 r = self.new_temp(I64)
                 self.emit("CALL", r, [Sym("fa_map_len"), obj], ty=I64)
+                return r
+            if name == "copy":
+                kbox = max(kt.size, 8) if kt.kind in ("struct", "enum") else 0
+                vbox = max(vt.size, 8) if vt.kind in ("struct", "enum") else 0
+                r = self.new_temp(ot)
+                self.emit("CALL", r, [Sym("fa_map_clone"), obj,
+                                      self.const(kbox), self.const(vbox)], ty=ot)
+                self.mark_owned(r, ot)
                 return r
             if name == "get":
                 k = self.gen_expr(e.args[0])

@@ -163,6 +163,7 @@ FaVec  *fa_args(void);
 
 /* --- 容器 --- */
 FaVec *fa_vec_new(int64_t kind, int64_t esz, int64_t sgn, int64_t ety);
+FaVec *fa_vec_clone(FaVec *v, int64_t box_size);   /* v.copy()；box_size>0 表示元素是装箱的聚合 */
 int64_t fa_vec_len(FaVec *v);
 void    fa_vec_push(FaVec *v, uint64_t val);
 uint64_t fa_vec_get(FaVec *v, int64_t i);
@@ -174,6 +175,7 @@ int64_t fa_vec_contains(FaVec *v, uint64_t val);
 void    fa_vec_resize(FaVec *v, int64_t n, uint64_t val);
 
 FaMap *fa_map_new(int64_t kkind, int64_t vkind, int64_t kty, int64_t vty);
+FaMap *fa_map_clone(FaMap *m, int64_t kbox, int64_t vbox);   /* m.copy() */
 int64_t fa_map_len(FaMap *m);
 uint64_t fa_map_get(FaMap *m, uint64_t key);
 void    fa_map_set(FaMap *m, uint64_t key, uint64_t val);

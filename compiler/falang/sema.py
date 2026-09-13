@@ -30,9 +30,9 @@ BUILTIN_METHODS = {
             "char_len", "char_at", "codepoints", "slice_chars"},
     "vec": {"len", "push", "get", "set", "pop", "clear", "contains", "to_str",
             "resize", "sort", "reverse", "join", "sum", "min", "max",
-            "index_of"},
+            "index_of", "copy"},
     "map": {"len", "get", "set", "has", "del", "clear", "to_str",
-            "keys", "values"},
+            "keys", "values", "copy"},
     "arr": {"len"},
     "pyobj": {"to_str", "to_i64", "to_f64", "call", "attr", "to_str_deep"},
     "jobj": {"to_str", "to_i64", "to_f64", "jcall_i64", "jcall_f64",
@@ -61,10 +61,11 @@ METHOD_ARITY = {
     "vec": {"len": (0, 0), "push": (1, 1), "get": (1, 1), "set": (2, 2),
             "pop": (0, 0), "clear": (0, 0), "contains": (1, 1), "to_str": (0, 0),
             "resize": (1, 2), "sort": (0, 0), "reverse": (0, 0), "join": (1, 1),
-            "sum": (0, 0), "min": (0, 0), "max": (0, 0), "index_of": (1, 1)},
+            "sum": (0, 0), "min": (0, 0), "max": (0, 0), "index_of": (1, 1),
+            "copy": (0, 0)},
     "map": {"len": (0, 0), "get": (1, 1), "set": (2, 2), "has": (1, 1),
             "del": (1, 1), "clear": (0, 0), "to_str": (0, 0), "keys": (0, 0),
-            "values": (0, 0)},
+            "values": (0, 0), "copy": (0, 0)},
     "arr": {"len": (0, 0)},
     "pyobj": {"to_str": (0, 0), "to_i64": (0, 0), "to_f64": (0, 0),
               "call": (0, 1), "attr": (1, 1), "to_str_deep": (0, 0)},
@@ -1554,6 +1555,9 @@ class Sema:
                     # 求和/极值一律按 64 位整数返回：bool、i8、u16 这些窄类型
                     # 累加起来很容易溢出元素本身的宽度（运行时也是按 i64 累加的）
                     e.ty = TYPES["i64"]
+            elif e.name == "copy":
+                # v.copy() / m.copy()：另起一份容器，类型和接收者完全一样
+                e.ty = ot
             elif e.name in ("sort", "reverse", "resize"):
                 e.ty = VOID
             elif e.name in ("contains", "has", "starts_with", "ends_with", "eq"):
