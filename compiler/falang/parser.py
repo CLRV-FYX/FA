@@ -598,7 +598,12 @@ class Parser:
         if self.at_kw("return"):
             self.next()
             val = None
-            if not (self.at("NEWLINE") or self.at(P, ";") or self.at("DEDENT")):
+            # 花括号块里的 `{ return }` 也算「后面没有值」：以前只认 NEWLINE / ; /
+            # DEDENT，于是 `if i < 0 { return }` 报「无法解析的表达式起始 token '}'」，
+            # 而同样意思的冒号缩进写法（单独一行 return）却是好的 —— 两种块写法
+            # 应该一个样。
+            if not (self.at("NEWLINE") or self.at(P, ";") or self.at("DEDENT")
+                    or self.at(P, "}")):
                 val = self.parse_expr()
             return Return(value=val)
         if self.at_kw("if"):

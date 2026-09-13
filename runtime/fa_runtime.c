@@ -1056,9 +1056,18 @@ int64_t fa_vec_contains(FaVec *v, uint64_t val) {
     return 0;
 }
 
+/* 变长时把**同一个** val push n 次：只对标量元素成立。引用计数元素（str/Vec/Map）
+   和装箱元素（struct/enum）必须每格新建一份，那条路由编译器发循环
+   （codegen.emit_vec_resize_ref），不走这里。 */
 void fa_vec_resize(FaVec *v, int64_t n, uint64_t val) {
     if (!v || n < 0) return;
-    while (v->len > n) fa_vec_pop(v);
+    while (v->len > n) {
+        /* fa_vec_pop 只是把值交出来、len--，**不释放**（`v.pop()` 的返回值归调用方）。
+           这里没人接，就得自己还掉 —— 以前直接丢弃，截断 Vec<str>/Vec<Vec> 时
+           被删掉的元素永远漏在堆上（ASan 实测）。 */
+        uint64_t old = fa_vec_pop(v);
+        if (v->kind) fa_rc_dec((void *)(uintptr_t)old, v->kind);
+    }
     while (v->len < n) fa_vec_push(v, val);
 }
 

@@ -126,13 +126,23 @@ fa/
 ## 5. 自动化测试
 
 ```bash
-python3 tests/run_tests.py            # 跑全部用例（75 个）
+python3 tests/run_tests.py            # 跑全部用例（95 个）
 python3 tests/run_tests.py --opt 0    # 换个优化级别再跑一遍（差分测试）
 python3 tests/run_tests.py 010        # 只跑名字里含 010 的用例
 python3 tests/run_tests.py --record   # 把当前输出记录为期望输出（改动需人工复核）
 python3 tests/check_docs.py           # 把文档里的 ```fa 代码块逐个喂给 fa check
 python3 tests/run_asan.py             # 整套用例在 AddressSanitizer 底下重跑（内存安全）
+python3 tools/fill_doc_outputs.py     # 教程里的 @@OUT@@ 占位符换成程序的真实输出
+python3 tools/check_doc_errors.py     # 反面教材（❌ 块）印的报错也要和真的一致
 ```
+
+写文档时的两个小工具，都是 `check_docs.py` 覆盖不到的角落：
+`fill_doc_outputs.py` 先写 ` ```text ` 里一个 `@@OUT@@` 占位符，它把上面那个
+` ```fa ` 块真的跑一遍、把 stdout 逐字填进去（所以「输出」不可能是手打的美好愿望）；
+`check_doc_errors.py` 盯的是带 ❌ 的块 —— `check_docs.py` 会跳过它们，于是那些
+「报错长这样」的文本没人校验，改了措辞、动了行列号就悄悄对不上。它把每个 ❌ 块
+真的喂给编译器（编得过的就真跑一遍看它 panic 什么），逐行比对文档印的文本，
+`--fix` 直接按真实输出改回文档。
 
 `check_docs.py` 是「文档不许说谎」的自动化守卫：它扫 `README.md` 与 `docs/*.md`
 里的每个 ` ```fa ` 代码块，按可信度顺序补全成完整程序（原样 / 整块包进 `main` /

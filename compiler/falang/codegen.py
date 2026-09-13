@@ -385,6 +385,164 @@ class FnGen:
                 vv = self.bitcast(vv, I64)
         self.emit("CALL", None, [Sym("fa_map_set"), m, kk, vv])
 
+    def gen_zero_value(self, ty: Type):
+        """新建一份 ty 的空值：str 是空串，Vec / Map 是**一张新的空表**。
+
+        和 const_zero 的区别就在这儿：const_zero 给的是常量 0，对引用计数类型
+        等于空指针。空指针塞进表里，str 还能被运行时当空串容错，Vec / Map 就
+        **静默失效**（fa_vec_push(NULL, x) 直接 return：格子看着在，什么都存不进去）。
+        返回的引用不登记 owned：调用方把它交给容器（push 会加一次引用，随后
+        自己把创建时那次还掉），或者自己负责释放。
+        """
+        if ty is None:
+            return self.const(0, I64)
+        if ty.kind == "str":
+            return self.make_str("")
+        if ty.kind == "vec":
+            et = ty.elem
+            v = self.new_temp(ty)
+            self.emit("CALL", v, [Sym("fa_vec_new"), self.const(elem_kind(et, self.sema)),
+                                  self.const(vec_esz(et)),
+                                  self.const(1 if (et.kind == "int" and et.is_signed) else 0),
+                                  self.const(T.ty_code(et))], ty=ty)
+            return v
+        if ty.kind == "map":
+            kt, vt = ty.key, ty.val
+            m = self.new_temp(ty)
+            self.emit("CALL", m, [Sym("fa_map_new"),
+                                  self.const(elem_kind(kt, self.sema)),
+                                  self.const(elem_kind(vt, self.sema)),
+                                  self.const(T.ty_code(kt)),
+                                  self.const(T.ty_code(vt))], ty=ty)
+            return m
+        return self.const_zero(ty)
+
+    def emit_vec_resize_ref(self, obj, et: Type, n, fill):
+        """元素是 str / Vec / Map / 结构体 / 枚举时的 `v.resize(n[, 填充值])`。
+
+        以前不管什么元素都走 `fa_vec_resize(v, n, val)` —— 它把**同一个** val
+        push n 次，于是：
+
+          * 不给填充值时 val 是 const_zero，也就是空指针。实测
+            `Vec<Vec<i64>>().resize(2)` 之后 `c[0].push(1)` 什么都不发生
+            （打出来还是 `[[], []]`，因为 fa_vec_push 对 NULL 直接 return）；
+            `Vec<P>().resize(2)` 更是当场段错误 —— box_agg 拿常量 0 当结构体值
+            装箱，连 `d.len()` 都崩；
+          * 给了填充值时 n 格共享同一个对象：改一格全表跟着变，装箱的结构体
+            还会被释放 n 次（double free）。
+
+        所以这里自己发循环，**每格新建一份**：
+
+            变短： while len > n: pop()          fa_vec_pop 按元素 kind 正确释放
+            变长： while len < n: push(新的一份)
+
+        填充值只求值一次（`resize(3, mk())` 不会调三回 mk）；装箱元素每格
+        alloc + memcpy 一份新盒子（盒子里的引用计数字段由 fa_vec_push 的 retain
+        补上，和 box_agg + push 一条路）；Vec / Map 的填充值每格 clone 一份
+        （浅拷，和 copy() 一个规矩）；str 不可变，共享同一份就行。
+        """
+        # 装箱元素不给填充值：截断是合法的（编译期不知道 n 和长度谁大），
+        # 真要变长时在循环里 panic 一句人话 —— 以前这里是拿常量 0 装箱，当场段错误
+        no_fill_boxed = fill is None and et.kind in ("struct", "enum")
+        if no_fill_boxed:
+            first = (getattr(et, "variants", None) or [("Empty", None, 0)])[0][0] \
+                if et.kind == "enum" else ""
+            how = (f"写 v.resize(n, {et.name}.{first})" if et.kind == "enum"
+                   else f"写 v.resize(n, {et}{{字段: 值, ...}})")
+            panic_msg = (f"Vec<{et}>.resize(n) 要变长就得给填充值：每一格都要一份新的 {et}，"
+                         f"FA 不猜「默认的 {et} 长什么样」。{how}（截断不用给）")
+        # n 和填充值都要放栈槽：循环体里有 CALL，寄存器里的值会被冲掉
+        nslot = self.emit_alloca(8)
+        self.emit("STORE", args=[nslot, n], extra=0, ty=I64)
+        src = None
+        if fill is not None:
+            src = self.gen_expr(fill)                     # 只求值这一次
+            if et.kind != "str":
+                s = self.emit_alloca(8)
+                self.emit("STORE", args=[s, src], extra=0, ty=ptr_to(et))
+                src = s
+
+        # ---- 变短：一格一格弹
+        top, body, end = (self.new_label("rzt"), self.new_label("rzb"),
+                          self.new_label("rze"))
+        self.emit("LABEL", extra=top)
+        ln = self.new_temp(I64)
+        self.emit("LOAD", ln, [obj], extra=8, ty=I64)
+        nn = self.new_temp(I64)
+        self.emit("LOAD", nn, [nslot], extra=0, ty=I64)
+        c = self.new_temp(BOOL)
+        self.emit("CMP", c, [ln, nn], extra=">", ty=I64)
+        self.emit("BR", args=[c], extra=(body, end))
+        self.emit("LABEL", extra=body)
+        # fa_vec_pop 把值**交给调用方**、自己不释放（`v.pop()` 的返回值归用户）。
+        # 截断时没人接这个值，必须当场还掉，否则被删掉的元素永远漏在堆上
+        # （ASan 实测：Vec<Vec<i64>> 截断漏 header + data 各 64 字节）。
+        popped = self.new_temp(et)
+        self.emit("CALL", popped, [Sym("fa_vec_pop"), obj], ty=et)
+        # 释放要按**容器元素**的 kind 来：装箱的结构体/枚举是 K_BOXED_STRUCT+desc
+        # （要先 drop 字段再 free 盒子），而 ty.rc_kind 对它们是 K_NONE ——
+        # 那个只适用于内联的结构体值。走 elem_kind 才和 fa_vec_clear 一个规矩。
+        self.emit("RCDEC", args=[popped], extra=elem_kind(et, self.sema))
+        self.emit("JMP", extra=top)
+        self.emit("LABEL", extra=end)
+
+        # ---- 变长：每轮新建一份再 push
+        top2, body2, end2 = (self.new_label("rzgt"), self.new_label("rzgb"),
+                             self.new_label("rzge"))
+        self.emit("LABEL", extra=top2)
+        ln2 = self.new_temp(I64)
+        self.emit("LOAD", ln2, [obj], extra=8, ty=I64)
+        nn2 = self.new_temp(I64)
+        self.emit("LOAD", nn2, [nslot], extra=0, ty=I64)
+        c2 = self.new_temp(BOOL)
+        self.emit("CMP", c2, [ln2, nn2], extra="<", ty=I64)
+        self.emit("BR", args=[c2], extra=(body2, end2))
+        self.emit("LABEL", extra=body2)
+        made_new = True
+        if no_fill_boxed:
+            self.emit("CALL", None, [Sym("fa_panic"), self.make_str(panic_msg)])
+            self.emit("JMP", extra=top2)
+            self.emit("LABEL", extra=end2)
+            return
+        if src is None:
+            val = self.gen_zero_value(et)
+        elif et.kind in ("struct", "enum"):
+            p = self.new_temp(ptr_to(et))
+            self.emit("LOAD", p, [src], extra=0, ty=ptr_to(et))
+            val = self.new_temp(ptr_to(et))
+            self.emit("CALL", val, [Sym("fa_alloc"), self.const(max(et.size, 8))],
+                      ty=ptr_to(et))
+            self.emit("MEMCPY", args=[val, p], extra=et.size, ty=et)
+            made_new = False                 # 盒子不带引用计数，push 的 retain 就够
+        elif et.kind == "vec":
+            inner = et.elem
+            box = (max(inner.size, 8)
+                   if inner is not None and inner.kind in ("struct", "enum") else 0)
+            p = self.new_temp(et)
+            self.emit("LOAD", p, [src], extra=0, ty=et)
+            val = self.new_temp(et)
+            self.emit("CALL", val, [Sym("fa_vec_clone"), p, self.const(box)], ty=et)
+        elif et.kind == "map":
+            kt, vt = et.key, et.val
+            kbox = (max(kt.size, 8)
+                    if kt is not None and kt.kind in ("struct", "enum") else 0)
+            vbox = (max(vt.size, 8)
+                    if vt is not None and vt.kind in ("struct", "enum") else 0)
+            p = self.new_temp(et)
+            self.emit("LOAD", p, [src], extra=0, ty=et)
+            val = self.new_temp(et)
+            self.emit("CALL", val, [Sym("fa_map_clone"), p,
+                                    self.const(kbox), self.const(vbox)], ty=et)
+        else:                                # str：不可变，n 格共享同一份
+            val, made_new = src, False
+        self.emit("CALL", None, [Sym("fa_vec_push"), obj, val])
+        if made_new:
+            # push 已经加过一次引用，创建时那一次要还掉
+            # （静态空串的 rc 是 -1，减引用是空操作，一起走这条路没问题）
+            self.emit_rcdec_val(val, et)
+        self.emit("JMP", extra=top2)
+        self.emit("LABEL", extra=end2)
+
     def box_agg(self, v, ty: Type):
         """为容器元素在堆上装一份箱。
 
@@ -2502,14 +2660,18 @@ class FnGen:
                 return r
             if name == "resize":
                 n = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
-                if len(e.args) > 1:
-                    v = self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, et)
+                fill = e.args[1] if len(e.args) > 1 else None
+                if et.kind in ("str", "vec", "map", "struct", "enum"):
+                    # 标量那条路（把同一个值 push n 次）对引用计数/装箱元素全错，
+                    # 见 emit_vec_resize_ref 的说明
+                    self.emit_vec_resize_ref(obj, et, n, fill)
+                    return self.const(0, VOID)
+                if fill is not None:
+                    v = self.coerce(self.gen_expr(fill), fill.ty, et)
                 else:
                     v = self.const_zero(et)      # v.resize(n)：新元素补零值
                 if et.is_float:
                     v = self.bitcast(v, I64)     # 运行时按 uint64 收，浮点得按位转
-                if et.kind in ("struct", "enum"):
-                    v = self.box_agg(v, et)
                 self.emit("CALL", None, [Sym("fa_vec_resize"), obj, n, v])
                 return self.const(0, VOID)
             if name == "sort":

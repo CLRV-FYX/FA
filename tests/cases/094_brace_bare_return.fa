@@ -1,0 +1,33 @@
+# 花括号块里的光秃 `return`：`if i < 0 { return }`。
+# 以前语法分析只认 NEWLINE / ; / DEDENT 三种「后面没有值」的情形，花括号块里
+# return 后面跟的是 }，于是被当成表达式去解析，报
+# 「无法解析的表达式起始 token '}'」—— 而同样意思的冒号缩进写法（单独一行 return）
+# 却是好的。两种块写法应该一个样。
+# 顺带盯着：非 void 函数里写光秃 return 仍然是**语义**错误（不是语法错误）。
+fn remove_at(v: Vec<str>, i: i64):
+    if i < 0 or i >= v.len() { return }
+    for j in i..v.len() - 1 { v[j] = v[j + 1] }
+    v.pop()
+
+fn first_negative(v: Vec<i64>) -> i64:
+    for x in v {
+        if x < 0 { return x }
+    }
+    return 0
+
+fn guarded(n: i64) -> i64:
+    if n <= 0 { return 1 }
+    let acc = 1
+    for i in 1..n + 1 { acc = acc * i }
+    return acc
+
+fn main() -> i64:
+    let v = Vec<str>["甲", "乙", "丙", "丁"]
+    remove_at(v, 1)
+    print(v.to_str())
+    remove_at(v, 99)            # 越界：直接 return，什么都不做
+    remove_at(v, -1)
+    print(v.to_str())
+    print(first_negative(Vec<i64>[1, -2, 3]), first_negative(Vec<i64>[1, 2]))
+    print(guarded(0), guarded(-3), guarded(5))
+    return 0

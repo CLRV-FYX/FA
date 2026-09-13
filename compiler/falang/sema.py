@@ -245,6 +245,8 @@ class Sema:
                     self.check_index_arg(ats[0], args[0], "新长度")
                 if len(ats) == 2 and et is not None:
                     self.check_assignable(et, ats[1], args[1], "填充值")
+                # 不给填充值时能不能变长，要看运行时的长度，所以这里不拦：
+                # 真要变长而元素是装箱类型，codegen 会在循环里 panic 一句人话
             elif name in ("contains", "index_of") and len(ats) == 1 and et is not None:
                 self.check_assignable(et, ats[0], args[0], f"{name}() 的实参")
         elif ot.kind == "map":
