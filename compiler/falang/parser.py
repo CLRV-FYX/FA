@@ -1116,6 +1116,12 @@ class Parser:
             # 语句位置由 _parse_stmt 先截走，所以这里只在「= 右边 / 实参 / return」
             # 这类真正的表达式位置生效，两种写法的解析完全共用一套代码。
             return self.parse_if() if t.value == "if" else self.parse_match()
+        if t.kind == KW and t.value in ("else", "elif"):
+            # 右花括号单独一行、else 另起一行 —— 从 C/Java 带过来的习惯写法，
+            # 报「无法解析的表达式起始 token 'else'」完全看不出问题在哪。
+            self.err(f"'{t.value}' 接不上前面的 if：花括号写法要和右花括号同一行"
+                     f"（写成 `}} {t.value} ...`），缩进写法要紧跟在 if 块的下一行、"
+                     f"和 if 同缩进")
         self.err(f"无法解析的表达式起始 token '{t.value}'")
 
     def make_string(self, raw: str, line: int, col: int) -> Expr:
