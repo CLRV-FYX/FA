@@ -1,0 +1,30 @@
+# 递归结构体只能用指针字段：链表节点。
+#
+# `next: Node`（按值包含自己）在语义阶段就拦下来，报「大小无限」并给出该怎么写；
+# `next: *Node` 才是能用的形式，配 `new Node { ... }` 建节点、`nil` 收尾。
+struct Node:
+    val: i64
+    next: *Node
+
+fn push_front(head: *Node, v: i64) -> *Node:
+    return new Node { val: v, next: head }
+
+fn sum(head: *Node) -> i64:
+    let s = 0
+    let p = head
+    while p != nil {
+        s += p.val
+        p = p.next
+    }
+    return s
+
+fn main() -> i64:
+    let head: *Node = nil
+    head = push_front(head, 1)
+    head = push_front(head, 2)
+    head = push_front(head, 3)
+    print(head.val, head.next.val, head.next.next.val, head.next.next.next == nil)
+    print(sum(head))
+    head.next.val = 20
+    print(sum(head))
+    return 0

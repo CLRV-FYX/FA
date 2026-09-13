@@ -1,0 +1,49 @@
+# 方法符号按类型分开；自己写的 to_str 到处都认。
+#
+# 两个回归：
+#   1) impl 方法的符号以前一律是 `fa_方法名`，两个类型有同名方法就撞车：
+#          impl A: fn show(self) -> i64
+#          impl B: fn show(self) -> i64
+#      汇编器报 `symbol 'fa_show' is already defined`，指着 .s 文件的行号，
+#      源码里看不出是哪两个方法。而 show / area / eq / to_str 这种名字
+#      在几个类型上各写一份是最平常的事。现在符号带上类型名（fa_A_show / fa_B_show）。
+#      同一个 impl 里重名方法也在语义阶段就报「定义了两次」（以前是后一个顶掉前一个，
+#      再一路走到汇编器）。
+#   2) 自己写了 `fn to_str(self) -> str`，print / str() / 插值 / 容器印元素以前一律不理，
+#      还是内建的字段展开（`A { x: 1 }`），只有显式 `a.to_str()` 才用得上。现在都用你的。
+#      在 to_str 自己的函数体里 `str(self)` 仍走内建展开，不会无限递归到爆栈。
+struct A:
+    x: i64 = 1
+
+struct B:
+    x: i64 = 2
+
+impl A:
+    fn show(self) -> i64:
+        return self.x
+
+    fn to_str(self) -> str:
+        return "A({self.x})"
+
+impl B:
+    fn show(self) -> i64:
+        return self.x * 10
+
+    fn to_str(self) -> str:
+        return "B<" + str(self) + ">"
+
+fn main() -> i64:
+    let a = A {}
+    let b = B {}
+    print(a.show(), b.show())
+    print(a, b)
+    print(str(a), "{b}")
+    print(b.to_str())
+
+    let v = Vec<A>[a, A { x: 5 }]
+    print(v)
+
+    let m = Map<str, B>()
+    m.set("k", b)
+    print(m)
+    return 0

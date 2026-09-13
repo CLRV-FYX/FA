@@ -1733,8 +1733,14 @@ class FnGen:
         elif ty.kind == "jobj":
             self.emit("CALL", r, [Sym("fa_jvm_to_str"), v], ty=STR)
         elif ty.kind == "struct":
+            u = self.user_to_str(ty)
+            if u is not None:
+                return self.call_user_to_str(u, v)
             return self.gen_struct_to_str(v, ty)
         elif ty.kind == "enum":
+            u = self.user_to_str(ty)
+            if u is not None:
+                return self.call_user_to_str(u, v)
             return self.gen_enum_to_str(v, ty)
         elif ty.kind == "arr":
             return self.gen_arr_to_str(v, ty)
@@ -1927,6 +1933,31 @@ class FnGen:
         t = self.new_temp(fty)
         self.emit("LOAD", t, [base], extra=off, ty=fty)
         return t
+
+    def user_to_str(self, ty: Type):
+        """这个类型自己写了 `fn to_str(self) -> str` 吗？写了就用他的。
+
+        以前不管你有没有写，`print(p)` / `str(p)` / 容器里印元素一律走内建的
+        字段展开（`Task { name: 甲, prio: 3 }`），你写的 to_str 只有显式
+        `p.to_str()` 才用得上 —— 而「我给它写了 to_str，print 却不理我」
+        正是每个人都会踩的一脚。
+        """
+        if getattr(ty, "kind", None) not in ("struct", "enum"):
+            return None
+        fs = (self.sema.methods or {}).get((ty.name, "to_str"))
+        if fs is None or fs is self.fnsym:
+            # 正在生成 to_str 自己的函数体：走内建展开，否则
+            # `fn to_str(self) -> str: return str(self)` 会无限递归到爆栈。
+            return None
+        if getattr(fs, "extern", False):
+            return None
+        return fs
+
+    def call_user_to_str(self, fs, v) -> Temp:
+        r = self.new_temp(STR)
+        self.emit("CALL", r, [Sym(fs.symbol), v], extra=fs, ty=STR)
+        self.mark_owned(r, STR)
+        return r
 
     def gen_struct_to_str(self, v, ty: Type) -> Temp:
         """`P { x: 1, y: "甲" }`。

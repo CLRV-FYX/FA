@@ -134,7 +134,18 @@ class FnSym:
 
     @property
     def symbol(self):
-        return self.cname if self.extern else f"fa_{self.name}"
+        # impl 方法的符号必须带上类型名（register_impl 给的 cname 是
+        # `fa_类型_方法`）。以前一律走 `fa_{name}`，于是两个类型有同名方法就撞车：
+        #     impl A: fn show(self) -> i64   # 符号 fa_show
+        #     impl B: fn show(self) -> i64   # 符号也是 fa_show
+        # 汇编器报 `symbol 'fa_show' is already defined`，指着 .s 文件的行号，
+        # 源码里看不出是哪两个方法。而 show / area / to_str / eq 这种名字
+        # 在多个类型上各写一份是最平常不过的事。
+        if self.extern:
+            return self.cname
+        if self.cname and self.cname != self.name:
+            return self.cname
+        return f"fa_{self.name}"
 
     def __repr__(self):
         return f"Fn({self.name}{self.params}->{self.ret})"
@@ -714,7 +725,14 @@ class Sema:
             self.error(f"impl 的类型 '{d.type_name}' 不存在"
                        f"（结构体要用 struct 声明，枚举要用 enum 声明）", d)
             return
+        seen_methods = {}
         for m in d.methods:
+            # 同一个 impl 里同名方法写两遍：后一个会把前一个从 methods 表里顶掉，
+            # 而两个函数体的符号一样，一路走到汇编器才报 `symbol ... is already defined`。
+            if m.name in seen_methods:
+                self.error(f"类型 {d.type_name} 的方法 '{m.name}' 定义了两次"
+                           f"（第一次在第 {seen_methods[m.name]} 行）", m)
+            seen_methods[m.name] = getattr(m, "line", 0)
             params = [self.resolve_type(p.ty) for p in m.params
                       if p.name != "self"]
             ret = self.resolve_type(m.ret) if m.ret is not None else VOID
