@@ -1762,8 +1762,8 @@ class FnGen:
         l_bad = self.new_label("bbad")
         self.emit("BR", args=[ok], extra=(l_ok, l_bad))
         self.emit("LABEL", extra=l_bad)
-        msg = self.make_str("下标越界 (index out of range)")
-        self.emit("CALL", None, [Sym("fa_panic"), msg])
+        lim = limit if isinstance(limit, (Temp, Const)) else self.const(limit, I64)
+        self.emit("CALL", None, [Sym("fa_bounds_error"), idx, lim])
         self.emit("LABEL", extra=l_ok)
 
     def load_ptr(self, ptr, ty: Type, off) -> Temp:
@@ -2128,15 +2128,32 @@ class FnGen:
             return self.gen_builtin_method(e)
         self.err(f"未解析的方法调用 .{e.name}", e)
 
-    def emit_bounds_check(self, bad: Temp):
-        """bad 为真时跳到运行时报错（下标越界）"""
+    def emit_bounds_check(self, bad: Temp, idx, limit):
+        """bad 为真时跳到运行时报错（下标越界），并把下标和长度一起报出来"""
         ok = self.new_label("bok")
         self.emit("BR", args=[bad], extra=(self.new_label("bbad"), ok))
         # 用一条 JMP 串联：BR 的真分支先落到报错调用
         lbl_bad = self.ir[-1].extra[0]
         self.emit("LABEL", extra=lbl_bad)
-        self.emit("CALL", None, [Sym("fa_bounds_error")])
+        self.emit("CALL", None, [Sym("fa_bounds_error"), idx, limit])
         self.emit("LABEL", extra=ok)
+
+    def emit_vec_bounds(self, obj, i: Temp):
+        """Vec 内联存取前的越界检查：**两头都要查**。
+
+        以前只查了上界（i >= len），于是 v[-1] 不报错，直接读到缓冲区前面
+        那 8 个字节（实测打出 81 这种垃圾值，ASan 下是 heap-buffer-underflow）。
+        """
+        n = self.new_temp(I64)
+        self.emit("LOAD", n, [obj], extra=8, ty=I64)
+        hi = self.new_temp(BOOL)
+        self.emit("CMP", hi, [i, n], extra=">=", ty=I64)
+        lo = self.new_temp(BOOL)
+        self.emit("CMP", lo, [i, self.const(0)], extra="<", ty=I64)
+        bad = self.new_temp(BOOL)
+        self.emit("BIN", bad, [lo, hi], extra="or", ty=BOOL)
+        self.emit_bounds_check(bad, i, n)
+        return n
 
     def bitcast(self, v, to_ty: Type):
         """同一 64 位数据的类型重解释（i64 <-> f64），用于容器这类按 uint64_t 存取的 ABI"""
@@ -2280,11 +2297,7 @@ class FnGen:
             if name == "get":
                 i = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
                 # 内联快速路径：越界检查 + 直接取元素（省掉一次函数调用）
-                n = self.new_temp(I64)
-                self.emit("LOAD", n, [obj], extra=8, ty=I64)
-                bad = self.new_temp(BOOL)
-                self.emit("CMP", bad, [i, n], extra=">=", ty=I64)
-                self.emit_bounds_check(bad)
+                self.emit_vec_bounds(obj, i)
                 data = self.new_temp(ptr_to(I64))
                 self.emit("LOAD", data, [obj], extra=32, ty=ptr_to(I64))
                 # extra=(下标, 比例) -> 直接用 x86 比例变址 [data + i*esz]，省掉一条 imul
@@ -2309,11 +2322,7 @@ class FnGen:
                     self.emit("CALL", None, [Sym("fa_vec_set"), obj, i, av])
                     return self.const(0, VOID)
                 # 内联快速路径：越界检查 + 直接写元素
-                n = self.new_temp(I64)
-                self.emit("LOAD", n, [obj], extra=8, ty=I64)
-                bad = self.new_temp(BOOL)
-                self.emit("CMP", bad, [i, n], extra=">=", ty=I64)
-                self.emit_bounds_check(bad)
+                self.emit_vec_bounds(obj, i)
                 data = self.new_temp(ptr_to(I64))
                 self.emit("LOAD", data, [obj], extra=32, ty=ptr_to(I64))
                 ez = vec_esz(et)

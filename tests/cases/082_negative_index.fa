@@ -1,0 +1,12 @@
+# expect-exit: 1
+# expect-stderr: 下标 -1
+# 回归：负数下标必须拦下来。
+# Vec 的内联存取以前只查上界（i >= len），于是 v[-1] 不报错，直接读到缓冲区
+# **前面**那 8 个字节（实测打出 81 这种垃圾值；ASan 下是 heap-buffer-underflow）。
+# 现在读写两条内联路径都查两头，报错里还带上长度和下标。
+# 写路径（v[-1] = x / v.set(-1, x)）、str 与数组的负下标走的是同一套检查。
+fn main() -> i64:
+    let v = Vec<i64>[1, 2]
+    print(v[0], v[1])
+    print(v[-1])
+    return 0

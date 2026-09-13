@@ -823,7 +823,7 @@ int64_t fa_str_char_at(FaStr *s, int64_t idx) {
         i = next; n++;
     }
     if (idx < 0) return 0;
-    fa_bounds_error();                                /* 和下标越界同一套报错 */
+    fa_bounds_error(idx, n);                          /* 和下标越界同一套报错 */
     return 0;
 }
 
@@ -986,9 +986,18 @@ static uint64_t fa_hash_str(FaStr *s) {
     return h;
 }
 
-void fa_bounds_error(void) {
+/* 下标越界：把长度和下标一起打出来，用户才知道是哪儿算错了。
+   v[i] / v.get(i) / s[i] / a[i] / s.char_at(i) 共用这一句。 */
+void fa_bounds_error(int64_t idx, int64_t len) {
+    char buf[128];
+    int n;
     fa_flush();
-    fa_sys_write(2, "index out of range\n", 19);
+    n = snprintf(buf, sizeof(buf),
+                 "panic: 下标越界 (index out of range)：长度 %lld，下标 %lld\n",
+                 (long long)len, (long long)idx);
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(buf)) n = (int)sizeof(buf);
+    fa_sys_write(2, buf, (int64_t)n);
     fa_sys_exit(1);
 }
 

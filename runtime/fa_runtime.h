@@ -169,7 +169,7 @@ uint64_t fa_vec_get(FaVec *v, int64_t i);
 void    fa_vec_set(FaVec *v, int64_t i, uint64_t val);
 uint64_t fa_vec_pop(FaVec *v);
 void    fa_vec_clear(FaVec *v);
-void    fa_bounds_error(void);
+void    fa_bounds_error(int64_t idx, int64_t len);
 int64_t fa_vec_contains(FaVec *v, uint64_t val);
 void    fa_vec_resize(FaVec *v, int64_t n, uint64_t val);
 
