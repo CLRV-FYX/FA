@@ -706,6 +706,14 @@ class Sema:
         return sym
 
     def register_impl(self, d: ImplDef):
+        # `impl Pont:`（把 Point 打错了）以前一声不响：方法注册进了
+        # methods[("Pont", ...)]，可谁也不会用类型名 Pont 去调，于是这些方法
+        # 就这么消失了，而 `p.norm()` 报的是「类型 Point 没有方法 'norm'」——
+        # 看着像方法没写，其实是 impl 的名字错了。
+        if d.type_name not in self.structs and d.type_name not in self.enums:
+            self.error(f"impl 的类型 '{d.type_name}' 不存在"
+                       f"（结构体要用 struct 声明，枚举要用 enum 声明）", d)
+            return
         for m in d.methods:
             params = [self.resolve_type(p.ty) for p in m.params
                       if p.name != "self"]
@@ -1099,6 +1107,14 @@ class Sema:
             if st is None:
                 self.error(f"未知结构体 '{e.name}'", e)
             fty_by_name = {fn: t for fn, t, off in st.fields}
+            # `Task { name: "a", name: "b" }` 以前悄悄取后一个（given 是字典推导，
+            # 重复键后者覆盖前者）—— 打错字段名或者复制粘贴忘删的时候，
+            # 程序照跑，值却是另一个，谁也看不出来。直接报错。
+            seen_fields = set()
+            for fn, fv in e.fields:
+                if fn in seen_fields:
+                    self.error(f"结构体 {e.name} 的字段 '{fn}' 写了两次", e)
+                seen_fields.add(fn)
             given = {fn: self.expr(fv, expect=fty_by_name.get(fn))
                      for fn, fv in e.fields}
             defaults = getattr(self.struct_decls.get(e.name), "defaults", None) or {}
@@ -1627,6 +1643,32 @@ class Sema:
         pat.ty = st
         pat.bindings = binds
 
+    def check_method_receiver(self, e: MethodCall, ot: Type, fs: FnSym):
+        """分清楚「静态方法」（impl 里不带 self）和普通方法（带 self）。
+
+        两头都得拦：
+          * `P.norm()`：norm 要 self，可接收者是**类型名**，没有实例可传。
+            以前语义层放行，代码生成去查一个叫 P 的变量，崩在
+            「代码生成错误：未定义变量 'P'」。
+          * `p.make(2.0)`：make 没有 self，可接收者是个值。以前语义层放行，
+            代码生成把 p 当成第一个实参塞进去 —— 形参对不上号，
+            `fn make(a: f64)` 收到的是结构体的地址当浮点位模式用，
+            悄悄算出一个垃圾数。
+        """
+        decl = getattr(fs, "decl", None)
+        has_self = bool(decl is not None and any(
+            getattr(p, "name", "") == "self"
+            for p in (getattr(decl, "params", None) or [])))
+        names = set(self.structs or {}) | set(self.enums or {})
+        recv_is_type = isinstance(e.obj, NameRef) and e.obj.name in names
+        if recv_is_type and has_self:
+            self.error(f"方法 '{e.name}' 带 self，得用实例调用："
+                       f"let p = {e.obj.name} {{...}}，然后 p.{e.name}(...)"
+                       f"；想直接用类型名调用，就把形参里的 self 去掉", e)
+        elif not recv_is_type and not has_self and ot.kind in ("struct", "enum"):
+            self.error(f"方法 '{e.name}' 没有 self（静态方法），要用类型名调用："
+                       f"{ot.name}.{e.name}(...)", e)
+
     def expr_method(self, e: MethodCall) -> Type:
         ot = self.expr(e.obj)
         # 枚举变体构造器在语法上和方法调用一模一样：Shape.Circle(2.0)
@@ -1660,12 +1702,10 @@ class Sema:
             return e.ty
         key = (ot.name if ot.kind in ("struct", "enum") else ot.kind, e.name)
         fs = self.methods.get(key)
+        if fs is None and ot.kind in ("struct", "enum"):
+            fs = self.methods.get((ot.name, e.name))
         if fs is not None:
-            e.resolved = fs
-            e.ty = fs.ret
-            return fs.ret
-        if ot.kind in ("struct", "enum") and (ot.name, e.name) in self.methods:
-            fs = self.methods[(ot.name, e.name)]
+            self.check_method_receiver(e, ot, fs)
             e.resolved = fs
             e.ty = fs.ret
             return fs.ret
