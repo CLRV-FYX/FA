@@ -351,6 +351,22 @@ class FnGen:
         self.emit("ALLOCA", d, extra=(max(size, 1), align))
         return d
 
+    def add_offs(self, a, b):
+        """两个偏移相加，两边都可能是常量也可能是 Temp。
+
+        嵌套数组 `grid[i][j]` 就是这种：外层下标给出一个运行时才算得出的偏移，
+        内层再给一个，两个都得加上去。
+        """
+        if isinstance(a, int) and isinstance(b, int):
+            return a + b
+        if isinstance(a, int) and a == 0:
+            return b
+        if isinstance(b, int) and b == 0:
+            return a
+        r = self.new_temp(I64)
+        self.emit("BIN", r, [a, b], extra="+", ty=I64)
+        return r
+
     def add_off(self, off, delta: int):
         """把常量偏移叠加到「可能是 Temp 的偏移」上。
 
@@ -1633,7 +1649,7 @@ class FnGen:
 
     # ------------------------------------------- 容器里装着结构体 / 枚举时的 to_str
     def _container_has_agg(self, ty: Type) -> bool:
-        """容器里（含嵌套几层）有没有结构体 / 枚举元素。
+        """容器里（含嵌套几层）有没有结构体 / 枚举 / 数组元素。
 
         运行时的 fa_container_to_str 只认元素 kind，结构体/枚举一律打成 `{...}`
         —— 可 `print(v[0])` 明明是 `P { x: 1, y: 甲 }`。字段名只有编译器知道，
@@ -1650,7 +1666,10 @@ class FnGen:
     def _ty_has_agg(self, t) -> bool:
         if t is None:
             return False
-        if t.kind in ("struct", "enum"):
+        # 数组元素也算：运行时同样只认 kind，`Vec<[i64; 3]>.to_str()` 打出来是
+        # [{...}, {...}]，可 `print(v[0])` 明明是 [1, 2, 3]。编译期知道长度和元素类型，
+        # 交给 gen_arr_to_str 展开就行（元素在槽里也是装箱的，取值路径和结构体一致）。
+        if t.kind in ("struct", "enum", "arr"):
             return True
         if t.kind in ("vec", "map"):
             return self._container_has_agg(t)
@@ -2116,8 +2135,15 @@ class FnGen:
                 sc = max(ot.elem.size, 1)
                 o = self.new_temp(I64)
                 self.emit("BIN", o, [idx, self.const(sc)], extra="*", ty=I64)
-                return base, self.add_off(o, off0 if isinstance(off0, int) else 0), ot.elem \
-                    if isinstance(off0, int) else (base, self.add_off(o, 0), ot.elem)
+                # 以前这行写成
+                #   return base, self.add_off(o, off0 if isinstance(off0, int) else 0), ot.elem \
+                #       if isinstance(off0, int) else (base, self.add_off(o, 0), ot.elem)
+                # Python 把 `x if c else y` 只当成**元组最后一个元素**，于是 off0 是 Temp 时
+                # 返回的「类型」变成了那个三元组本身 —— `grid[1][2]` 直接
+                # AttributeError: 'tuple' object has no attribute 'kind'（编译器崩在 is_agg 里）。
+                # 而且那条 else 分支还把 off0 丢掉了：就算不崩，算出来的地址也是错的
+                # （少加外层下标的偏移，读到的是第 0 行）。两个偏移必须都加上。
+                return base, self.add_offs(off0, o), ot.elem
             if ot.kind == "ptr":
                 p = self.gen_expr(e.obj)
                 idx = self.coerce(self.gen_expr(e.index), e.index.ty, I64)
