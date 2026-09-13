@@ -1,0 +1,43 @@
+# 键不存在时 get 给什么：数值/bool/char 是零值（计数惯用法靠的就是它），
+# str 换成**静态空串**（以前是 NULL：len 和拼接被运行时容错了，但走 .chars()
+# 这类要读对象头的路就不一定），容器和结构体值造不出能用的零值 —— 那条路
+# 见 097（panic，不再段错误）。
+fn main() -> i64:
+    let m = Map<str, i64>()
+    m.set("a", 1)
+    print("i64 未命中:", m.get("zzz"), m["zzz"])
+
+    # 词频统计的标准写法：未命中当 0
+    let freq = Map<str, i64>()
+    for w in Vec<str>["甲", "乙", "甲", "甲", "丙"] {
+        freq.set(w, freq.get(w) + 1)
+    }
+    let ks = freq.keys()
+    ks.sort()
+    for k in ks { print("  ", k, freq.get(k)) }
+
+    let f = Map<str, f64>()
+    print("f64 未命中:", f.get("nope"))
+    let b = Map<str, bool>()
+    print("bool 未命中:", b.get("nope"))
+    let c = Map<str, char>()
+    print("char 未命中:", c.get("nope") == 0 as i64)
+
+    let s = Map<str, str>()
+    s.set("k", "值")
+    let miss = s.get("nope")
+    print("str 未命中:", "[" + miss + "]", miss.len(), miss.chars().len(), miss.to_i64())
+
+    # has / del / len / clear
+    print("has:", m.has("a"), m.has("zzz"))
+    m.del("zzz")                    # 删不存在的键：什么也不做
+    print("del 未命中之后 len:", m.len())
+    m.del("a")
+    print("del 命中之后 len:", m.len(), m.to_str())
+
+    # 覆盖同一个键
+    let o = Map<str, i64>()
+    o.set("k", 1)
+    o.set("k", 2)
+    print("覆盖:", o.to_str(), o.len())
+    return 0

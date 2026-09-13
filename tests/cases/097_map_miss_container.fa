@@ -1,0 +1,13 @@
+# expect-exit: 1
+# expect-stderr: 里没有键
+# 值是容器/结构体时，键不存在**没法**给一个能用的零值：空指针一用就段错误
+# （实测 Map<str, Vec<i64>> 上 m.get("nope").to_str() 当场崩，.len() 是 0 而
+# 往里 push 静默失效，因为 fa_vec_push 对 NULL 直接 return）；结构体更是连
+# 「默认的 P」都不存在（字段没写默认值时 P{} 本身就编译不过）。
+# 所以现在 panic 一句人话，把键和该怎么做都打出来。
+fn main() -> i64:
+    let m = Map<str, Vec<i64>>()
+    m.set("a", Vec<i64>[1, 2])
+    print("命中:", m.get("a").to_str())
+    print("未命中:", m.get("nope").to_str())
+    return 0

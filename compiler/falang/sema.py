@@ -31,7 +31,12 @@ BUILTIN_METHODS = {
     "vec": {"len", "push", "get", "set", "pop", "clear", "contains", "to_str",
             "resize", "sort", "reverse", "join", "sum", "min", "max",
             "index_of", "copy"},
-    "map": {"len", "get", "set", "has", "del", "clear", "to_str",
+    # contains 是 has 的别名。以前 Map 只有全局写法 contains(m, k) 编得过
+    # （sema 把它 forwarded 到 _builtin_on_container），方法写法 m.contains(k) 被拒，
+    # 而 codegen 两条路都没实现 —— 全局写法一路走到后端才报
+    # 「未实现的内建方法 .contains（类型 Map<...>）」。Vec 那边两种写法都有，
+    # Map 也该一样：都落到 fa_map_has。
+    "map": {"len", "get", "set", "has", "contains", "del", "clear", "to_str",
             "keys", "values", "copy"},
     "arr": {"len"},
     "pyobj": {"to_str", "to_i64", "to_f64", "call", "attr", "to_str_deep"},
@@ -64,8 +69,8 @@ METHOD_ARITY = {
             "sum": (0, 0), "min": (0, 0), "max": (0, 0), "index_of": (1, 1),
             "copy": (0, 0)},
     "map": {"len": (0, 0), "get": (1, 1), "set": (2, 2), "has": (1, 1),
-            "del": (1, 1), "clear": (0, 0), "to_str": (0, 0), "keys": (0, 0),
-            "values": (0, 0), "copy": (0, 0)},
+            "contains": (1, 1), "del": (1, 1), "clear": (0, 0), "to_str": (0, 0),
+            "keys": (0, 0), "values": (0, 0), "copy": (0, 0)},
     "arr": {"len": (0, 0)},
     "pyobj": {"to_str": (0, 0), "to_i64": (0, 0), "to_f64": (0, 0),
               "call": (0, 1), "attr": (1, 1), "to_str_deep": (0, 0)},
@@ -256,7 +261,8 @@ class Sema:
                     self.check_assignable(kt, ats[0], args[0], "Map 的键")
                 if vt is not None:
                     self.check_assignable(vt, ats[1], args[1], "Map 的值")
-            elif name in ("get", "has", "del") and len(ats) == 1 and kt is not None:
+            elif (name in ("get", "has", "contains", "del") and len(ats) == 1
+                  and kt is not None):
                 self.check_assignable(kt, ats[0], args[0], "Map 的键")
 
     # sort / min / max / contains / index_of / sum 都要**按内容**比较或累加元素。

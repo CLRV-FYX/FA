@@ -1,0 +1,12 @@
+i64 未命中: 0 0
+   丙 1
+   乙 1
+   甲 3
+f64 未命中: 0.0
+bool 未命中: false
+char 未命中: true
+str 未命中: [] 0 0 0
+has: true false
+del 未命中之后 len: 1
+del 命中之后 len: 0 {}
+覆盖: {"k": 2} 1

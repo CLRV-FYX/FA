@@ -385,6 +385,66 @@ class FnGen:
                 vv = self.bitcast(vv, I64)
         self.emit("CALL", None, [Sym("fa_map_set"), m, kk, vv])
 
+    def map_miss_default(self, raw, vt: Type, kk, kt: Type, ot: Type):
+        """键不存在时 fa_map_get 返回 0，而 0 对各个值类型的意思完全不同。
+
+        数值 / bool / char / 指针：0 就是零值 —— `m.get(词) + 1` 这个计数惯用法
+            靠的正是它，原样返回。
+        str：换成静态空串。NULL 在多数地方被运行时容错成空串（len 是 0、拼接是 ""），
+            但走 `.chars()` / `.split()` 这类要读对象头的路就不一定了；静态串
+            rc = -1 永生，不涉及所有权，两条路都安全。
+        Vec / Map / struct / enum：造不出一个能用的零值，直接 panic 把键打出来。
+            NULL 表**一用就段错误**（实测 Map<str, Vec<i64>> 上 m.get("nope").to_str()
+            当场崩，.len() 是 0 而往里 push 静默失效，因为 fa_vec_push 对 NULL
+            直接 return）；结构体更是连「默认的 P」都不存在（字段没写默认值时
+            P{} 本身就编译不过）。
+            为什么不像 str 那样在分支里造一份新的空表交出去：那份表的**所有权**
+            和命中路径不一样（命中的值是借来的、不能释放，新建的那份必须有人释放），
+            而释放是登记在语句末尾做的 —— 走命中路径时那个临时寄存器里装的是
+            无关的值，实测退出时 glibc 报 free(): invalid pointer。这正是
+            if/match 表达式和 gen_enum_to_str 踩过的同一个坑：分支里新建的引用
+            必须在分支内了结，不能拖到合流之后。
+
+        panic 分支里的中间引用（键的文本、拼接结果）用 release_new_refs 在**分支内**
+        注销并释放，理由同上。
+        """
+        if vt is None or vt.kind in ("int", "float", "bool", "char", "ptr",
+                                     "any", "pyobj", "jobj"):
+            return raw
+        isnull = self.new_temp(BOOL)
+        self.emit("CMP", isnull, [raw, self.const(0)], extra="==", ty=I64)
+        l_fix = self.new_label("mmiss")
+        l_end = self.new_label("mmissd")
+        slot = self.emit_alloca(8)
+        self.emit("STORE", args=[slot, raw], extra=0, ty=I64)
+        self.emit("BR", args=[isnull], extra=(l_fix, l_end))
+        self.emit("LABEL", extra=l_fix)
+        ref_before = set(self.owned_ids)
+        agg_before = set(self.agg_owned_ids)
+        if vt.kind == "str":
+            self.emit("STORE", args=[slot, self.make_str("")], extra=0, ty=STR)
+        else:
+            ks = self.gen_to_str(kk, kt)
+            if vt.kind in ("vec", "map"):
+                tail = (f"：{vt} 的值给不出一个能用的零值（空指针一用就段错误）。"
+                        f"先用 m.has(k) 判断；要「没有就建一张空表」，写 "
+                        f"if not m.has(k) {{ m.set(k, {vt}()) }}")
+            else:
+                tail = (f"：{vt} 的值造不出「零值」（字段没写默认值时连 {vt}{{}} 都"
+                        f"编译不过）。先用 m.has(k) 判断键在不在")
+            msg = self.concat_str(self.make_str(f"Map<{kt}, {vt}> 里没有键 "), ks)
+            msg = self.concat_str(msg, self.make_str(tail))
+            self.emit("CALL", None, [Sym("fa_panic"), msg])
+        self.release_new_refs(None, ref_before, agg_before)
+        self.emit("LABEL", extra=l_end)
+        # 按 I64 取回来：槽里存的就是那 8 个字节的把手/盒子地址，和 fa_map_get
+        # 原来的返回值一个形状。按 vt 去 LOAD 的话，结构体值会被当成「从槽里
+        # 拷 sizeof(P) 字节」—— 8 字节的栈格子读出十几字节垃圾，实测命中路径
+        # 直接段错误。
+        out = self.new_temp(I64)
+        self.emit("LOAD", out, [slot], extra=0, ty=I64)
+        return out
+
     def gen_zero_value(self, ty: Type):
         """新建一份 ty 的空值：str 是空串，Vec / Map 是**一张新的空表**。
 
@@ -2735,22 +2795,30 @@ class FnGen:
                     kk = self.bitcast(kk, I64)
                 raw = self.new_temp(I64)
                 self.emit("CALL", raw, [Sym("fa_map_get"), obj, kk], ty=I64)
+                raw = self.map_miss_default(raw, vt, kk, kt, ot)
                 return self.bitcast(raw, vt) if vt.is_float else raw
             if name == "set":
                 self.emit_map_set(obj, e.args[0], e.args[1], kt, vt)
                 return self.const(0, VOID)
-            if name == "has":
+            if name in ("has", "contains"):
                 k = self.gen_expr(e.args[0])
+                kk = self.coerce(k, e.args[0].ty, kt)
+                if kt.is_float:
+                    # 浮点键在表里存的是**位模式**（fa_map_set 那边 bitcast 过），
+                    # 这里不转就把 f64 放在 xmm 里传过去、整数参数寄存器里是垃圾 ——
+                    # 实测 Map<f64, V>.has() 永远 false（而 get 是对的，它转了）。
+                    kk = self.bitcast(kk, I64)
                 r = self.new_temp(I64)
-                self.emit("CALL", r, [Sym("fa_map_has"), obj,
-                                      self.coerce(k, e.args[0].ty, kt)], ty=I64)
+                self.emit("CALL", r, [Sym("fa_map_has"), obj, kk], ty=I64)
                 c = self.new_temp(BOOL)
                 self.emit("CMP", c, [r, self.const(1)], extra="==", ty=I64)
                 return c
             if name == "del":
                 k = self.gen_expr(e.args[0])
-                self.emit("CALL", None, [Sym("fa_map_del"), obj,
-                                         self.coerce(k, e.args[0].ty, kt)])
+                kk = self.coerce(k, e.args[0].ty, kt)
+                if kt.is_float:
+                    kk = self.bitcast(kk, I64)      # 同 has：键是位模式
+                self.emit("CALL", None, [Sym("fa_map_del"), obj, kk])
                 return self.const(0, VOID)
             if name == "clear":
                 self.emit("CALL", None, [Sym("fa_map_clear"), obj])
