@@ -1,0 +1,95 @@
+# 枚举与 match：变体、载荷、分支绑定、match 当表达式、枚举方法、递归枚举。
+#
+# 两个回归：
+#   1) 不带载荷的枚举（C 那种）以前连 `==` 都不给比，报「无法比较 Color 与 Color」，
+#      判断 `if state == State.On` 只能拿 match 绕。现在比 tag。
+#      带载荷的仍然拦：只比 tag 会让 Circle(2.0) == Circle(3.0) 成立（悄悄给错答案）。
+#   2) 括号里的 match 用冒号缩进写法（`print(match s: ...)`）以前报
+#      「期望 'INDENT'，实际得到 'STR'」—— 词法层在括号内不发 NEWLINE / INDENT，
+#      解析器却硬等一个 INDENT。现在括号内一路解析分支到右括号。
+enum Color:
+    Red
+    Green
+    Blue
+
+enum Shape:
+    Dot
+    Circle(r: f64)
+    Rect(w: f64, h: f64)
+    Tagged(s: str, xs: Vec<i64>)
+
+enum IntList:
+    Nil
+    Cons(head: i64, tail: *IntList)
+
+impl Color:
+    fn is_warm(self) -> bool:
+        return self == Color.Red
+
+    fn cn(self) -> str:
+        return match self:
+            Color.Red: "红"
+            Color.Green: "绿"
+            Color.Blue: "蓝"
+
+fn area(s: Shape) -> f64:
+    match s:
+        Shape.Dot:
+            return 0.0
+        Shape.Circle(r):
+            return 3.0 * r * r
+        Shape.Rect(w, h):
+            return w * h
+        Shape.Tagged(_, _):
+            return -1.0
+    return -2.0
+
+fn total(l: *IntList) -> i64:
+    if l == nil:
+        return 0
+    match *l:
+        IntList.Nil:
+            return 0
+        IntList.Cons(h, t):
+            return h + total(t)
+    return 0
+
+fn main() -> i64:
+    # 打印与比较
+    let c = Color.Green
+    print(c, c == Color.Green, c == Color.Red, c != Color.Red)
+    print(Color.Red.is_warm(), Color.Blue.is_warm(), c.cn())
+
+    # 载荷变体
+    let a = Shape.Dot
+    let b = Shape.Circle(2.0)
+    let d = Shape.Rect(3.0, 4.0)
+    let t = Shape.Tagged("甲", Vec<i64>[1, 2])
+    print(a, b, d, t)
+    print(area(a), area(b), area(d), area(t))
+
+    # match 当表达式：冒号缩进式、花括号式、括号里都算
+    let n = 3
+    let w1 = match n:
+        1: "一"
+        3: "三"
+        _: "多"
+    let w2 = match c { Color.Red: "红"; _: "别的" }
+    print(w1, w2, match c:
+        Color.Green: "绿"
+        _: "?")
+
+    # 不穷尽也不写 _：落到 match 后面（语句式允许，表达式式编译期就拦）
+    print(area(Shape.Dot))
+
+    # 容器里的枚举
+    let v = Vec<Shape>[a, b]
+    print(v.to_str())
+    let m = Map<str, Color>()
+    m.set("k", Color.Blue)
+    print(m.to_str(), m.get("k").cn())
+
+    # 递归枚举：载荷用指针
+    let l = new IntList.Cons(1, new IntList.Cons(2, new IntList.Nil()))
+    print(total(l), total(nil))
+    return 0

@@ -1454,6 +1454,21 @@ class Sema:
             if lt.kind == "ptr" and rt.kind == "int" and rt.name == "i64":
                 e.ty = BOOL
                 return BOOL
+            # 枚举：变体**不带载荷**时（就是 C 那种枚举）`==` / `!=` 比 tag，
+            # 这是最常写的判断（`if state == State.On`），以前一律报
+            # 「无法比较 Color 与 Color」，只能拿 match 绕。
+            # 带载荷的仍然拦：只比 tag 会让 Circle(2.0) == Circle(3.0) 成立，
+            # 那是悄悄给错答案，比报错糟糕得多。
+            if lt.kind == "enum" and rt.kind == "enum" and e.op in ("==", "!="):
+                if lt.name != rt.name:
+                    self.error(f"无法比较 {lt} 与 {rt}（不是同一个枚举）", e)
+                if any(fl for _vn, fl, _vi in (lt.variants or [])):
+                    self.error(
+                        f"枚举 {lt.name} 的变体带载荷，'{e.op}' 比不出来："
+                        f"只比 tag 会让 Circle(2.0) {e.op} Circle(3.0) 成立。"
+                        f"要么用 match 分支处理，要么给这个类型写个 eq 方法", e)
+                e.ty = BOOL
+                return BOOL
             self.error(f"无法比较 {lt} 与 {rt}", e)
         # 算术
         if lt.kind == "ptr" and rt.kind == "int" and e.op in ("+", "-"):

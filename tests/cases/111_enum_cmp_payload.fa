@@ -1,0 +1,11 @@
+# expect-compile-error: 变体带载荷
+# expect-compile-error: Circle(2.0) == Circle(3.0)
+# 带载荷的枚举不能只比 tag：那样 Circle(2.0) == Circle(3.0) 会成立，
+# 悄悄给错答案。要么用 match，要么自己写 eq 方法。
+enum Shape:
+    Dot
+    Circle(r: f64)
+
+fn main() -> i64:
+    print(Shape.Circle(1.0) == Shape.Circle(1.0))
+    return 0

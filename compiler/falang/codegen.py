@@ -2093,6 +2093,18 @@ class FnGen:
             # 操作数如果本身是新临时值（比如 `("a"+"b") == c` 的左边），
             # 拼接那边已经登记过了，这里不用管。
             return c
+        # 枚举（不带载荷）：两边的值都是「tag + 载荷」那块存储的地址，
+        # tag 在偏移 0，直接读出来比。sema 已经保证带载荷的枚举走不到这里。
+        if lt.kind == "enum" and rt.kind == "enum" and op in ("==", "!="):
+            a = self.gen_expr(e.left)
+            b = self.gen_expr(e.right)
+            ta = self.new_temp(I64)
+            self.emit("LOAD", ta, [a], extra=0, ty=I64)
+            tb = self.new_temp(I64)
+            self.emit("LOAD", tb, [b], extra=0, ty=I64)
+            c = self.new_temp(BOOL)
+            self.emit("CMP", c, [ta, tb], extra=op, ty=I64)
+            return c
         # 指针算术
         if lt.kind == "ptr" and rt.kind == "int" and op in ("+", "-"):
             a = self.gen_expr(e.left)

@@ -796,14 +796,27 @@ class Parser:
                 self.next()
             if self.at("NEWLINE"):
                 self.next()
-            self.expect("INDENT")
-            while not self.at("DEDENT"):
-                self.skip_terms()
-                if self.at("DEDENT"):
-                    break
-                arms.append(self.parse_arm())
-                self.skip_terms()
-            self.accept("DEDENT")
+            if self.at("INDENT"):
+                self.expect("INDENT")
+                while not self.at("DEDENT"):
+                    self.skip_terms()
+                    if self.at("DEDENT"):
+                        break
+                    arms.append(self.parse_arm())
+                    self.skip_terms()
+                self.accept("DEDENT")
+            else:
+                # 在括号里（`print(match s: ...)`）换行和缩进都不算数 —— 词法层
+                # 在括号内根本不发 NEWLINE / INDENT，这里等不到 INDENT。
+                # 以前一律 expect("INDENT")，报「期望 'INDENT'，实际得到 'STR'」，
+                # 指着模式那个字面量，谁也看不出是「在括号里」这件事。
+                # 现在一路解析分支到右括号为止（和花括号写法同一条路）。
+                while not self.at("EOF"):
+                    self.skip_terms()
+                    if self.at(P, ")") or self.at("EOF"):
+                        break
+                    arms.append(self.parse_arm())
+                    self.skip_terms()
         return Match(subject=subj, arms=arms)
 
     def parse_arm(self) -> MatchArm:
