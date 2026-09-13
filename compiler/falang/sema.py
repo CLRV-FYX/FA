@@ -1068,6 +1068,18 @@ class Sema:
                                           x, "Vec 元素")
                 e.ty = expect
                 return e.ty
+            if expect is not None and expect.kind == "arr":
+                # `let a: [u8; 4] = [1, 2, 3, 4]`、`let g: [f64; 2] = [1, 2]`：
+                # 标注明明写了元素类型，字面量里的整数就该按它转（和上面 Vec 那条一样）。
+                # 以前只有 vec 有这条路，数组一律先按第一个元素推成 [i64 x N] 再和标注比，
+                # 于是 `[u8; 4] = [1,2,3,4]` 报「期望 [u8 x 4]，实际 [i64 x 4]」——
+                # 而 `[u8; 4]` 正是写字节缓冲最自然的写法。个数仍然要对上
+                # （推出来的是 [u8 x 2] 就还是和 [u8 x 4] 不匹配）。
+                for x in e.elems:
+                    self.check_assignable(expect.elem, self.expr(x, expect=expect.elem),
+                                          x, "数组元素")
+                e.ty = arr_of(expect.elem, len(e.elems))
+                return e.ty
             et = self.expr(e.elems[0])
             for x in e.elems[1:]:
                 t2 = self.expr(x)

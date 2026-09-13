@@ -210,9 +210,18 @@ FaStr *fa_str_new(const char *s, int64_t len) {
 
 FaStr *fa_str_from_cstr(const char *s) { return fa_str_new(s, s ? (int64_t)strlen(s) : 0); }
 
+/* 一份**永生**的空串（rc = -1：fa_rc_inc / fa_rc_dec 见到负数都直接返回）。
+   凡是「传进来是 NULL，就拿空串顶上」的地方都用它。以前一律调
+   FA_EMPTY，每次都在堆上分配 17 字节，而 fa_str_concat / fa_str_cmp
+   里当替身的那两份**从来没人释放** —— `let m: [str; 2]` 不初始化（槽里是 NULL）
+   再 `m.to_str()`，ASan 实测漏 34 字节 2 个对象，正好是两份替身空串。
+   返回给调用方的那些也顺手换了：省一次分配，调用方 rc_dec 时对永生对象是空操作。 */
+static struct { FaStr s; char nul; } fa_empty_store = { { -1, 0 }, 0 };
+#define FA_EMPTY ((FaStr *)&fa_empty_store)
+
 FaStr *fa_str_concat(FaStr *a, FaStr *b) {
-    if (!a) a = fa_str_from_cstr("");
-    if (!b) b = fa_str_from_cstr("");
+    if (!a) a = FA_EMPTY;
+    if (!b) b = FA_EMPTY;
     int64_t n = a->len + b->len;
     FaStr *r = (FaStr *)fa_alloc((int64_t)sizeof(FaStr) + n + 1);
     r->rc = 1; r->len = n;
@@ -226,14 +235,19 @@ int64_t fa_str_len(FaStr *s) { return s ? s->len : 0; }
 
 int64_t fa_str_eq(FaStr *a, FaStr *b) {
     if (a == b) return 1;
-    if (!a || !b) return 0;
+    /* NULL 就当空串：其它地方（len / to_str / 拼接 / 比较大小）都是这么办的，
+       只有这里以前直接返回 0，于是未初始化的 `[str; 2]` 里那两个 NULL 元素
+       `s[0] == ""` 是 false、`s[0] == s[1]`（两个都是 NULL，走不到上面 a == b）
+       也是 false —— 打印出来明明是 ""、长度明明是 0。 */
+    if (!a) a = FA_EMPTY;
+    if (!b) b = FA_EMPTY;
     if (a->len != b->len) return 0;
     return memcmp(a->data, b->data, (size_t)a->len) == 0 ? 1 : 0;
 }
 
 int64_t fa_str_cmp(FaStr *a, FaStr *b) {
-    if (!a) a = fa_str_from_cstr("");
-    if (!b) b = fa_str_from_cstr("");
+    if (!a) a = FA_EMPTY;
+    if (!b) b = FA_EMPTY;
     int64_t n = a->len < b->len ? a->len : b->len;
     int c = memcmp(a->data, b->data, (size_t)n);
     if (c) return c;
@@ -241,7 +255,7 @@ int64_t fa_str_cmp(FaStr *a, FaStr *b) {
 }
 
 FaStr *fa_str_slice(FaStr *s, int64_t a, int64_t b) {
-    if (!s) return fa_str_from_cstr("");
+    if (!s) return FA_EMPTY;
     if (a < 0) a = 0;
     if (b > s->len) b = s->len;
     if (b < a) b = a;
@@ -702,7 +716,7 @@ int64_t fa_str_ends(FaStr *s, FaStr *p) {
 }
 
 FaStr *fa_str_trim(FaStr *s) {
-    if (!s) return fa_str_from_cstr("");
+    if (!s) return FA_EMPTY;
     int64_t a = 0, b = s->len;
     while (a < b && (unsigned char)s->data[a] <= ' ') a++;
     while (b > a && (unsigned char)s->data[b - 1] <= ' ') b--;
@@ -710,7 +724,7 @@ FaStr *fa_str_trim(FaStr *s) {
 }
 
 FaStr *fa_str_upper(FaStr *s) {
-    if (!s) return fa_str_from_cstr("");
+    if (!s) return FA_EMPTY;
     FaStr *r = fa_str_new(s->data, s->len);
     for (int64_t i = 0; i < r->len; i++)
         if (r->data[i] >= 'a' && r->data[i] <= 'z') r->data[i] -= 32;
@@ -718,7 +732,7 @@ FaStr *fa_str_upper(FaStr *s) {
 }
 
 FaStr *fa_str_lower(FaStr *s) {
-    if (!s) return fa_str_from_cstr("");
+    if (!s) return FA_EMPTY;
     FaStr *r = fa_str_new(s->data, s->len);
     for (int64_t i = 0; i < r->len; i++)
         if (r->data[i] >= 'A' && r->data[i] <= 'Z') r->data[i] += 32;
@@ -839,7 +853,7 @@ FaVec *fa_str_codepoints(FaStr *s) {
 }
 
 FaStr *fa_str_slice_chars(FaStr *s, int64_t a, int64_t b) {
-    if (!s) return fa_str_from_cstr("");
+    if (!s) return FA_EMPTY;
     int64_t n = fa_str_char_len(s);
     if (a < 0) a = 0;
     if (b > n) b = n;
@@ -1361,16 +1375,16 @@ FaStr *fa_read_line(void) {
         if (n + 2 > cap) { cap *= 2; char *t = (char *)fa_alloc((int64_t)cap); memcpy(t, buf, n); fa_free(buf); buf = t; }
         buf[n++] = (char)c;
     }
-    if (c == EOF && n == 0) { fa_free(buf); return fa_str_from_cstr(""); }
+    if (c == EOF && n == 0) { fa_free(buf); return FA_EMPTY; }
     FaStr *r = fa_str_new(buf, (int64_t)n);
     fa_free(buf);
     return r;
 }
 
 FaStr *fa_file_read(FaStr *path) {
-    if (!path) return fa_str_from_cstr("");
+    if (!path) return FA_EMPTY;
     FILE *f = fopen(path->data, "rb");
-    if (!f) return fa_str_from_cstr("");
+    if (!f) return FA_EMPTY;
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
     char *buf = (char *)fa_alloc((int64_t)sz + 1);
     size_t got = fread(buf, 1, (size_t)sz, f);
@@ -1391,9 +1405,9 @@ int64_t fa_file_write(FaStr *path, FaStr *content) {
 }
 
 FaStr *fa_system_capture(FaStr *cmd) {
-    if (!cmd) return fa_str_from_cstr("");
+    if (!cmd) return FA_EMPTY;
     FILE *p = popen(cmd->data, "r");
-    if (!p) return fa_str_from_cstr("");
+    if (!p) return FA_EMPTY;
     size_t cap = 4096, n = 0;
     char *buf = (char *)fa_alloc((int64_t)cap);
     while (fgets(buf + n, (int)(cap - n), p)) {
@@ -1407,7 +1421,7 @@ FaStr *fa_system_capture(FaStr *cmd) {
 }
 
 FaStr *fa_env(FaStr *name) {
-    if (!name) return fa_str_from_cstr("");
+    if (!name) return FA_EMPTY;
     const char *v = getenv(name->data);
     return fa_str_from_cstr(v ? v : "");
 }
