@@ -423,8 +423,20 @@ class FnGen:
             return b
         if isinstance(b, int) and b == 0:
             return a
+        # 常量偏移必须包成 Const 再进 IR：直接塞一个 Python int 进去，
+        # 汇编生成器认不出来，抛「bad operand 16」把编译器崩掉。
+        # 触发条件很平常 —— 结构体里有个数组字段，而它**不是第一个**字段：
+        #     struct S:
+        #         n: i64 = 0
+        #         a: [i64; 3] = [0, 0, 0]
+        #     s.a[1] = 7          # 数组字段偏移 8，下标偏移是运行时算的
+        # 外层偏移是常量 8、内层是 Temp，两边一相加就撞上这条路。
+        # 偏移为 0（数组正好是第一个字段）时上面几个分支会短路，所以看着像好的。
         r = self.new_temp(I64)
-        self.emit("BIN", r, [a, b], extra="+", ty=I64)
+        self.emit("BIN", r,
+                  [self.const(a) if isinstance(a, int) else a,
+                   self.const(b) if isinstance(b, int) else b],
+                  extra="+", ty=I64)
         return r
 
     def add_off(self, off, delta: int):
