@@ -207,6 +207,56 @@ class Sema:
     # 宽度表。与其留着一串坑，编译期就说清楚。
     MAP_KEY_BAD = ("struct", "enum", "vec", "map", "arr")
 
+    def check_index_arg(self, at, node, ctx):
+        """下标 / 长度这类实参必须是整数。
+
+        以前不查，`v.get("0")` 会被 coerce 成 fa_str_to_i64("0") = 0，
+        静默取到第 0 个元素；`v.resize("3")` 同理。
+        """
+        if at is not None and at.kind not in ("int", "bool", "char", "any"):
+            self.error(f"{ctx}必须是整数，得到 {at}"
+                       f"（字符串要先 .to_i64()）", node)
+
+    def check_container_args(self, ot, e):
+        """`v.push(x)` / `m.set(k, v)` 的实参类型。
+
+        以前内建方法只查**参数个数**，不查类型，于是容器这条路比赋值松得多：
+        `let n: i64 = "42"` 是编译错误，`Vec<i64>` 上 `v.push("42")` 却编得过 ——
+        codegen 的 coerce 会把它当 fa_str_to_i64 解析，`v.push("x")` 解析不出数字
+        就静默存了个 0；反过来 `Vec<str>.push(7)` 也是靠 coerce 悄悄 to_str。
+        下标赋值 `v[0] = "x"` 倒是查的（报「类型不匹配，期望 i64，实际 str」），
+        同一个意思两种规矩。现在统一走 check_assignable：**能赋给 T 变量的，
+        才能推进 Vec<T> / 当 Map<K,V> 的键值**，要转就写明白（str(7) / s.to_i64()）。
+        """
+        name, args = e.name, e.args
+        ats = [a.ty for a in args]
+        if ot.kind == "vec":
+            et = ot.elem
+            if name == "push" and len(ats) == 1 and et is not None:
+                self.check_assignable(et, ats[0], args[0], "Vec 元素")
+            elif name == "set" and len(ats) == 2:
+                self.check_index_arg(ats[0], args[0], "下标")
+                if et is not None:
+                    self.check_assignable(et, ats[1], args[1], "Vec 元素")
+            elif name == "get" and len(ats) == 1:
+                self.check_index_arg(ats[0], args[0], "下标")
+            elif name == "resize":
+                if ats:
+                    self.check_index_arg(ats[0], args[0], "新长度")
+                if len(ats) == 2 and et is not None:
+                    self.check_assignable(et, ats[1], args[1], "填充值")
+            elif name in ("contains", "index_of") and len(ats) == 1 and et is not None:
+                self.check_assignable(et, ats[0], args[0], f"{name}() 的实参")
+        elif ot.kind == "map":
+            kt, vt = ot.key, ot.val
+            if name == "set" and len(ats) == 2:
+                if kt is not None:
+                    self.check_assignable(kt, ats[0], args[0], "Map 的键")
+                if vt is not None:
+                    self.check_assignable(vt, ats[1], args[1], "Map 的值")
+            elif name in ("get", "has", "del") and len(ats) == 1 and kt is not None:
+                self.check_assignable(kt, ats[0], args[0], "Map 的键")
+
     # sort / min / max / contains / index_of / sum 都要**按内容**比较或累加元素。
     # 运行时只实现了三种元素：整数（按位）、浮点（按值）、str（cmp_strp 逐字节
     # memcmp，contains 里 kind==1 也特判了内容比较）。结构体/枚举/容器在表里存的是
@@ -1597,8 +1647,10 @@ class Sema:
                     f"{lo}~{hi} 个" if hi is not None else f"至少 {lo} 个")
                 self.error(f"{ot}.{e.name}() 需要 {want}参数，这里给了 {n} 个", e)
             e.resolved = "builtin-method"
-            if ot.kind == "vec":
-                self.check_vec_content_op(ot.elem, e.name, e)
+            if ot.kind in ("vec", "map"):
+                self.check_vec_content_op(ot.elem if ot.kind == "vec" else None,
+                                          e.name, e)
+                self.check_container_args(ot, e)
             if e.name == "to_f64":
                 e.ty = TYPES["f64"]
             elif e.name in ("len", "at", "to_i64", "find", "bytes",
