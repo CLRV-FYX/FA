@@ -131,7 +131,11 @@ class FnGen:
         # 它们的存储是栈上的 alloca，语句结束时若没被谁接管就必须就地释放字段。
         self.agg_owned: List[Tuple[Temp, Type]] = []
         self.agg_owned_ids: set = set()
-        self.loop_stack: List[Tuple[str, str]] = []  # (continue_label, break_label)
+        # (continue 标签, break 标签, continue 要收尾到哪个作用域为止,
+        #  break 要收尾到哪个作用域为止)。后两个是「停在这层之外」的意思：
+        #  break / continue 会跳出若干层块，被跳过的那些块里的 defer 与引用
+        #  释放必须在跳转之前就地补一份（与 return 的 unwind_scopes 同理）。
+        self.loop_stack: List[Tuple[str, str, object, object]] = []
         self.temp_tys: dict = {}
         # 目标驱动代码生成：调用方（赋值/let）可以把「结果该写到哪个 Temp」作为提示传进来，
         # 让 x = x + 1 直接生成 add 而不是「算到临时寄存器再搬回去」。
@@ -510,6 +514,23 @@ class FnGen:
         self.gen_expr(d)
         self.flush_owned_since(ref_before, agg_before)
 
+    def unwind_to(self, stop_scope):
+        """把 stop_scope **之内**的作用域按 defer + 引用释放收尾（不清空登记表）。
+
+        break / continue 会直接跳走，被跳过的那些块里的 `defer` 和局部引用
+        就永远不会执行/释放了：`for i in 0..3 { defer write("d") ; break }`
+        的 defer 不跑，`while ... { let s = "a"+"b"; break }` 每轮漏一个 FaStr。
+        这里就地补一份清理指令再跳转 —— 和 return 走的 unwind_scopes 是同一套
+        道理；正常路径那份清理代码仍在原地，两条路径各自只执行一次。
+        """
+        sc = self.scope
+        while sc is not None and sc is not stop_scope:
+            for d in reversed(sc.defers):
+                self.gen_deferred(d)
+            for loc, ty in reversed(sc.drops):
+                self.emit_drop(loc, ty)
+            sc = sc.parent
+
     def unwind_scopes(self):
         """`return` 之前，把当前仍然打开的所有作用域的 defer 与引用释放补上。
 
@@ -563,10 +584,12 @@ class FnGen:
         elif isinstance(s, Break):
             if not self.loop_stack:
                 self.err("break 不在循环内", s)
+            self.unwind_to(self.loop_stack[-1][3])
             self.emit("JMP", extra=self.loop_stack[-1][1])
         elif isinstance(s, Continue):
             if not self.loop_stack:
                 self.err("continue 不在循环内", s)
+            self.unwind_to(self.loop_stack[-1][2])
             self.emit("JMP", extra=self.loop_stack[-1][0])
         elif isinstance(s, Defer):
             self.scope.defers.append(s.call)
@@ -890,7 +913,9 @@ class FnGen:
         end_lbl = self.new_label("fend")
         self.emit("JMP", extra=cond_lbl)
         self.emit("LABEL", extra=body_lbl)
-        self.loop_stack.append((cont_lbl, end_lbl))   # (continue, break)
+        # 这层作用域（装 `let i = 0`）在 end_lbl 之后才 pop，break / continue
+        # 都会经过那里，所以清理只做到这层为止，不重复释放
+        self.loop_stack.append((cont_lbl, end_lbl, self.scope, self.scope))
         self.gen_block(s.body)
         self.loop_stack.pop()
         self.emit("LABEL", extra=cont_lbl)
@@ -913,7 +938,8 @@ class FnGen:
         c = self.gen_cond(s.cond)
         self.emit("BR", args=[c], extra=(body, end))
         self.emit("LABEL", extra=body)
-        self.loop_stack.append((top, end))
+        outer = self.scope
+        self.loop_stack.append((top, end, outer, outer))
         self.gen_block(s.body)
         self.loop_stack.pop()
         self.emit("JMP", extra=top)
@@ -923,7 +949,8 @@ class FnGen:
         top = self.new_label("loop")
         end = self.new_label("loopE")
         self.emit("LABEL", extra=top)
-        self.loop_stack.append((top, end))
+        outer = self.scope
+        self.loop_stack.append((top, end, outer, outer))
         self.gen_block(s.body)
         self.loop_stack.pop()
         self.emit("JMP", extra=top)
@@ -1056,9 +1083,17 @@ class FnGen:
         if vloc is None:
             vloc = VarLoc("temp", vt, vty)
         sc.vars[s.var] = vloc
-        self.loop_stack.append((top, end))
+        # continue 必须跳到「自增之前」，不能跳到循环头：下标自增是在循环体
+        # 之后发的，跳到 top 就等于永远不自增 —— `for k in 0..5 { if k == 2 {
+        # continue } }` 会**死循环挂住**（while / C 风格 for / loop 各自都对，
+        # 只有 for-in 这条把 continue 目标写成了 top）。
+        # 标签放在 pop_scope 之前，这样 continue 与正常走完一轮一样，
+        # 都会执行本次迭代的作用域清理（defer / 块内引用）再自增。
+        step = self.new_label("fstep")
+        self.loop_stack.append((step, end, sc, sc.parent))
         self.gen_block(s.body)
         self.loop_stack.pop()
+        self.emit("LABEL", extra=step)
         self.pop_scope()
         self.emit("BIN", idx, [idx, self.const(1)], extra="+", ty=I64)
         self.emit("JMP", extra=top)
