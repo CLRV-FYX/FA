@@ -1463,9 +1463,14 @@ class Sema:
                 if lt.name != rt.name:
                     self.error(f"无法比较 {lt} 与 {rt}（不是同一个枚举）", e)
                 if any(fl for _vn, fl, _vi in (lt.variants or [])):
+                    # 举例要用**这个**枚举自己的变体名：写成 Circle(2.0) == Circle(3.0)
+                    # 的话，比较 Maybe 时报出来一堆 Circle，看着像串了台。
+                    ex = next((vn for vn, fl, _vi in (lt.variants or []) if fl), None)
+                    hint = (f"只比 tag 的话，{ex}(…) 和 {ex}(…) 载荷不同也会算相等"
+                            if ex else "只比 tag 会漏掉载荷")
                     self.error(
                         f"枚举 {lt.name} 的变体带载荷，'{e.op}' 比不出来："
-                        f"只比 tag 会让 Circle(2.0) {e.op} Circle(3.0) 成立。"
+                        f"{hint}（悄悄给错答案）。"
                         f"要么用 match 分支处理，要么给这个类型写个 eq 方法", e)
                 e.ty = BOOL
                 return BOOL
