@@ -37,7 +37,10 @@ void fa_register_drop(int64_t id, void (*fn)(void *)) {
 /* ============================================================ 内存与 RC */
 void *fa_alloc(int64_t size) {
     void *p = malloc(size > 0 ? (size_t)size : 1);
-    if (!p) { fa_sys_write(2, "out of memory\n", 14); fa_sys_exit(134); }
+    if (!p) {
+        static const char msg[] = "panic: 内存不够（malloc 返回 NULL）\n";
+        fa_sys_write(2, msg, (int64_t)(sizeof(msg) - 1)); fa_sys_exit(134);
+    }
     return p;
 }
 
@@ -957,14 +960,14 @@ void fa_vec_push(FaVec *v, uint64_t val) {
 
 uint64_t fa_vec_get(FaVec *v, int64_t i) {
     if (!v || i < 0 || i >= v->len) {
-        fa_sys_write(2, "vec index out of range\n", 23); fa_sys_exit(1);
+        fa_bounds_error(i, v ? v->len : 0);   /* 和 a[i] 越界同一套报错：长度和下标都打出来 */
     }
     return vec_load(v, i);
 }
 
 void fa_vec_set(FaVec *v, int64_t i, uint64_t val) {
     if (!v || i < 0 || i >= v->len) {
-        fa_sys_write(2, "vec index out of range\n", 23); fa_sys_exit(1);
+        fa_bounds_error(i, v ? v->len : 0);
     }
     uint64_t old = vec_load(v, i);
     fa_agg_inc((void *)(uintptr_t)val, v->kind);
@@ -974,7 +977,8 @@ void fa_vec_set(FaVec *v, int64_t i, uint64_t val) {
 
 uint64_t fa_vec_pop(FaVec *v) {
     if (!v || v->len == 0) {
-        fa_sys_write(2, "pop from empty vec\n", 19); fa_sys_exit(1);
+        static const char msg[] = "panic: 从空 Vec 里 pop（没有元素可取）\n";
+        fa_sys_write(2, msg, (int64_t)(sizeof(msg) - 1)); fa_sys_exit(1);
     }
     return vec_load(v, --v->len);
 }
@@ -1446,7 +1450,12 @@ int64_t fa_gcd(int64_t a, int64_t b) { while (b) { int64_t t = a % b; a = b; b =
 /* ============================================================ 动态库 */
 void *fa_dl_open(const char *path) {
     void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
-    if (!h) { fa_sys_write(2, "dlopen failed: ", 15); fa_sys_write(2, path, (int64_t)strlen(path)); fa_sys_write(2, "\n", 1); }
+    if (!h) {
+        static const char pre[] = "panic: 打不开动态库 ";
+        fa_sys_write(2, pre, (int64_t)(sizeof(pre) - 1));
+        fa_sys_write(2, path, (int64_t)strlen(path));
+        fa_sys_write(2, "\n", 1);
+    }
     return h;
 }
 

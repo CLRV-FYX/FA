@@ -1,0 +1,11 @@
+# Map 取不存在的键：值类型是容器/结构体时给不出能用的零值，直接报错并把写法教给你。
+# （标量值类型不报错：i64 给 0、bool 给 false、str 给 ""。）
+# expect-exit: 1
+# expect-stderr: 里没有键
+fn main() -> i64:
+    let m = Map<str, i64>()
+    m.set("有", 1)
+    print(m.get("没有"), m.has("没有"))      # 标量：0 和 false，不报错
+    let n = Map<str, Vec<i64>>()
+    print(n.get("也没有"))                   # 容器：报错
+    return 0

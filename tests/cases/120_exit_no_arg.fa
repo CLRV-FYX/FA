@@ -1,0 +1,9 @@
+# exit() 不带参数 = exit(0)：正常结束，退出码 0。
+# 以前代码生成阶段直接取第一个参数，一个都没给就炸出 Python IndexError。
+# expect-exit: 0
+# expect-stdout: 收尾做完了
+fn main() -> i64:
+    print("开始")
+    print("收尾做完了")
+    exit()
+    return 99

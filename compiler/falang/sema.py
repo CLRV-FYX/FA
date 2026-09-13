@@ -1592,6 +1592,8 @@ class Sema:
                 e.ty = TYPES["f64"] if (not ats or ats[0].is_float) else TYPES["i64"]
             elif name in ("assert", "print", "println", "write", "exit",
                           "sleep", "panic"):
+                if name == "exit" and len(e.args) > 1:
+                    self.error(f"exit() 最多一个参数（退出码），这里给了 {len(e.args)} 个", e)
                 e.ty = VOID
             elif name == "contains":
                 if ats and ats[0].kind == "vec":

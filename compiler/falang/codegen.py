@@ -3240,6 +3240,12 @@ class FnGen:
             self.emit("LABEL", extra=l_ok)
             return self.const(0, VOID)
         if name == "exit":
+            # `exit()` 不写参数就是「正常结束」，退出码 0。
+            # 以前这里直接取 e.args[0]，参数一个没给就在代码生成阶段炸出一个
+            # Python IndexError（连栈回溯一起打到用户脸上）。
+            if not e.args:
+                self.emit("CALL", None, [Sym("fa_exit"), self.const(0, I64)])
+                return self.const(0, VOID)
             v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
             self.emit("CALL", None, [Sym("fa_exit"), v])
             return self.const(0, VOID)
