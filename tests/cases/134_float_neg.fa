@@ -1,0 +1,69 @@
+# 浮点取负：`-x` 在 x 是**寄存器里的**浮点值时必须真的取负。
+#
+# 回归：以前 asmgen 把浮点取负降成 `xorpd d,d; subsd d,a`（0 - x），
+# 而 UN 在 regalloc 的 COPY_LIKE_OPS 名单里，d 和 a 会被合并成同一个寄存器 ——
+# 于是先把操作数清零，再算 0-0：
+#     fn neg(x: f64) -> f64: return -x      永远返回 0.0
+# 只有当操作数正好在寄存器里（函数参数、刚算出来的中间值）才会撞上；
+# 操作数在栈槽里时 d != a，代码是对的 —— 所以这个 bug 看起来时好时坏，
+# 换个上下文（多一个 print 参数、多一个函数调用）结果就变了。
+# 现在改成翻转符号位：`movsd d,a`（必要时）+ `xorpd d, [rip+__fa_negmask]`，
+# 一条指令、就地、不需要暂存寄存器，d 和 a 是不是同一个都无所谓。
+# 掩码本身要 16 字节对齐（xorpd 的内存操作数是 128 位打包操作数，
+# 不对齐就是 #GP，表现为段错误）。
+
+fn neg(x: f64) -> f64:
+    return -x
+
+fn twice(x: f64) -> f64:
+    return -(-x)
+
+fn sum_neg(a: f64, b: f64) -> f64:
+    return -a + -b
+
+let G: f64 = 2.5
+
+fn main() -> i64:
+    # 1) 函数参数取负（以前必然是 0.0）
+    print("neg(3.7)        =", neg(3.7))
+    print("neg(-3.7)       =", neg(-3.7))
+    print("neg(0.0)        =", neg(0.0))
+
+    # 2) 局部变量取负
+    let z = 3.7
+    print("-z              =", -z)
+    print("str(-z)         =", str(-z))
+    let a = -z
+    print("let a = -z      =", a)
+
+    # 3) 取负两次 = 原值
+    print("twice(1.25)     =", twice(1.25))
+
+    # 4) 表达式里混着算
+    print("-z + 0.0        =", -z + 0.0)
+    print("1.0 - -z        =", 1.0 - -z)
+    print("-z * 2.0        =", -z * 2.0)
+    print("sum_neg(1.5, 2) =", sum_neg(1.5, 2.0))
+
+    # 5) 字面量与全局
+    print("-3.7            =", -3.7)
+    print("-G              =", -G)
+
+    # 6) 取负再转整数：截断向零
+    print("-z as i64       =", -z as i64)
+    print("(-z) as i64     =", (-z) as i64)
+    print("-(z as i64)     =", -(z as i64))
+
+    # 7) 整数取负一直是好的，一并钉住
+    let i = 5
+    print("-i              =", -i)
+    print("str(-i)         =", str(-i))
+
+    # 8) 比较也要跟着对：-0.0 == 0.0，但 -z < 0
+    if -z < 0.0:
+        print("-z < 0          = 是")
+    if neg(1.0) < neg(2.0):
+        print("neg(1) < neg(2) = 否")
+    else:
+        print("neg(1) < neg(2) = 是（-1 > -2）")
+    return 0

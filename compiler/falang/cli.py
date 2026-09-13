@@ -15,6 +15,7 @@ USAGE = """FA (FYX-all) 编译器  ——  功能完全 + 极致速度
   run      编译并立即运行
   asm      只输出 x86-64 汇编（打到 stdout，并存一份 <源文件名>.s；-o 可指定路径）
   check    只做语法/类型检查，不生成代码
+  bind     把 C 头文件自动翻成 FA 的绑定（`fa bind zlib.h --lib z -o zlib.fa`）
   tokens   转储词法分析结果（自举比对用）
   ast      转储语法树（自举比对用）
   version  显示版本与环境信息
@@ -52,6 +53,11 @@ def main(argv=None) -> int:
         return 0
 
     cmd = argv[0]
+    if cmd == "bind":
+        # C 头文件 → FA 绑定。参数规矩和 build/run 完全不同（收的是 .h，不是 .fa），
+        # 所以在通用解析之前就走掉。
+        from .bindgen import main as bind_main
+        return bind_main(argv[1:])
     rest = argv[1:]
     out = None
     opt = 2

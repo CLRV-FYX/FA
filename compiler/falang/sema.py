@@ -701,6 +701,14 @@ class Sema:
         ret = self.resolve_type(d.ret) if d.ret is not None else VOID
         sym = FnSym(d.name, params, ret, varargs=d.varargs,
                     extern=extern or d.extern, cname=d.cname, decl=d)
+        if d.cname and d.body is not None:
+            # `fn f(a: i64) -> i64 = "g"` 后面还跟了函数体：符号名是给**外部**
+            # 已经存在的函数用的别名，自己写了体就没有「另一个符号」可指。
+            self.error(
+                f"'{d.name}' 既给了 C 符号名 '{d.cname}' 又写了函数体："
+                "= 符号名 只能用在 extern / use c / use lib 的**声明**上"
+                "（声明 C 那边已经存在的函数，顺便在 FA 侧换个不撞车的名字）", d)
+            d.cname = None
         if sym.extern and d.body is not None:
             # `extern "C": fn fa_add(a: i64, b: i64) -> i64: return a + b` 以前一路
             # 走到代码生成，在那儿炸出 AttributeError（extern 的符号没有解析过

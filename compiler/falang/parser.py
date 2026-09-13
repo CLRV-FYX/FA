@@ -23,6 +23,9 @@ BIN_PREC = {
     "*": 10, "/": 10, "%": 10,
     "**": 12,
 }
+# `as` 不在 BIN_PREC 里（它是关键字，不是运算符），优先级固定在 11：
+# 比 * / %（10）紧，比 **（12）松，比一切一元运算松 —— 见 _parse_expr。
+AS_PREC = 11
 RIGHT_ASSOC = {"**"}
 CMP_OPS = {"==", "!=", "<", "<=", ">", ">="}
 
@@ -308,6 +311,14 @@ class Parser:
         fn = FnDef(name=name, params=params, ret=ret, body=None,
                    varargs=self._last_varargs)
         fn.line, fn.col = line, col
+        # `fn 本地名(...) -> T = "C 里的符号名"`：声明一个外部符号，同时给它换个
+        # FA 侧的名字。C 库里一大堆名字和 FA 的内建函数撞车（free / exit / pow /
+        # sqrt / abs / min / max / log / exp / floor / ceil / random / env / cmd /
+        # len / str / sum / sort / join / keys / values ...），撞了以后内建的会被
+        # 悄悄顶掉，写的人还以为在用内建的。显式改名比隐式遮蔽安全得多。
+        if self.at_op("=") and self.peek(1).kind == "STR":
+            self.next()
+            fn.cname = self.next().value
         if self.at(P, ";"):            # 纯声明：fn f(...);
             self.next()
             return fn
@@ -935,6 +946,17 @@ class Parser:
                 rhs = self.parse_expr(nxt_min)
                 lhs = Binary(op, lhs, rhs)
                 continue
+            if t.kind == KW and t.value == "as":
+                # `as` 比 * / % 紧（10），比一元运算松：于是 `&m as *T` 读成
+                # `(&m) as *T`（要的正是这个），`a * b as i64` 还是 `a * (b as i64)`。
+                # 以前 `as` 挂在 parse_unary 的尾巴上，比 `&`/`*`/`-` 都紧，
+                # `&m as *T` 就成了 `&(m as *T)` —— 拿一个 cast 表达式取地址，
+                # 代码生成直接报「表达式不可取址」，只能多写一对括号。
+                if 11 < min_prec:
+                    break
+                self.next()
+                lhs = Cast(lhs, self.parse_type())
+                continue
             if t.kind == KW and t.value in ("and", "or"):
                 prec = BIN_PREC[t.value]
                 if prec < min_prec:
@@ -976,13 +998,9 @@ class Parser:
         if t.kind == KW and t.value == "unsafe":
             self.next()
             return self.parse_unary()
-        e = self.parse_postfix(self.parse_primary())
-        # cast: expr as Type
-        if self.at_kw("as"):
-            self.next()
-            target = self.parse_type()
-            e = Cast(e, target)
-        return e
+        # cast 不在这里处理：`as` 是一元运算之外的一层（见 _parse_expr），
+        # 这样 `&x as *T`、`*p as i64`、`-x as f64` 都按直觉读。
+        return self.parse_postfix(self.parse_primary())
 
     def parse_postfix(self, e: Expr) -> Expr:
         tok = self.cur()

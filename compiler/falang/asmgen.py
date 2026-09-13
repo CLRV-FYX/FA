@@ -93,6 +93,7 @@ class AsmGen:
         self.opt = opt
         self.out: List[str] = []
         self.float_consts: Dict[float, str] = {}
+        self.need_neg_mask = False
         self.cur: Optional[IRFunc] = None
         self.loc: Dict[int, str] = {}
         self.spills: Dict[int, int] = {}
@@ -192,12 +193,19 @@ class AsmGen:
         # 模块初始化（.init_array）
         self.emit_init()
         # 浮点常量区
-        if self.float_consts:
+        if self.float_consts or self.need_neg_mask:
             self.R("    .section .rodata")
             for val, lbl in self.float_consts.items():
                 bits = struct.unpack("<Q", struct.pack("<d", val))[0]
                 self.R(f"{lbl}:")
                 self.R(f"    .quad {bits}")
+            if self.need_neg_mask:
+                # xorpd 的内存操作数是 128 位打包操作数，SSE2 要求 16 字节对齐，
+                # 不对齐就是 #GP（表现为段错误）。所以既要对齐，也要真的给满 16 字节。
+                self.R("    .align 16")
+                self.R("__fa_negmask:")
+                self.R("    .quad -9223372036854775808    /* 0x8000000000000000：只有符号位 */")
+                self.R("    .quad 0                       /* 高 64 位：标量运算用不到 */")
         self.R("    .section .note.GNU-stack,\"\",@progbits")
         return "\n".join(o) + "\n"
 
@@ -580,6 +588,15 @@ class AsmGen:
 
     def spilled(self, t: Temp) -> bool:
         return t.id in self.spills
+
+    def neg_mask(self) -> str:
+        """浮点取负的符号位掩码（0x8000000000000000）的标签。
+
+        不能复用 float_const(-0.0)：Python 里 -0.0 == 0.0、hash 也一样，
+        放进那个按值查的字典会和 +0.0 撞键，掩码悄悄变成 0，取负就变成没取负。
+        """
+        self.need_neg_mask = True
+        return "__fa_negmask"
 
     def float_const(self, val: float) -> str:
         if val not in self.float_consts:
@@ -1086,8 +1103,14 @@ class AsmGen:
         d = self.dst_reg(ins, ctx)
         if op == "-":
             if is_float_ty(ty):
-                self.L(f"xorpd {d}, {d}")
-                self.L(f"subsd {d}, {a}")
+                # 取负 = 翻转符号位。以前写的是 `xorpd d,d; subsd d,a`，
+                # 而 UN 在 regalloc 的 COPY_LIKE_OPS 里、d 和 a 会被合并成同一个
+                # 寄存器 —— 于是先把操作数清零，再算 0-0：
+                #     fn neg(x: f64) -> f64: return -x     永远返回 0.0
+                # 参数在寄存器里（而不是栈槽里）的时候才会撞上，所以看起来时好时坏。
+                if d != a:
+                    self.L(f"movsd {d}, {a}")
+                self.L(f"xorpd {d}, [rip+{self.neg_mask()}]")
             else:
                 if d != a:
                     self.L(f"mov {d}, {a}")
@@ -1106,8 +1129,9 @@ class AsmGen:
                 self.L(f"mov {d}, {a}")
             self.L(f"not {d}")
         elif op == "f-":
-            self.L(f"xorpd {d}, {d}")
-            self.L(f"subsd {d}, {a}")
+            if d != a:
+                self.L(f"movsd {d}, {a}")
+            self.L(f"xorpd {d}, [rip+{self.neg_mask()}]")
         self.store_dst(ins, d)
 
     def emit_cmp(self, ins: Instr, ctx: Ctx):
