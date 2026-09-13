@@ -1,0 +1,7 @@
+# expect-compile-error: 需要 2 个参数
+# 内建方法的参数个数以前完全不查：给少了会在代码生成里 e.args[0] 越界，
+# 把 Python 的 IndexError traceback 甩给用户；给多了则被悄悄忽略
+# （`s.len(1)` 照样编译通过，返回 3）。两种现在都是编译期的中文报错。
+fn main() -> i64:
+    print("abc".slice(1))
+    return 0

@@ -44,6 +44,45 @@ BUILTIN_METHODS = {
 }
 
 
+# 内建方法的参数个数：(最少, 最多)，最多为 None 表示可变参数。
+# 以前不查：参数给少了会在代码生成里 `e.args[0]` 越界，抛一条 Python 的
+# IndexError traceback 给用户；给多了则被悄悄忽略（`s.len(1)` 照样编译）。
+# 两种都改成编译期的中文报错。
+METHOD_ARITY = {
+    "str": {"len": (0, 0), "at": (1, 1), "slice": (2, 2), "eq": (1, 1),
+            "find": (1, 1), "trim": (0, 0), "split": (1, 1), "contains": (1, 1),
+            "to_i64": (0, 0), "to_f64": (0, 0), "to_str": (0, 0), "bytes": (0, 0),
+            "upper": (0, 0), "lower": (0, 0), "starts_with": (1, 1),
+            "ends_with": (1, 1), "replace": (2, 2), "chars": (0, 0),
+            "cstr": (0, 0), "repeat": (1, 1), "count": (1, 1), "lines": (0, 0),
+            "trim_start": (0, 0), "trim_end": (0, 0), "char_len": (0, 0),
+            "char_at": (1, 1), "codepoints": (0, 0), "slice_chars": (2, 2)},
+    "vec": {"len": (0, 0), "push": (1, 1), "get": (1, 1), "set": (2, 2),
+            "pop": (0, 0), "clear": (0, 0), "contains": (1, 1), "to_str": (0, 0),
+            "resize": (1, 2), "sort": (0, 0), "reverse": (0, 0), "join": (1, 1),
+            "sum": (0, 0), "min": (0, 0), "max": (0, 0), "index_of": (1, 1)},
+    "map": {"len": (0, 0), "get": (1, 1), "set": (2, 2), "has": (1, 1),
+            "del": (1, 1), "clear": (0, 0), "to_str": (0, 0), "keys": (0, 0),
+            "values": (0, 0)},
+    "arr": {"len": (0, 0)},
+    "pyobj": {"to_str": (0, 0), "to_i64": (0, 0), "to_f64": (0, 0),
+              "call": (0, 1), "attr": (1, 1), "to_str_deep": (0, 0)},
+    "jobj": {"to_str": (0, 0), "to_i64": (0, 0), "to_f64": (0, 0),
+             "jcall_i64": (2, None), "jcall_f64": (2, None),
+             "jcall_obj": (2, None), "jcall_void": (2, None)},
+    "int": {"to_str": (0, 0), "abs": (0, 0), "to_f64": (0, 0), "to_i64": (0, 0)},
+    "float": {"to_str": (0, 0), "to_i64": (0, 0), "to_f64": (0, 0),
+              "floor": (0, 0), "ceil": (0, 0), "abs": (0, 0), "round": (0, 0),
+              "trunc": (0, 0), "sqrt": (0, 0), "log": (0, 0), "log2": (0, 0),
+              "log10": (0, 0), "exp": (0, 0), "exp2": (0, 0), "sin": (0, 0),
+              "cos": (0, 0), "tan": (0, 0)},
+}
+
+# .to_str() 在这些类型上都有实现（codegen 走 print 用的同一套字符串化路径）
+TOSTR_OK = ("str", "int", "float", "vec", "map", "arr", "struct", "enum",
+            "bool", "char", "ptr", "pyobj", "jobj")
+
+
 class FaTypeError(Exception):
     def __init__(self, msg, line=0, col=0):
         super().__init__(msg)
@@ -140,6 +179,7 @@ class Sema:
         self.cur_fn: Optional[FnSym] = None
         self.scope: Optional[Scope] = None
         self.loop_depth = 0
+        self.in_range = 0        # 正在检查 for 的遍历对象（range 只允许出现在这里）
         self.fn_bodies: List[Tuple[FnSym, Block, List[Param]]] = []
         self.py_used = False
         self.java_used = False
@@ -682,7 +722,12 @@ class Sema:
             self.stmt(s.body)
             self.loop_depth -= 1
         elif isinstance(s, For):
-            it = self.expr(s.iter)
+            # range 只有在 for 的遍历位置才有意义，检查期间打开这个开关
+            self.in_range += 1
+            try:
+                it = self.expr(s.iter)
+            finally:
+                self.in_range -= 1
             vty = None
             if it.kind == "arr":
                 vty = it.elem
@@ -1176,6 +1221,12 @@ class Sema:
             for side, t in (("左", lt), ("右", rt)):
                 if t.kind not in ("int", "bool", "char"):
                     self.error(f"range 的{side}端点必须是整数（或 char），得到 {t}", e)
+            if self.in_range == 0:
+                # `print(0..3)` / `let r = 0..10`：range 不是一等值，以前会一路
+                # 走到 asmgen 的二元运算符表 KeyError: '..'，甩一条 Python traceback。
+                self.error("范围 `起..止` 只能写在 for 的遍历位置（FA 的 range 不是"
+                           "一等值：不能存进变量、当参数传、也不能 print）。"
+                           "要一个整数序列请用 Vec<i64>，或直接 `for i in 起..止`", e)
             e.ty = Type("range", "range", 16, 8)
             return e.ty
         lt = self.expr(e.left)
@@ -1443,6 +1494,12 @@ class Sema:
         # 内建方法
         kind = ot.kind if ot.kind in BUILTIN_METHODS else None
         if kind and e.name in BUILTIN_METHODS[kind]:
+            lo, hi = METHOD_ARITY[kind].get(e.name, (0, None))
+            n = len(e.args)
+            if n < lo or (hi is not None and n > hi):
+                want = f"{lo} 个" if lo == hi else (
+                    f"{lo}~{hi} 个" if hi is not None else f"至少 {lo} 个")
+                self.error(f"{ot}.{e.name}() 需要 {want}参数，这里给了 {n} 个", e)
             e.resolved = "builtin-method"
             if e.name == "to_f64":
                 e.ty = TYPES["f64"]
@@ -1511,6 +1568,15 @@ class Sema:
             else:
                 e.ty = ANY
             return e.ty
+        # .to_str() 对任何有实现的类型都成立，等价于全局的 str(x)。
+        # 以前只有 str/int/float/vec/map 放行，结构体、数组、bool、char、指针上
+        # 调用会被拒 —— 而 codegen 里那条通用字符串化分支其实早就支持它们了。
+        if e.name == "to_str" and ot.kind in TOSTR_OK:
+            if e.args:
+                self.error(f"{ot}.to_str() 不接受参数，这里给了 {len(e.args)} 个", e)
+            e.resolved = "builtin-method"
+            e.ty = STR
+            return STR
         # UFCS：自由函数以对象作为首个参数
         fs = self.fns.get(e.name)
         if fs is not None and fs.params and fs.params[0] == ot:

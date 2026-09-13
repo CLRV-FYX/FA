@@ -362,7 +362,12 @@ def tokenize(src: str) -> List[Token]:
             else:
                 while i < n and (src[i] in DIGITS or src[i] == "_"):
                     adv()
-                if i < n and src[i] == "." and not (i + 1 < n and src[i + 1] == "."):
+                # 小数点后面必须真的跟数字，才算浮点字面量。
+                # 否则 `42.to_str()` 会被当成「42. 加后缀 to_str」，报一条
+                # 「非法数字字面量」的错 —— 而用户想写的是整数 42 调方法。
+                if (i < n and src[i] == "." and i + 1 < n
+                        and (src[i + 1] in DIGITS or src[i + 1] == "_")
+                        and src[i + 1] != "."):
                     isfloat = True
                     adv()
                     while i < n and (src[i] in DIGITS or src[i] == "_"):

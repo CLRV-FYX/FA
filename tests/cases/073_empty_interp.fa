@@ -1,0 +1,7 @@
+# expect-compile-error: 字符串插值 {} 里是空的
+# `print("{}")` 以前拿空文本去 parse_expr，报一条「无法解析的表达式起始 token
+# 'None'」，完全看不出问题出在花括号里。现在直接说明：花括号里要放表达式，
+# 要打印字面花括号用 chr(123) / chr(125)。
+fn main() -> i64:
+    print("{}")
+    return 0

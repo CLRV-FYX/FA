@@ -1,0 +1,26 @@
+# .to_str() 以前只在 str / 整数 / 浮点 / Vec / Map 上放行，结构体、枚举、数组、
+# bool、char 会被 sema 拒掉（“类型 P 没有方法 'to_str'”），而 codegen 里那条通用
+# 字符串化分支其实早就支持它们 —— 语义分析与代码生成对不上。现在统一放开，
+# x.to_str() 与全局的 str(x) 完全等价。
+# 顺带覆盖词法修复：`42.to_str()` 以前被当成「浮点 42. 加后缀 to_str」，报
+# “非法数字字面量”；现在小数点后不是数字就不算浮点，整数照样能调方法。
+struct P:
+    a: i64
+    name: str
+
+enum Shape:
+    Circle(r: f64)
+    Empty
+
+fn main() -> i64:
+    let p = P { a: 7, name: "点" }
+    let arr: [i64; 3] = [1, 2, 3]
+    let v = Vec<i64>[1, 2]
+    let m = Map<str, i64>["a": 1]
+    print(p.to_str())
+    print(Shape.Circle(1.5).to_str(), Shape.Empty.to_str())
+    print(arr.to_str(), arr.len())
+    print(v.to_str(), m.to_str())
+    print(true.to_str(), 'A'.to_str(), 42.to_str(), 3.5.to_str())
+    print(str(p) == p.to_str(), str(arr) == arr.to_str())
+    return 0

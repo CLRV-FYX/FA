@@ -1129,6 +1129,13 @@ class Parser:
             if kind == "lit":
                 out.append(("lit", text))
             else:
+                if not text.strip():
+                    # `print("{}")` 以前会拿空文本去 parse_expr，报一条
+                    # 「无法解析的表达式起始 token 'None'」，看不出问题在花括号里
+                    raise FaSyntaxError(
+                        "字符串插值 {} 里是空的：花括号里要放表达式（如 \"{n}\"）；"
+                        "要打印字面花括号请用 chr(123) / chr(125) 或字符串拼接",
+                        line, col)
                 sub = Parser(text + "\n", self.filename)
                 sub.pos = 0
                 e = sub.parse_expr()
