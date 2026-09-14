@@ -1,0 +1,55 @@
+make_utc: 1789279402
+iso_utc: 2026-09-13T06:03:22Z
+format_utc: 2026-09-13 06:03:22
+date: 2026-09-13
+clock: 06:03:22
+weekday 全名: Sunday
+stamp_file: 20260913_060322
+纪元: 1970-01-01T00:00:00Z
+utc_parts: 2026 9 13 6 3 22 0 255
+is_utc: true
+weekday_cn: 星期日
+is_weekend: true
+is_weekend 周一: false
+本地 year 一致: true
+本地 iso 长度: 19
+本地 iso_offset 带符号: true
+tz_name 非空: true
+tz_offset 是 15 分钟的整数倍: true
+parse UTC: true
+parse 坏输入: -1
+parse_date 合理: true
+parse_iso 合理: true
+make 非法日期: -1
+make 合法日期: true
+add_days: 2026-09-14T06:03:22Z
+add_hours: 2026-09-13T09:03:22Z
+add_weeks: 2026-09-20T06:03:22Z
+day_start 是本地当天零点: true true
+month_start 是本地当月一号: true
+year_start 是本地当年元旦: true
+day_end 比 day_start 大 86399: 86399
+days_between: 10
+days_between 反向: -10
+days_between 同一天: 0
+sec_between: 90
+is_leap: true false true false
+days_in_month: 28 29 31 30
+days_in_year: 365 366
+human: 1 小时 2 分 5 秒
+human 0: 0 秒
+human 天: 1 天 1 小时 1 分 1 秒
+human 负: -1 分 5 秒
+ago 刚刚: 刚刚
+ago 秒: 30 秒前
+ago 分: 5 分钟前
+ago 时: 2 小时前
+ago 天: 3 天前
+ago 周: 1 周前
+ago 将来: 1 小时之后
+now 合理: true
+now_ms 合理: true
+now_us 合理: true
+elapsed_ms 不为负: true
+elapsed_us 不为负: true
+单调时钟只用来算差: true

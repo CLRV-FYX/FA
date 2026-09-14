@@ -1,0 +1,753 @@
+# stdlib/json.fa —— JSON：解析、构造、序列化
+#
+#   use std.json
+#
+#   let v = Json.parse("{\"name\": \"FA\", \"ver\": 1, \"tags\": [\"a\", \"b\"]}")
+#   if v.is_err():
+#       panic(v.err)
+#   print(v.get("name").text())            # FA
+#   print(v.get("ver").int())              # 1
+#   print(v.get("tags").at(0).text())      # a
+#   print(v.path("tags.1").text())         # b
+#
+#   let out = Json.object()
+#   out.set("ok", Json.boolean(true))
+#   out.set("n", Json.integer(42))
+#   out.set("list", Json.from_vec_str(Vec<str>["x", "y"]))
+#   print(Json.pretty(out))
+#
+# 为什么值得有个 JSON 模块：FA 能一行接上 C 的 cJSON / jansson（`fa bind cJSON.h --lib cjson`），
+# 但那要求机器上装了对应的 -dev 包。解析 JSON 这件事本身没有外部依赖，
+# 用 FA 自己写一遍（递归下降，约 500 行）就能到处跑，所以放进标准库。
+#
+# 值用 JVal 表示。它按值递归（`arr: Vec<JVal>`），因为 Vec/Map 是引用计数对象，
+# 字段里存的是 8 字节的指针 —— 不用 new/free，出作用域自动回收。
+#
+# 出错约定：Json.parse 不 panic，解析失败给一个 kind == J_ERR 的 JVal，
+# 原因在 .err 里。所以拿到值之后先 `if v.is_err()` 是最省事的写法。
+#
+# 赋值是浅的：`let b = a` 之后 a 和 b 共享里面的数组和对象（FA 的 Vec/Map 就是
+# 引用计数对象）。要独立的一份用 Json.clone(a)。
+
+const J_NULL: i64 = 0
+const J_BOOL: i64 = 1
+const J_NUM: i64 = 2
+const J_STR: i64 = 3
+const J_ARR: i64 = 4
+const J_OBJ: i64 = 5
+const J_ERR: i64 = -1
+
+struct JVal:
+    kind: i64                   # 上面那组 J_* 之一
+    b: bool                     # kind == J_BOOL 时的值
+    num: f64                    # kind == J_NUM 时的值
+    raw: str                    # 数字的原文。1e3 解析完 dump 出来还是 1e3，不会变成 1000
+    s: str                      # kind == J_STR 时的内容（已解转义）
+    err: str                    # kind == J_ERR 时的原因
+    arr: Vec<JVal>              # kind == J_ARR
+    obj: Map<str, JVal>         # kind == J_OBJ
+    order: Vec<str>             # 对象键的顺序（Map 自己不保序，输出要按原文的顺序）
+
+# 解析器的状态。别直接用，Json.parse 会替你走完。
+# 内部那些 jp_* 函数收的都是 *JParser：FA 的结构体形参是按值拷贝的，
+# 传 JParser 的话 p.pos += 1 只改到副本，解析永远停在第一个字节。
+struct JParser:
+    src: str
+    pos: i64
+    err: str
+    failed: bool
+
+struct Json:
+    _ns: i64
+
+impl Json:
+    # ---------------------------------------------------------- 解析
+    fn parse(text: str) -> JVal:
+        let p: JParser
+        p.src = text
+        p.pos = 0
+        p.err = ""
+        p.failed = false
+        jp_ws(&p)
+        let v = jp_value(&p)
+        if p.failed:
+            return v
+        jp_ws(&p)
+        if p.pos < p.src.len():
+            return jp_fail(&p, "末尾有多余的内容（第 " + (p.pos + 1).to_str() + " 字节）")
+        return v
+
+    fn ok(text: str) -> bool:
+        return not Json.parse(text).is_err()
+
+    fn err_of(text: str) -> str:
+        # 能解析就给 ""，不能就给原因（写测试、验输入的时候好用）
+        let v = Json.parse(text)
+        if v.is_err():
+            return v.err
+        return ""
+
+    fn parse_file(path: str) -> JVal:
+        let text = file_read(path)
+        if text.len() == 0:
+            let v = Json.nul()
+            v.kind = J_ERR
+            v.err = "读不到文件，或文件是空的：" + path
+            return v
+        return Json.parse(text)
+
+    fn write_file(path: str, v: JVal) -> bool:
+        # 文件末尾补一个换行：POSIX 的文本文件该以换行结尾，
+        # cat 出来不会和下一行提示符黏在一起，diff 也不会报「No newline at end of file」。
+        return file_write(path, Json.pretty(v) + "\n") != 0
+
+    # ---------------------------------------------------------- 构造
+    fn nul() -> JVal:
+        let v = jval_new(J_NULL)
+        return v
+
+    fn boolean(b: bool) -> JVal:
+        let v = jval_new(J_BOOL)
+        v.b = b
+        return v
+
+    fn number(x: f64) -> JVal:
+        let v = jval_new(J_NUM)
+        v.num = x
+        return v
+
+    fn integer(n: i64) -> JVal:
+        let v = jval_new(J_NUM)
+        v.num = n as f64
+        v.raw = n.to_str()          # 整数就按整数输出，别变成 42.0
+        return v
+
+    fn string(s: str) -> JVal:
+        let v = jval_new(J_STR)
+        v.s = s
+        return v
+
+    fn array() -> JVal:
+        return jval_new(J_ARR)
+
+    fn object() -> JVal:
+        return jval_new(J_OBJ)
+
+    fn clone(v: JVal) -> JVal:
+        # 深拷贝。FA 里 `let b = a` 拷的是结构体本身，可里面的 Vec / Map 是
+        # 引用计数对象，两份**共享**同一个容器（和 Python 的赋值一个意思）：
+        # 改 b 的数组，a 的也跟着变。要真正独立的一份，用这个。
+        let out = jval_new(v.kind)
+        out.b = v.b
+        out.num = v.num
+        out.raw = v.raw
+        out.s = v.s
+        out.err = v.err
+        if v.kind == J_ARR:
+            for i in 0..v.arr.len():
+                out.arr.push(Json.clone(v.arr.get(i)))
+        elif v.kind == J_OBJ:
+            for i in 0..v.order.len():
+                let k = v.order.get(i)
+                out.order.push(k)
+                out.obj.set(k, Json.clone(v.obj.get(k)))
+        return out
+
+    fn error(msg: str) -> JVal:
+        let v = jval_new(J_ERR)
+        v.err = msg
+        return v
+
+    fn array_of(items: Vec<JVal>) -> JVal:
+        let v = jval_new(J_ARR)
+        for i in 0..items.len():
+            v.arr.push(items.get(i))
+        return v
+
+    fn from_vec_str(items: Vec<str>) -> JVal:
+        let v = jval_new(J_ARR)
+        for i in 0..items.len():
+            v.arr.push(Json.string(items.get(i)))
+        return v
+
+    fn from_vec_i64(items: Vec<i64>) -> JVal:
+        let v = jval_new(J_ARR)
+        for i in 0..items.len():
+            v.arr.push(Json.integer(items.get(i)))
+        return v
+
+    fn from_vec_f64(items: Vec<f64>) -> JVal:
+        let v = jval_new(J_ARR)
+        for i in 0..items.len():
+            v.arr.push(Json.number(items.get(i)))
+        return v
+
+    # ---------------------------------------------------------- 序列化
+    fn dump(v: JVal) -> str:
+        # 紧凑：{"a":1,"b":[2,3]}
+        let out: Vec<str> = Vec<str>()
+        json_emit(v, out, 0, 0)
+        return out.join("")
+
+    fn pretty(v: JVal) -> str:
+        # 缩进两个空格
+        return Json.pretty_indent(v, 2)
+
+    fn pretty_indent(v: JVal, indent: i64) -> str:
+        # 结尾**不带**换行（和 Python 的 json.dumps(indent=2) 一致）：
+        # 拼进别的文本里不会多出空行，要写文件的话 write_file 自己会补一个。
+        let out: Vec<str> = Vec<str>()
+        json_emit(v, out, indent, 0)
+        return out.join("")
+
+impl JVal:
+    # ---------------------------------------------------------- 是什么
+    fn is_null(self) -> bool:
+        return self.kind == J_NULL
+
+    fn is_bool(self) -> bool:
+        return self.kind == J_BOOL
+
+    fn is_num(self) -> bool:
+        return self.kind == J_NUM
+
+    fn is_str(self) -> bool:
+        return self.kind == J_STR
+
+    fn is_arr(self) -> bool:
+        return self.kind == J_ARR
+
+    fn is_obj(self) -> bool:
+        return self.kind == J_OBJ
+
+    fn is_err(self) -> bool:
+        return self.kind == J_ERR
+
+    fn kind_name(self) -> str:
+        if self.kind == J_NULL:
+            return "null"
+        if self.kind == J_BOOL:
+            return "bool"
+        if self.kind == J_NUM:
+            return "number"
+        if self.kind == J_STR:
+            return "string"
+        if self.kind == J_ARR:
+            return "array"
+        if self.kind == J_OBJ:
+            return "object"
+        return "error"
+
+    # ---------------------------------------------------------- 取值
+    fn boolean(self) -> bool:
+        return self.b
+
+    fn num(self) -> f64:
+        return self.num
+
+    fn int(self) -> i64:
+        return self.num as i64
+
+    fn text(self) -> str:
+        # 字符串值。种类不对给 ""（要区分「空字符串」和「不是字符串」用 is_str()）
+        return self.s
+
+    fn num_or(self, d: f64) -> f64:
+        if self.kind == J_NUM:
+            return self.num
+        return d
+
+    fn int_or(self, d: i64) -> i64:
+        if self.kind == J_NUM:
+            return self.num as i64
+        return d
+
+    fn text_or(self, d: str) -> str:
+        if self.kind == J_STR:
+            return self.s
+        return d
+
+    fn bool_or(self, d: bool) -> bool:
+        if self.kind == J_BOOL:
+            return self.b
+        return d
+
+    # ---------------------------------------------------------- 容器
+    fn len(self) -> i64:
+        if self.kind == J_ARR:
+            return self.arr.len()
+        if self.kind == J_OBJ:
+            return self.order.len()
+        if self.kind == J_STR:
+            return self.s.len()
+        return 0
+
+    fn at(self, i: i64) -> JVal:
+        # 数组第 i 个。越界或不是数组，给一个 null 值（不 panic）
+        if self.kind == J_ARR and i >= 0 and i < self.arr.len():
+            return self.arr.get(i)
+        return Json.nul()
+
+    fn get(self, k: str) -> JVal:
+        # 对象的 k 字段。没有或不是对象，给一个 null 值（不 panic）
+        if self.kind == J_OBJ and self.obj.has(k):
+            return self.obj.get(k)
+        return Json.nul()
+
+    fn has(self, k: str) -> bool:
+        if self.kind != J_OBJ:
+            return false
+        return self.obj.has(k)
+
+    fn keys(self) -> Vec<str>:
+        # 对象的键，按原文出现的顺序
+        let out: Vec<str> = Vec<str>()
+        if self.kind == J_OBJ:
+            for i in 0..self.order.len():
+                out.push(self.order.get(i))
+        return out
+
+    fn values(self) -> Vec<JVal>:
+        let out: Vec<JVal> = Vec<JVal>()
+        if self.kind == J_OBJ:
+            for i in 0..self.order.len():
+                out.push(self.obj.get(self.order.get(i)))
+        else:
+            if self.kind == J_ARR:
+                for i in 0..self.arr.len():
+                    out.push(self.arr.get(i))
+        return out
+
+    fn items(self) -> Vec<JVal>:
+        # 数组的元素（对象的话给它的值）。就是 values()，名字顺手一点。
+        return self.values()
+
+    fn path(self, spec: str) -> JVal:
+        # 一条路径走到底："user.address.city" / "list.0.name"
+        # 数字段是数组下标。中间任何一步对不上，给 null 值（不 panic）。
+        let mut cur = self
+        let parts = spec.split(".")
+        for i in 0..parts.len():
+            let seg = parts.get(i)
+            if seg.len() == 0:
+                continue
+            if cur.kind == J_ARR:
+                let idx = seg.to_i64()
+                if idx < 0 or idx >= cur.arr.len():
+                    return Json.nul()
+                cur = cur.arr.get(idx)
+            else:
+                if cur.kind != J_OBJ or not cur.obj.has(seg):
+                    return Json.nul()
+                cur = cur.obj.get(seg)
+        return cur
+
+    # ---------------------------------------------------------- 改
+    fn push(self, item: JVal):
+        # 往数组尾巴上加一个。不是数组就什么也不做。
+        if self.kind == J_ARR:
+            self.arr.push(item)
+
+    fn set(self, k: str, item: JVal):
+        # 设对象的字段。已有就替换（顺序不变），新的加在末尾。
+        if self.kind != J_OBJ:
+            return
+        if not self.obj.has(k):
+            self.order.push(k)
+        self.obj.set(k, item)
+
+    fn del(self, k: str) -> bool:
+        if self.kind != J_OBJ or not self.obj.has(k):
+            return false
+        self.obj.del(k)
+        let keep: Vec<str> = Vec<str>()
+        for i in 0..self.order.len():
+            if self.order.get(i) != k:
+                keep.push(self.order.get(i))
+        self.order.clear()
+        for i in 0..keep.len():
+            self.order.push(keep.get(i))
+        return true
+
+    # ---------------------------------------------------------- 输出
+    fn dump(self) -> str:
+        return Json.dump(self)
+
+    fn pretty(self) -> str:
+        return Json.pretty(self)
+
+# ------------------------------------------------------------------ 内部：构造
+fn jval_new(kind: i64) -> JVal:
+    let v: JVal
+    v.kind = kind
+    v.b = false
+    v.num = 0.0
+    v.raw = ""
+    v.s = ""
+    v.err = ""
+    return v
+
+# ------------------------------------------------------------------ 内部：解析
+fn jp_fail(p: *JParser, msg: str) -> JVal:
+    if not p.failed:
+        p.err = msg + "（第 " + (p.pos + 1).to_str() + " 字节附近）"
+        p.failed = true
+    let v = jval_new(J_ERR)
+    v.err = p.err
+    return v
+
+fn jp_ws(p: *JParser):
+    while p.pos < p.src.len():
+        let c = p.src.at(p.pos)
+        if c == 32 or c == 9 or c == 10 or c == 13:
+            p.pos += 1
+        else:
+            break
+
+fn jp_peek(p: *JParser) -> i64:
+    # 当前字节（0-255），到头了给 -1
+    if p.pos >= p.src.len():
+        return -1
+    return p.src.at(p.pos)
+
+fn jp_eat(p: *JParser, c: i64) -> bool:
+    if jp_peek(p) == c:
+        p.pos += 1
+        return true
+    return false
+
+fn jp_word(p: *JParser, w: str) -> bool:
+    if p.pos + w.len() > p.src.len():
+        return false
+    if p.src.slice(p.pos, p.pos + w.len()) == w:
+        p.pos += w.len()
+        return true
+    return false
+
+fn jp_value(p: *JParser) -> JVal:
+    let c = jp_peek(p)
+    if c == -1:
+        return jp_fail(p, "还没读到值就到头了")
+    if c == 123:                                  # {
+        return jp_object(p)
+    if c == 91:                                   # [
+        return jp_array(p)
+    if c == 34:                                   # "
+        let s = jp_string(p)
+        if p.failed:
+            return jval_new(J_ERR)
+        let v = jval_new(J_STR)
+        v.s = s
+        return v
+    if c == 116:                                  # true
+        if jp_word(p, "true"):
+            return Json.boolean(true)
+        return jp_fail(p, "不是合法的值")
+    if c == 102:                                  # false
+        if jp_word(p, "false"):
+            return Json.boolean(false)
+        return jp_fail(p, "不是合法的值")
+    if c == 110:                                  # null
+        if jp_word(p, "null"):
+            return Json.nul()
+        return jp_fail(p, "不是合法的值")
+    if c == 45 or (c >= 48 and c <= 57):          # - 或 0-9
+        return jp_number(p)
+    return jp_fail(p, "值不能以 '" + p.src.slice(p.pos, p.pos + 1) + "' 开头")
+
+fn jp_array(p: *JParser) -> JVal:
+    p.pos += 1                                    # 吃掉 [
+    let v = jval_new(J_ARR)
+    jp_ws(p)
+    if jp_eat(p, 93):                             # ] 空数组
+        return v
+    while true:
+        jp_ws(p)
+        let item = jp_value(p)
+        if p.failed:
+            return item
+        v.arr.push(item)
+        jp_ws(p)
+        if jp_eat(p, 44):                         # ,
+            continue
+        if jp_eat(p, 93):                         # ]
+            return v
+        return jp_fail(p, "数组里少了 , 或 ]")
+
+fn jp_object(p: *JParser) -> JVal:
+    p.pos += 1                                    # 吃掉 {
+    let v = jval_new(J_OBJ)
+    jp_ws(p)
+    if jp_eat(p, 125):                            # } 空对象
+        return v
+    while true:
+        jp_ws(p)
+        if jp_peek(p) != 34:
+            return jp_fail(p, "对象的键必须是带双引号的字符串")
+        let k = jp_string(p)
+        if p.failed:
+            return jval_new(J_ERR)
+        jp_ws(p)
+        if not jp_eat(p, 58):                     # :
+            return jp_fail(p, "键 '" + k + "' 后面少了 :")
+        jp_ws(p)
+        let item = jp_value(p)
+        if p.failed:
+            return item
+        if not v.obj.has(k):
+            v.order.push(k)
+        v.obj.set(k, item)
+        jp_ws(p)
+        if jp_eat(p, 44):
+            continue
+        if jp_eat(p, 125):
+            return v
+        return jp_fail(p, "对象里少了 , 或 }")
+
+fn jp_number(p: *JParser) -> JVal:
+    let start = p.pos
+    let neg = jp_eat(p, 45)                       # 可选的负号（后面按原文切，不用它）
+    if jp_peek(p) == 48:                          # 0 后面不能跟数字（012 不合法）
+        p.pos += 1
+    else:
+        if not jp_digits(p):
+            return jp_fail(p, "数字写法不对")
+    if jp_eat(p, 46):                             # .
+        if not jp_digits(p):
+            return jp_fail(p, "小数点后面要有数字")
+    let e = jp_peek(p)
+    if e == 101 or e == 69:                       # e / E
+        p.pos += 1
+        let sg = jp_peek(p)
+        if sg == 43 or sg == 45:
+            p.pos += 1
+        if not jp_digits(p):
+            return jp_fail(p, "指数后面要有数字")
+    let text = p.src.slice(start, p.pos)
+    if neg and text == "-":
+        return jp_fail(p, "只有一个负号，不是数字")
+    let v = jval_new(J_NUM)
+    v.raw = text
+    v.num = text.to_f64()
+    return v
+
+fn jp_digits(p: *JParser) -> bool:
+    let start = p.pos
+    while p.pos < p.src.len():
+        let c = p.src.at(p.pos)
+        if c >= 48 and c <= 57:
+            p.pos += 1
+        else:
+            break
+    return p.pos > start
+
+fn jp_string(p: *JParser) -> str:
+    # 进来时当前字节一定是 "
+    p.pos += 1
+    let out: Vec<str> = Vec<str>()
+    while true:
+        if p.pos >= p.src.len():
+            jp_fail(p, "字符串没有收尾的双引号")
+            return ""
+        let c = p.src.at(p.pos)
+        if c == 34:                               # "
+            p.pos += 1
+            return out.join("")
+        if c == 92:                               # \
+            p.pos += 1
+            if p.pos >= p.src.len():
+                jp_fail(p, "转义写到头了")
+                return ""
+            let e = p.src.at(p.pos)
+            p.pos += 1
+            if e == 34:
+                out.push("\"")
+            elif e == 92:
+                out.push("\\")
+            elif e == 47:
+                out.push("/")
+            elif e == 98:
+                out.push(chr(8))
+            elif e == 102:
+                out.push(chr(12))
+            elif e == 110:
+                out.push("\n")
+            elif e == 114:
+                out.push(chr(13))
+            elif e == 116:
+                out.push("\t")
+            elif e == 117:
+                let cp = jp_hex4(p)
+                if cp < 0:
+                    jp_fail(p, "\\u 后面要 4 位十六进制")
+                    return ""
+                if cp >= 0xD800 and cp <= 0xDBFF and jp_peek(p) == 92:
+                    # 代理对：\uD83D\uDE00 这种，两个 \u 合起来才是一个字符
+                    let save = p.pos
+                    p.pos += 1
+                    if jp_eat(p, 117):
+                        let lo = jp_hex4(p)
+                        if lo >= 0xDC00 and lo <= 0xDFFF:
+                            cp = 0x10000 + ((cp - 0xD800) * 1024) + (lo - 0xDC00)
+                        else:
+                            p.pos = save
+                    else:
+                        p.pos = save
+                out.push(json_utf8(cp))
+            else:
+                jp_fail(p, "不认识的转义 \\" + p.src.slice(p.pos - 1, p.pos))
+                return ""
+            continue
+        if c < 32:
+            jp_fail(p, "字符串里有没转义的控制字符（0x" + json_hex2(c) + "）")
+            return ""
+        out.push(p.src.slice(p.pos, p.pos + 1))    # 普通字节，含 UTF-8 的后续字节
+        p.pos += 1
+
+fn jp_hex4(p: *JParser) -> i64:
+    if p.pos + 4 > p.src.len():
+        return -1
+    let mut n: i64 = 0
+    for i in 0..4:
+        let d = json_hexval(p.src.at(p.pos + i))
+        if d < 0:
+            return -1
+        n = n * 16 + d
+    p.pos += 4
+    return n
+
+fn json_hexval(c: i64) -> i64:
+    if c >= 48 and c <= 57:
+        return c - 48
+    if c >= 97 and c <= 102:
+        return c - 87
+    if c >= 65 and c <= 70:
+        return c - 55
+    return -1
+
+fn json_hex2(n: i64) -> str:
+    let digits = "0123456789abcdef"
+    let hi = (n / 16) & 15
+    let lo = n & 15
+    return digits.slice(hi, hi + 1) + digits.slice(lo, lo + 1)
+
+fn json_utf8(cp: i64) -> str:
+    # 码点 -> UTF-8 字节。chr() 自己就是按 UTF-8 编码的（chr(20013) 给的是
+    # "中" 三个字节，不是 0xE4 那一个字节），所以这里直接用它就行。
+    # 早先的版本自己按位拼字节，结果每个字节又被 chr 编了一遍 UTF-8，
+    # \u4e2d 出来是 "ä¸­" 六个字节 —— 看着像乱码，其实是编了两次。
+    if cp < 0:
+        return ""
+    return chr(cp)
+
+# ------------------------------------------------------------------ 内部：输出
+fn json_emit(v: JVal, out: Vec<str>, indent: i64, depth: i64):
+    if v.kind == J_NULL:
+        out.push("null")
+        return
+    if v.kind == J_BOOL:
+        if v.b:
+            out.push("true")
+        else:
+            out.push("false")
+        return
+    if v.kind == J_NUM:
+        out.push(json_num_text(v))
+        return
+    if v.kind == J_STR:
+        out.push("\"" + json_escape(v.s) + "\"")
+        return
+    if v.kind == J_ERR:
+        # 错误值不是合法 JSON。输出 null，比把内部错误信息当数据吐出去好。
+        out.push("null")
+        return
+    let pad = ""
+    let pad2 = ""
+    if indent > 0:
+        pad = json_spaces(indent * depth)
+        pad2 = json_spaces(indent * (depth + 1))
+    if v.kind == J_ARR:
+        if v.arr.len() == 0:
+            out.push("[]")
+            return
+        out.push("[")
+        for i in 0..v.arr.len():
+            if i > 0:
+                out.push(",")
+            if indent > 0:
+                out.push("\n" + pad2)
+            json_emit(v.arr.get(i), out, indent, depth + 1)
+        if indent > 0:
+            out.push("\n" + pad)
+        out.push("]")
+        return
+    # 对象
+    if v.order.len() == 0:
+        out.push("{{}}")
+        return
+    out.push("{{")
+    for i in 0..v.order.len():
+        if i > 0:
+            out.push(",")
+        let k = v.order.get(i)
+        if indent > 0:
+            out.push("\n" + pad2)
+        out.push("\"" + json_escape(k) + "\":")
+        if indent > 0:
+            out.push(" ")
+        json_emit(v.obj.get(k), out, indent, depth + 1)
+    if indent > 0:
+        out.push("\n" + pad)
+    out.push("}}")
+
+fn json_spaces(n: i64) -> str:
+    if n <= 0:
+        return ""
+    let out: Vec<str> = Vec<str>()
+    for i in 0..n:
+        out.push(" ")
+    return out.join("")
+
+fn json_num_text(v: JVal) -> str:
+    if v.raw.len() > 0:
+        return v.raw                      # 原文最保真：1e3、0.10、-0 都原样回去
+    return json_fmt_num(v.num)
+
+fn json_fmt_num(x: f64) -> str:
+    # 整数值不带小数点：Json.number(42.0) 输出 42，Json.integer(42) 也是 42。
+    # JSON 里没有「整数」和「浮点」之分，42 和 42.0 是同一个数，取短的那个写。
+    # 从文本解析进来的数字带着原文（raw），所以 1e3、0.10 会原样回去，不会被规整。
+    # JSON 没有 NaN 和 Infinity，只能给 null（这是各家库的通行做法）
+    if x != x:
+        return "null"
+    if x > 1.7976931348623157e308 or x < -1.7976931348623157e308:
+        return "null"
+    if x >= -9223372036854775808.0 and x <= 9223372036854775807.0:
+        let i = x as i64
+        if i as f64 == x:
+            return i.to_str()             # 整数值不带小数点
+    return x.to_str()
+
+fn json_escape(s: str) -> str:
+    let out: Vec<str> = Vec<str>()
+    for i in 0..s.len():
+        let c = s.at(i)
+        if c == 34:
+            out.push("\\\"")
+        elif c == 92:
+            out.push("\\\\")
+        elif c == 10:
+            out.push("\\n")
+        elif c == 13:
+            out.push("\\r")
+        elif c == 9:
+            out.push("\\t")
+        elif c == 8:
+            out.push("\\b")
+        elif c == 12:
+            out.push("\\f")
+        elif c < 32:
+            out.push("\\u00" + json_hex2(c))
+        else:
+            out.push(s.slice(i, i + 1))   # 含 UTF-8 的后续字节，原样过去
+    return out.join("")

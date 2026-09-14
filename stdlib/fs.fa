@@ -1,0 +1,322 @@
+# stdlib/fs.fa —— 文件系统与路径
+#
+#   use std.fs
+#
+#   if Fs.exists("data/in.txt"):
+#       let text = Fs.read("data/in.txt")
+#       print(Fs.size("data/in.txt"), Fs.ext("a.tar.gz"))
+#   for name in Fs.list_dir("."):
+#       print(name)
+#
+# FA 的内建里只有 file_read / file_write / cmd / env，没有目录、没有 stat、
+# 没有路径拼接 —— 这些都是天天要用的东西，所以放进标准库。
+# 底下的 C 声明是 `fa bind` 从系统头文件生成的（见 c/libc.fa 与 c/regen_libc.sh），
+# 结构体布局由真编译器量过（sizeof/offsetof 逐个对得上），不是手抄的。
+#
+# 没有 Option/Result，所以出错怎么办是**写在每个函数的注释里**的：
+#   - 返回 str 的：失败给 ""
+#   - 返回 i64 的：失败给 -1（size）或 0（mtime）
+#   - 返回 Vec 的：失败给空表
+#   - 返回 bool 的：false 就是没做成
+#   - 要区分「文件不存在」和「文件是空的」：先 Fs.exists()，或用 Fs.info() 拿一份完整的
+use "c/libc.fa"
+
+# 一次 stat 的全部结果。Fs.info() 返回它，省得为每个字段各调一次系统调用。
+struct FsStat:
+    ok: bool            # stat 本身成功了（= 路径存在）
+    is_dir: bool
+    is_file: bool
+    is_link: bool
+    size: i64           # 字节数
+    mtime: i64          # 最后修改时间（Unix 秒）
+    mode: i64           # 原始 st_mode（权限位 + 类型位）
+
+# FA 没有命名空间（`use ... as 别名` 还没实现），所以标准库统一用
+# 「空结构体 + 静态方法」当命名空间：Fs.join(...)、Time.now(...)。
+# 这样导进来的东西不会和你自己写的 join / now 撞在一起。
+struct Fs:
+    _ns: i64
+
+impl Fs:
+    # ---------------------------------------------------------- 查询
+    fn info(p: str) -> FsStat:
+        let r: FsStat
+        r.ok = false
+        r.is_dir = false
+        r.is_file = false
+        r.is_link = false
+        r.size = -1
+        r.mtime = 0
+        r.mode = 0
+        let st: stat
+        if stat(p, &st) != 0:
+            return r
+        r.ok = true
+        r.size = st.st_size
+        r.mtime = st.st_mtim.tv_sec
+        r.mode = st.st_mode as i64
+        r.is_dir = ((st.st_mode as i64) & S_IFDIR) != 0
+        r.is_file = ((st.st_mode as i64) & S_IFREG) != 0
+        return r
+
+    fn linfo(p: str) -> FsStat:
+        # 和 info 一样，但遇到符号链接不跟过去（lstat）
+        let r: FsStat
+        r.ok = false
+        r.is_dir = false
+        r.is_file = false
+        r.is_link = false
+        r.size = -1
+        r.mtime = 0
+        r.mode = 0
+        let st: stat
+        if lstat(p, &st) != 0:
+            return r
+        r.ok = true
+        r.size = st.st_size
+        r.mtime = st.st_mtim.tv_sec
+        r.mode = st.st_mode as i64
+        r.is_dir = ((st.st_mode as i64) & S_IFDIR) != 0
+        r.is_file = ((st.st_mode as i64) & S_IFREG) != 0
+        r.is_link = ((st.st_mode as i64) & S_IFLNK) == S_IFLNK
+        return r
+
+    fn exists(p: str) -> bool:
+        return access(p, F_OK as i32) == 0
+
+    fn is_file(p: str) -> bool:
+        return Fs.info(p).is_file
+
+    fn is_dir(p: str) -> bool:
+        return Fs.info(p).is_dir
+
+    fn is_link(p: str) -> bool:
+        return Fs.linfo(p).is_link
+
+    fn readable(p: str) -> bool:
+        return access(p, R_OK as i32) == 0
+
+    fn writable(p: str) -> bool:
+        return access(p, W_OK as i32) == 0
+
+    # 字节数；路径不存在或读不到给 -1（所以「0」就是真的空文件）
+    fn size(p: str) -> i64:
+        return Fs.info(p).size
+
+    # 最后修改时间（Unix 秒）；失败给 0
+    fn mtime(p: str) -> i64:
+        return Fs.info(p).mtime
+
+    # ---------------------------------------------------------- 目录
+    fn list_dir(p: str) -> Vec<str>:
+        # 只列一层，不含 "." 与 ".."，名字是**相对 p 的**（不是全路径）。
+        # 打不开目录（不存在 / 没权限 / p 是文件）就给空表。
+        let out: Vec<str> = Vec<str>()
+        let d = opendir(p)
+        if d == nil:
+            return out
+        while true:
+            let e = readdir(d)
+            if e == nil:
+                break
+            let name = cstr(&e.d_name as *u8)
+            if name != "." and name != "..":
+                out.push(name)
+        closedir(d)
+        return out
+
+    fn entries(p: str) -> Vec<str>:
+        # 和 list_dir 一样，但给的是拼好的路径（p/name）
+        let out: Vec<str> = Vec<str>()
+        let names = Fs.list_dir(p)
+        for i in 0..names.len():
+            out.push(Fs.join(p, names.get(i)))
+        return out
+
+    fn walk(p: str) -> Vec<str>:
+        # 递归列出 p 底下的一切。目录名后面带 "/"，路径是相对 p 的。
+        let out: Vec<str> = Vec<str>()
+        fs_walk_into(p, "", out)
+        return out
+
+    fn count_dir(p: str) -> i64:
+        return Fs.list_dir(p).len()
+
+    # ---------------------------------------------------------- 读写
+    fn read(p: str) -> str:
+        # 整个文件读成一个字符串（二进制也按字节装进 str）。读不到给 ""。
+        return file_read(p)
+
+    fn read_lines(p: str) -> Vec<str>:
+        # 按行读整个文件。str.lines() 是「按 \n 切开」，文件末尾那个换行会多出
+        # 一个空段（"a\nb\n".lines() 是 3 段）；读文件的人不想要那个空段，这里去掉。
+        let text = Fs.read(p)
+        if text.len() == 0:
+            return Vec<str>()
+        let out = text.lines()
+        if out.len() > 0 and out.get(out.len() - 1).len() == 0:
+            out.pop()
+        return out
+
+    fn write(p: str, content: str) -> bool:
+        # 覆盖写。父目录不存在、没权限都返回 false（不 panic）。
+        return file_write(p, content) != 0
+
+    fn write_lines(p: str, lines: Vec<str>) -> bool:
+        return Fs.write(p, lines.join("\n") + "\n")
+
+    fn append(p: str, content: str) -> bool:
+        # 追加。用 O_APPEND，多进程同时写同一个日志文件也不会互相覆盖
+        # （read + write 那种「假追加」会）。文件不存在就创建，权限 0644。
+        let flags = (O_WRONLY | O_APPEND | O_CREAT) as i32
+        let fd = open(p, flags, 420)
+        if fd < 0:
+            return false
+        let n = c_write(fd, s_cstr(content) as *void, content.len() as usize)
+        close(fd)
+        return n == content.len()
+
+    fn copy(src: str, dst: str) -> bool:
+        return Fs.write(dst, Fs.read(src))
+
+    # ---------------------------------------------------------- 改动
+    fn make_dir(p: str) -> bool:
+        # 只建一层；父目录不存在会失败（要一路建出来用 make_dir_all）
+        return mkdir(p, 493) == 0                 # 493 = 0755
+
+    fn make_dir_all(p: str) -> bool:
+        if p.len() == 0:
+            return false
+        if Fs.is_dir(p):
+            return true
+        let parent = Fs.dir(p)
+        if parent.len() > 0 and parent != p and not Fs.is_dir(parent):
+            if not Fs.make_dir_all(parent):
+                return false
+        return Fs.make_dir(p)
+
+    fn remove(p: str) -> bool:
+        # 删文件（符号链接本身也走这里）。目录要用 rmdir。
+        return unlink(p) == 0
+
+    fn remove_dir(p: str) -> bool:
+        # 只能删空目录（和 C 的 rmdir 一样）
+        return rmdir(p) == 0
+
+    fn rename_to(a: str, b: str) -> bool:
+        # 改名/移动。跨文件系统会失败（rename 的老规矩），那种情况用 copy + remove。
+        return rename(a, b) == 0
+
+    fn set_mode(p: str, mode: i64) -> bool:
+        # mode 按八进制写：Fs.set_mode("x.sh", 0o755) 是 493
+        return chmod(p, mode as u32) == 0
+
+    # ---------------------------------------------------------- 路径
+    fn cwd() -> str:
+        let buf: [u8; 4096]
+        return getcwd(&buf as *u8, 4096)
+
+    fn abs(p: str) -> str:
+        # 解析成绝对路径，顺带把 ".."、符号链接都展开。失败就把原样还回来。
+        let buf: [u8; 4096]
+        let r = realpath(p, &buf as *u8)
+        if r.len() == 0:
+            return p
+        return r
+
+    fn is_abs(p: str) -> bool:
+        return p.starts_with("/")
+
+    fn join(a: str, b: str) -> str:
+        if a.len() == 0:
+            return b
+        if b.starts_with("/"):
+            return b                              # 右边是绝对路径，左边作废
+        if a.ends_with("/"):
+            return a + b
+        return a + "/" + b
+
+    fn base(p: str) -> str:
+        # 最后一段：/a/b/c.txt -> c.txt
+        let t = Fs.trim_slash(p)
+        let i = t.rfind("/")
+        if i < 0:
+            return t
+        return t.slice(i + 1, t.len())
+
+    fn dir(p: str) -> str:
+        # 去掉最后一段：/a/b/c.txt -> /a/b
+        let t = Fs.trim_slash(p)
+        let i = t.rfind("/")
+        if i < 0:
+            return ""
+        if i == 0:
+            return "/"
+        return t.slice(0, i)
+
+    fn ext(p: str) -> str:
+        # 扩展名（不带点）：a.tar.gz -> gz；.bashrc 和 noext 都给 ""
+        let b = Fs.base(p)
+        let i = b.rfind(".")
+        if i <= 0:
+            return ""
+        return b.slice(i + 1, b.len())
+
+    fn stem(p: str) -> str:
+        # 去掉扩展名的文件名：a.tar.gz -> a.tar
+        let b = Fs.base(p)
+        let i = b.rfind(".")
+        if i <= 0:
+            return b
+        return b.slice(0, i)
+
+    fn trim_slash(p: str) -> str:
+        # 去掉结尾多余的 "/"（根目录 "/" 保留）
+        if p.len() <= 1:
+            return p
+        let mut n = p.len()
+        while n > 1 and p.slice(n - 1, n) == "/":
+            n -= 1
+        return p.slice(0, n)
+
+    fn parts(p: str) -> Vec<str>:
+        # 按 "/" 拆成一段一段（绝对路径的第一段是 ""）
+        let out: Vec<str> = Vec<str>()
+        let pieces = p.split("/")
+        for i in 0..pieces.len():
+            let s = pieces.get(i)
+            if s.len() > 0:
+                out.push(s)
+        return out
+
+    fn relative(base: str, p: str) -> str:
+        # 把 p 里开头的 base 去掉（ Fs.relative("/a/b", "/a/b/c.txt") -> "c.txt" ）
+        let b = Fs.trim_slash(base)
+        if b.len() == 0:
+            return p
+        if not p.starts_with(b):
+            return p
+        let rest = p.slice(b.len(), p.len())
+        if rest.starts_with("/"):
+            return rest.slice(1, rest.len())
+        return rest
+
+# 内部工具：str 的 char* 拿法。s.cstr() 是方法，这里包一层是为了在
+# 需要 `as *void` 的地方读起来顺一点（方法调用后面直接接 as 也可以）。
+fn s_cstr(s: str) -> *u8:
+    return s.cstr()
+
+# 内部工具：递归遍历。FA 的 Vec / Map / str 本来就是引用计数对象，形参直接写
+# Vec<str> 传的就是同一个容器（不是拷贝），所以一路 push 上来不用返回，
+# 也不要在类型上写 *Vec<str>（那是「指向容器的指针」，方法调不上去）。
+fn fs_walk_into(dir: str, prefix: str, out: Vec<str>):
+    let names = Fs.list_dir(dir)
+    for i in 0..names.len():
+        let n = names.get(i)
+        let full = Fs.join(dir, n)
+        let rel = prefix + n
+        if Fs.is_dir(full):
+            out.push(rel + "/")
+            fs_walk_into(full, rel + "/", out)
+        else:
+            out.push(rel)

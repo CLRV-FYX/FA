@@ -1,0 +1,44 @@
+ok 好模式: true
+ok 坏模式: false
+err 有话: true
+err 好模式给空: []
+test: true false
+test_i: true false
+find: [123]
+find 没有: []
+find_i: ABC
+find_all: ["1", "22", "333"]
+find_all_i: ["a", "A", "b", "B"]
+count: 3
+spans: [1, 2, 3, 5, 6, 9]
+search: true 0 7
+search 没匹配: false -1 -1 0
+groups: ["2026-09-13", "2026", "09", "13"]
+groups 没匹配: 0
+replace: a#b#c#
+replace 多字节: a<数>b<数>
+replace_first: a#b2c3
+replace_i: ----
+replace 没匹配: abc
+replace 坏模式原样返回: abc
+split: ["a", "b", "c"]
+split 没匹配: ["abc"]
+escape: a\.b\+c\(d\)
+零长度 find_all: 4
+零长度 replace: [XbXbXbX]
+^ 只匹配一次: ["a"]
+$ 只匹配一次: ["c"]
+r.ok: true r.err: []
+复用同一个正则: 10
+r.test: true false
+r.find: 12
+r.groups: ["12"]
+r.replace: a!b!
+r.replace_n: a#b#c3
+r.split: ["a", "b", "c"]
+编译失败: false true
+失败的 test 是 false: false
+compile_i: ABC true
+BRE 基本正则: 123
+REG_NEWLINE 行首: ["b"]
+中文: ["1", "22"]

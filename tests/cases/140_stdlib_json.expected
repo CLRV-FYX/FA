@@ -1,0 +1,89 @@
+null: null
+true: true false: false
+整数: 42 负数: -7
+小数: 3.5 指数原文: 1e3 尾零原文: 0.10
+大整数: 1234567890123
+字符串: "hi" 空串: [""]
+引号: "a\"b"
+反斜杠: "a\\b"
+斜杠: "a/b"
+换行: "a\nb" 制表: "a\tb"
+\u0041: A
+\u4e2d: 中 字节数: 3
+代理对: 😀 字节数: 4
+控制字符输出: "\u0001"
+中文往返: "中文" 中文
+空数组: [] 空对象: {}
+数组: [1,2,3] 带空格: [1,2]
+嵌套数组: [[1],[2,[3]]]
+混合: [1,"a",true,null,2.5]
+对象: {"a":1}
+键序保留: {"z":1,"a":2,"m":3}
+嵌套对象: {"a":{"b":{"c":[1,2]}}}
+重复键后者胜: 2
+解析成功: true
+取字符串: FA
+取整数: 1 取浮点: 3.14
+取布尔: true 取 null: true
+数组下标: b 越界: true
+数组长度: 2 对象长度: 7
+keys 顺序: name,ver,pi,ok,tags,meta,nil
+has: true false
+没有的键给 null: true
+path 深层: 20
+path 走空: true
+默认值: 9.0 默认 -1 true
+kind_name: object array
+values/items: 7 2
+构造: {"ok":true,"n":42,"x":2.5,"s":"带\"引号\"","list":["x","y"],"nums":[1,2,3],"fl":[1.5],"nul":null}
+替换键序不变: {"ok":true,"n":43,
+del: true 7 删没有的: false
+构造数组: [1,"二"]
+array_of: [7]
+整数不带小数点: 42 浮点整值也短写: 42
+NaN 变 null: null
+赋值是浅的: {"a":[1,2,3]}
+clone 是深的: {"a":[1,2]} | {"a":[1,2,9]}
+clone 保住键序: name,ver,pi,ok,tags,meta,nil
+pretty:
+{
+  "a": [
+    1,
+    2
+  ],
+  "b": {}
+}
+四空格前 10 字节: [{
+    "a":]
+紧凑: {"a":[1,2],"b":{}}
+pretty 完还能解析: true
+空容器 pretty: [[]] [{}]
+换行缩进: {"a":[1,2]}
+CRLF: {"a":1}
+空输入: true
+只有左括号: true
+少右括号: true
+尾随逗号: true
+键没引号: true
+单引号: true
+多余内容: true
+前导零: true
+字符串没闭合: true
+坏转义: true
+裸换行: true
+NaN 字面量: true
+只有负号: true
+小数点后空: true
+指数后空: true
+\u 不够四位: true
+ok(): true false
+err_of 没错给空: []
+错误信息带位置: 键 'a' 后面少了 :（第 6 字节附近）
+错误信息带位置2: 值不能以 ']' 开头（第 4 字节附近）
+错误值输出成 null: null
+write_file: true
+parse_file 往返一致: true
+文件末尾有换行: true
+读不到的文件: true
+空文件算错误: true
+手写文件能读: 3

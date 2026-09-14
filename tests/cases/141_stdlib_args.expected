@@ -1,0 +1,32 @@
+程序名: /usr/bin/prog
+base: prog
+长选项带等号: FA
+短开关: true
+长选项带值: x.txt
+no- 前缀: false
+连写短开关: true true true
+数字选项: 3
+位置参数: 2 in1 in2
+越界给空: [] 默认值: 默认
+-- 之后: --keep,-5
+选项顺序: name,v,out,color,a,b,c,level
+has: true false
+没给的用默认: 缺省 -1 2.5 true
+value 没给是空: []
+unknown 全允许: 0
+unknown 挑出拼错: naem
+require_int: 3
+summary:
+prog=prog flags={name=FA, v=true, out=x.txt, color=false, a=true, b=true, c=true, level=3} pos=["in1", "in2"] rest=["--keep", "-5"]
+假值四种写法: false false false false 真值: true
+空值算给过: true []
+-5 被当成短选项 5: true
+单独的 - 是位置参数: -
+--n=-7: -7
+-o 带值: out.txt 末尾 -v 是开关: true
+-h: true
+--help: true
+--version: true
+没给 help: false
+真实位置参数: 0 rest: 0
+真实 argv0 非空: true

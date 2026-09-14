@@ -1,0 +1,388 @@
+# stdlib/re.fa —— 正则表达式（POSIX ERE，走 libc 的 regex.h）
+#
+#   use std.re
+#
+#   if Re.test("2026-09-13", "[0-9]{4}-[0-9]{2}-[0-9]{2}"):
+#       print(Re.find("abc123", "[0-9]+"))           # 123
+#       print(Re.find_all("a1b22c333", "[0-9]+"))    # ["1", "22", "333"]
+#       print(Re.groups("2026-09-13", "([0-9]+)-([0-9]+)-([0-9]+)"))
+#       print(Re.replace("a1b2", "[0-9]", "#"))      # a#b#
+#       print(Re.split("a, b ,c", " *, *"))          # ["a", "b", "c"]
+#
+#   # 循环里反复用同一个模式：编译一次，别每次 Re.find（每次都重新 regcomp）
+#   let r = Re.compile("[0-9]+")
+#   for line in lines:
+#       if r.test(line):
+#           ...
+#   r.free()
+#
+# 语法是 POSIX **扩展**正则（REG_EXTENDED，默认就开着）：`+ ? | () {} []` 直接写，
+# 不用像 BRE 那样加反斜杠。和 Perl/Python 的正则**不完全一样**，这几样没有：
+#   - 非贪婪 `*?`（没有，`.*` 一律贪婪）
+#   - 环视 `(?=...)` `(?!...)`
+#   - `\d \w \s`（要写 [0-9] [A-Za-z0-9_] [[:space:]]）
+#   - 命名组 `(?P<name>...)`（只有编号组）
+# 要这些就得接 PCRE2 / RE2 / Oniguruma：`fa bind pcre2.h --lib pcre2-8` 然后照这个模块的样子包一层。
+use "c/libc.fa"
+
+# 编译好的正则。re_pattern_buffer 是 libc 的内部结构（64 字节，里面有位域，
+# FA 侧只能当不透明的一块内存用），编译时 libc 会往里 malloc 东西，所以：
+#   - 用完要 free()（FA 的引用计数管不到 libc 自己 malloc 的内存）
+#   - 不要复制这个结构体（两份指向同一块内部内存，free 两次就是双重释放）
+struct Regex:
+    preg: re_pattern_buffer
+    nsub: i64                   # 捕获组个数（括号个数）
+    ok: bool                    # 编译成功了吗
+    err: str                    # 失败的话，原因在这里（regerror 给的）
+
+# 一次匹配的结果：整体 + 各个捕获组在原文里的位置
+struct Match:
+    found: bool
+    start: i64                  # 整体匹配的起点
+    end: i64                    # 整体匹配的终点（不含）
+    n: i64                      # 有几个组有值（含整体，所以至少是 1）
+
+const RE_GROUPS: i64 = 16       # 一次最多取 16 个捕获组（含整体）
+const RE_ICASE: i64 = 2         # = REG_ICASE
+const RE_NEWLINE: i64 = 4       # = REG_NEWLINE：. 不匹配换行，^ $ 认行首行尾
+const RE_NOSUB: i64 = 8         # = REG_NOSUB：只要「匹不匹配」，不要位置
+
+struct Re:
+    _ns: i64
+
+impl Re:
+    # ---------------------------------------------------------- 编译
+    fn compile(pat: str) -> Regex:
+        # 扩展正则（+ ? | () {} 直接写）。要控制标志用 compile_flags。
+        return re_compile(pat, REG_EXTENDED)
+
+    fn compile_i(pat: str) -> Regex:
+        # 忽略大小写
+        return re_compile(pat, REG_EXTENDED | REG_ICASE)
+
+    fn compile_with(pat: str, flags: i64) -> Regex:
+        # flags 是 REG_* 的按位或：REG_EXTENDED | REG_ICASE | REG_NEWLINE
+        return re_compile(pat, flags)
+
+    fn basic(pat: str) -> Regex:
+        # POSIX 基本正则（BRE）：+ ? | ( ) { } 要写成 \+ \? \| \( \) \{ \}
+        return re_compile(pat, 0)
+
+    fn ok(pat: str) -> bool:
+        # 模式本身能不能编译（写正则之前先验一下，比运行时才发现好）
+        let r = Re.compile(pat)
+        let got = r.ok
+        r.free()
+        return got
+
+    fn err(pat: str) -> str:
+        # 编译不过的话，原因是什么（能编译就给 ""）
+        let r = Re.compile(pat)
+        let msg = r.err
+        r.free()
+        return msg
+
+    # ---------------------------------------------------------- 一次性用法
+    fn test(s: str, pat: str) -> bool:
+        let r = re_compile(pat, REG_EXTENDED | REG_NOSUB)
+        if not r.ok:
+            return false
+        let got = r.test(s)
+        r.free()
+        return got
+
+    fn test_i(s: str, pat: str) -> bool:
+        let r = re_compile(pat, REG_EXTENDED | REG_ICASE | REG_NOSUB)
+        if not r.ok:
+            return false
+        let got = r.test(s)
+        r.free()
+        return got
+
+    fn find(s: str, pat: str) -> str:
+        # 第一处匹配；没有匹配、或模式写错，都给 ""
+        let r = Re.compile(pat)
+        if not r.ok:
+            return ""
+        let out = r.find(s)
+        r.free()
+        return out
+
+    fn find_i(s: str, pat: str) -> str:
+        let r = Re.compile_i(pat)
+        if not r.ok:
+            return ""
+        let out = r.find(s)
+        r.free()
+        return out
+
+    fn find_all(s: str, pat: str) -> Vec<str>:
+        let r = Re.compile(pat)
+        let out: Vec<str> = Vec<str>()
+        if not r.ok:
+            return out
+        out = r.find_all(s)
+        r.free()
+        return out
+
+    fn find_all_i(s: str, pat: str) -> Vec<str>:
+        let r = Re.compile_i(pat)
+        let out: Vec<str> = Vec<str>()
+        if not r.ok:
+            return out
+        out = r.find_all(s)
+        r.free()
+        return out
+
+    fn count(s: str, pat: str) -> i64:
+        return Re.find_all(s, pat).len()
+
+    fn search(s: str, pat: str) -> Match:
+        # 要位置信息（不只是匹配到的文本）就用这个。
+        # 名字不叫 match，因为 match 是 FA 的关键字（模式匹配那个）。
+        let r = Re.compile(pat)
+        if not r.ok:
+            return re_no_match()
+        let m = r.search(s)
+        r.free()
+        return m
+
+    fn groups(s: str, pat: str) -> Vec<str>:
+        # [0] 是整体匹配，[1] 起是各个括号组。没匹配到给空表。
+        let r = Re.compile(pat)
+        let out: Vec<str> = Vec<str>()
+        if not r.ok:
+            return out
+        out = r.groups(s)
+        r.free()
+        return out
+
+    fn spans(s: str, pat: str) -> Vec<i64>:
+        # 每处匹配两个数：起点、终点（不含）。所以长度是偶数。
+        let r = Re.compile(pat)
+        let out: Vec<i64> = Vec<i64>()
+        if not r.ok:
+            return out
+        out = r.spans(s)
+        r.free()
+        return out
+
+    fn replace(s: str, pat: str, repl: str) -> str:
+        # 替换**所有**匹配
+        let r = Re.compile(pat)
+        if not r.ok:
+            return s
+        let out = r.replace(s, repl)
+        r.free()
+        return out
+
+    fn replace_i(s: str, pat: str, repl: str) -> str:
+        let r = Re.compile_i(pat)
+        if not r.ok:
+            return s
+        let out = r.replace(s, repl)
+        r.free()
+        return out
+
+    fn replace_first(s: str, pat: str, repl: str) -> str:
+        let r = Re.compile(pat)
+        if not r.ok:
+            return s
+        let out = r.replace_n(s, repl, 1)
+        r.free()
+        return out
+
+    fn split(s: str, pat: str) -> Vec<str>:
+        # 按正则切。分隔符本身不要，首尾的空段保留（和 str.split 一致）。
+        let r = Re.compile(pat)
+        let out: Vec<str> = Vec<str>()
+        if not r.ok:
+            out.push(s)
+            return out
+        out = r.split(s)
+        r.free()
+        return out
+
+    fn escape(s: str) -> str:
+        # 把普通文本变成「就按字面匹配这些字符」的模式：a.b -> a\.b
+        let out: Vec<str> = Vec<str>()
+        # {{ }} 是「字面的花括号」（裸写 {} 会被当成插值，见教程 §7）
+        let meta = ".^$*+?()[]{{}}|\\"
+        for i in 0..s.len():
+            let c = s.slice(i, i + 1)
+            if meta.find(c) >= 0:
+                out.push("\\")
+            out.push(c)
+        return out.join("")
+
+# ------------------------------------------------------------------ 编译好的正则
+impl Regex:
+    fn test(self, s: str) -> bool:
+        if not self.ok:
+            return false                # 编译都没成，preg 是块没初始化的内存
+        let m: [regmatch_t; 1]
+        let rc = regexec(&self.preg, s, 1, &m as *void, 0)
+        return rc == 0
+
+    fn find(self, s: str) -> str:
+        let m = self.search(s)
+        if not m.found:
+            return ""
+        return s.slice(m.start, m.end)
+
+    fn search(self, s: str) -> Match:
+        if not self.ok:
+            return re_no_match()
+        let r: Match
+        r.found = false
+        r.start = -1
+        r.end = -1
+        r.n = 0
+        let m: [regmatch_t; RE_GROUPS]
+        let rc = regexec(&self.preg, s, RE_GROUPS as usize, &m as *void, 0)
+        if rc != 0:
+            return r
+        r.found = true
+        r.start = m[0].rm_so as i64
+        r.end = m[0].rm_eo as i64
+        let mut n: i64 = 1
+        for i in 1..RE_GROUPS:
+            if (m[i].rm_so as i64) < 0:      # as 比 < 紧，括号得自己加
+                break
+            n += 1
+        r.n = n
+        return r
+
+    fn groups(self, s: str) -> Vec<str>:
+        let out: Vec<str> = Vec<str>()
+        if not self.ok:
+            return out
+        let m: [regmatch_t; RE_GROUPS]
+        let rc = regexec(&self.preg, s, RE_GROUPS as usize, &m as *void, 0)
+        if rc != 0:
+            return out
+        for i in 0..RE_GROUPS:
+            let so = m[i].rm_so as i64
+            let eo = m[i].rm_eo as i64
+            if so < 0:
+                break
+            out.push(s.slice(so, eo))
+        return out
+
+    fn spans(self, s: str) -> Vec<i64>:
+        # 所有匹配的位置。零长度匹配（比如 a* 在 "bbb" 上）每次前进一个字节，
+        # 不然会卡在原地无限循环。
+        let out: Vec<i64> = Vec<i64>()
+        if not self.ok:
+            return out
+        let mut at: i64 = 0
+        let n = s.len()
+        while at <= n:
+            let rest = s.slice(at, n)
+            let m: [regmatch_t; 1]
+            # regexec 没有「从第 N 个字节开始找」的参数，只能把尾巴切出来给它。
+            # 可这样一来，模式里的 ^ 会在每一段尾巴的开头都成立 —— 所以要带上
+            # REG_NOTBOL，告诉它「你看到的这个开头不是真的行首」。
+            let ef: i64 = 0
+            if at > 0:
+                ef = REG_NOTBOL
+            let rc = regexec(&self.preg, rest, 1, &m as *void, ef as i32)
+            if rc != 0:
+                break
+            let so = m[0].rm_so as i64
+            let eo = m[0].rm_eo as i64
+            out.push(at + so)
+            out.push(at + eo)
+            if eo == so:
+                at += 1
+            else:
+                at += eo
+        return out
+
+    fn find_all(self, s: str) -> Vec<str>:
+        let out: Vec<str> = Vec<str>()
+        let sp = self.spans(s)
+        let mut i: i64 = 0
+        while i + 1 < sp.len():
+            out.push(s.slice(sp.get(i), sp.get(i + 1)))
+            i += 2
+        return out
+
+    fn replace(self, s: str, repl: str) -> str:
+        return self.replace_n(s, repl, -1)
+
+    fn replace_n(self, s: str, repl: str, limit: i64) -> str:
+        # limit < 0 表示「全都换」
+        let sp = self.spans(s)
+        let total = sp.len() / 2
+        if total == 0:
+            return s
+        let out: Vec<str> = Vec<str>()
+        let mut last: i64 = 0
+        let mut i: i64 = 0
+        let mut done: i64 = 0
+        while i < total:
+            if limit >= 0 and done >= limit:
+                break
+            let a = sp.get(i * 2)
+            let b = sp.get(i * 2 + 1)
+            out.push(s.slice(last, a))
+            out.push(repl)
+            last = b
+            done += 1
+            if b == a:
+                # 零长度匹配：把这个字节原样留着，否则会吃掉一个字符
+                if a < s.len():
+                    out.push(s.slice(a, a + 1))
+                    last = a + 1
+            i += 1
+        out.push(s.slice(last, s.len()))
+        return out.join("")
+
+    fn split(self, s: str) -> Vec<str>:
+        let out: Vec<str> = Vec<str>()
+        if not self.ok:
+            out.push(s)                 # 模式是坏的：不切，原样给回去
+            return out
+        let sp = self.spans(s)
+        let mut last: i64 = 0
+        let mut i: i64 = 0
+        while i + 1 < sp.len():
+            out.push(s.slice(last, sp.get(i)))
+            last = sp.get(i + 1)
+            i += 2
+        out.push(s.slice(last, s.len()))
+        return out
+
+    fn free(self):
+        # 释放 libc 在 regcomp 里 malloc 的内部内存。不调用的话，
+        # 每编译一个正则就漏一块（valgrind / ASan 会报 still reachable）。
+        if self.ok:
+            regfree(&self.preg)
+            self.ok = false
+
+# ------------------------------------------------------------------ 内部实现
+fn re_compile(pat: str, flags: i64) -> Regex:
+    let r: Regex
+    r.nsub = 0
+    r.ok = false
+    r.err = ""
+    let rc = regcomp(&r.preg, pat, flags as i32)
+    if rc != 0:
+        let buf: [u8; 256]
+        regerror(rc, &r.preg, &buf as *u8, 256)
+        r.err = cstr(&buf as *u8)
+        return r
+    r.ok = true
+    # re_pattern_buffer 是不透明的（C 那边有位域，FA 没有位域），re_nsub 读不到，
+    # 所以「有几个捕获组」只能等 regexec 回来之后看哪些 rm_so 不是 -1（见 search）。
+    r.nsub = 0
+    return r
+
+fn re_no_match() -> Match:
+    let m: Match
+    m.found = false
+    m.start = -1
+    m.end = -1
+    m.n = 0
+    return m

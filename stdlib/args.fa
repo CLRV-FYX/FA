@@ -1,0 +1,275 @@
+# stdlib/args.fa —— 命令行参数
+#
+#   use std.args
+#
+#   fn main() -> i64:
+#       let a = Args.parse()
+#       if a.want_help():
+#           print("用法：" + a.prog + " [-v] [-o 输出文件] 输入文件...")
+#           return 0
+#       let out = a.text("o", "out.txt")
+#       let verbose = a.boolean("v", false)
+#       for i in 0..a.count():
+#           print(a.pos(i))
+#
+# FA 的内建 args() 给的是原始的 Vec<str>（含 argv[0]），--key=value、-v、
+# 位置参数、`--` 之后原样保留这些规矩都得自己写一遍。这里写好了。
+#
+# 认的写法：
+#   --key=value      key = value
+#   --key value      key = value（下一个 token 不以 - 开头才算值）
+#   --key            key = "true"
+#   --no-key         key = "false"（GNU 那套否定写法）
+#   -k=value         k = value
+#   -k value         k = value（同上，只对**单个**字母的短选项）
+#   -abc             a、b、c 三个开关都为 "true"（短选项可以连着写）
+#   --               后面的全部原样放进 after_dashdash()，不再当选项解析
+#   其它             位置参数，按顺序进 pos / positional()
+#
+# 两个坑，先说在前面：
+#   - 负数当位置参数要写成 --  -5，否则 -5 会被当成短选项 "5"
+#   - `--key value` 里 value 以 - 开头时不算值（会被当成下一个选项），
+#     这种情况请写 --key=-v
+
+struct ArgSet:
+    prog: str                   # argv[0]
+    flags: Map<str, str>        # 选项名 -> 值（开关类的值是 "true" / "false"）
+    order: Vec<str>             # 选项出现的顺序（第一次出现的顺序）
+    pos: Vec<str>               # 位置参数
+    rest: Vec<str>              # `--` 之后的东西，原样
+    seen: Map<str, bool>        # 出现过没有：用来分清「给了空值」和「根本没给」
+
+struct Args:
+    _ns: i64
+
+impl Args:
+    fn parse() -> ArgSet:
+        # 解析真正的命令行（内建 args()）
+        return args_parse(args())
+
+    fn parse_of(av: Vec<str>) -> ArgSet:
+        # 解析你给的一份参数（第一项当程序名）。写测试的时候用它，
+        # 不用真的去起一个进程。
+        return args_parse(av)
+
+    fn usage(text: str):
+        # 把用法说明打到标准输出
+        print(text)
+
+impl ArgSet:
+    # ---------------------------------------------------------- 选项
+    fn has(self, name: str) -> bool:
+        # 这个选项出现过吗（长选项写全名，短选项写那个字母，都不带 -）
+        return self.seen.has(name)
+
+    fn names(self) -> Vec<str>:
+        # 出现过的选项名，按第一次出现的顺序
+        let out: Vec<str> = Vec<str>()
+        for i in 0..self.order.len():
+            out.push(self.order.get(i))
+        return out
+
+    fn text(self, name: str, d: str) -> str:
+        # 选项的字符串值；没给就用默认值 d
+        if self.seen.has(name):
+            return self.flags.get(name)
+        return d
+
+    fn value(self, name: str) -> str:
+        # 和 text 一样，只是没给的时候给 ""
+        return self.text(name, "")
+
+    fn int(self, name: str, d: i64) -> i64:
+        # 选项的整数值。没给用 d；给了但不是数字，给 0（要严格一点用 require_int）
+        if not self.seen.has(name):
+            return d
+        let v = self.flags.get(name)
+        if v == "true":
+            return 1
+        if v == "false":
+            return 0
+        return v.to_i64()
+
+    fn require_int(self, name: str) -> i64:
+        # 必须是整数，否则 panic 并把话说明白（--port=abc 这种一眼能看出来）
+        if not self.seen.has(name):
+            panic("缺少必需的选项 --" + name)
+        let v = self.flags.get(name)
+        let n = v.to_i64()
+        if n == 0 and v != "0":
+            panic("选项 --" + name + " 要一个整数，得到的是 '" + v + "'")
+        return n
+
+    fn num(self, name: str, d: f64) -> f64:
+        if not self.seen.has(name):
+            return d
+        return self.flags.get(name).to_f64()
+
+    fn boolean(self, name: str, d: bool) -> bool:
+        # 开关。--v 是 true，--no-v 是 false，--v=false / --v=0 / --v=no / --v=off 也是 false。
+        # 名字不叫 bool，因为 bool 是类型名，当不了方法名。
+        if not self.seen.has(name):
+            return d
+        let v = self.flags.get(name)
+        if v == "false" or v == "0" or v == "no" or v == "off":
+            return false
+        return true
+
+    fn want_help(self) -> bool:
+        return self.has("h") or self.has("help")
+
+    fn want_version(self) -> bool:
+        return self.has("V") or self.has("version")
+
+    fn help_or(self, text: str):
+        # -h / --help 就把用法打出来然后退出（退出码 0）。放在 main 开头最省事：
+        #   a.help_or("用法：prog [-v] [-o 文件] 输入...")
+        if self.want_help():
+            print(text)
+            exit(0)
+
+    fn unknown(self, allowed: Vec<str>) -> Vec<str>:
+        # 拼错的选项：把不在 allowed 里的挑出来。allowed 里写不带 - 的名字。
+        let out: Vec<str> = Vec<str>()
+        for i in 0..self.order.len():
+            let k = self.order.get(i)
+            let mut ok = false
+            for j in 0..allowed.len():
+                if allowed.get(j) == k:
+                    ok = true
+            if not ok:
+                out.push(k)
+        return out
+
+    fn require(self, names: Vec<str>):
+        # 这些选项必须都给；少了就 panic，把少的一次说全
+        let missing: Vec<str> = Vec<str>()
+        for i in 0..names.len():
+            if not self.seen.has(names.get(i)):
+                missing.push("--" + names.get(i))
+        if missing.len() > 0:
+            panic("缺少必需的选项：" + missing.join(" "))
+
+    # ---------------------------------------------------------- 位置参数
+    fn count(self) -> i64:
+        return self.pos.len()
+
+    fn positional(self) -> Vec<str>:
+        let out: Vec<str> = Vec<str>()
+        for i in 0..self.pos.len():
+            out.push(self.pos.get(i))
+        return out
+
+    fn pos(self, i: i64) -> str:
+        # 第 i 个位置参数；越界给 ""
+        if i < 0 or i >= self.pos.len():
+            return ""
+        return self.pos.get(i)
+
+    fn pos_or(self, i: i64, d: str) -> str:
+        if i < 0 or i >= self.pos.len():
+            return d
+        return self.pos.get(i)
+
+    fn after_dashdash(self) -> Vec<str>:
+        # `--` 之后的所有 token，原样（要执行别的命令、要传负数的时候用）
+        let out: Vec<str> = Vec<str>()
+        for i in 0..self.rest.len():
+            out.push(self.rest.get(i))
+        return out
+
+    fn program(self) -> str:
+        # argv[0]。要「就叫 prog 而不是一长串路径」用 base()。
+        return self.prog
+
+    fn base(self) -> str:
+        let p = self.prog
+        let i = p.rfind("/")
+        if i < 0:
+            return p
+        return p.slice(i + 1, p.len())
+
+    fn summary(self) -> str:
+        # 一行说明解析结果，调试的时候 print(a.summary()) 就够
+        let fs: Vec<str> = Vec<str>()
+        for i in 0..self.order.len():
+            let k = self.order.get(i)
+            fs.push(k + "=" + self.flags.get(k))
+        # 注意那两处 {{ 和 }}：字符串里单个 { 是插值的开头，
+        # 写字面花括号必须成对（和 Python 的 f-string、Rust 的 format! 一个规矩）。
+        return ("prog=" + self.base()
+                + " flags={{" + fs.join(", ") + "}}"
+                + " pos=" + self.pos.to_str()
+                + " rest=" + self.rest.to_str())
+
+# ------------------------------------------------------------------ 内部实现
+fn args_set(r: ArgSet, k: str, v: str):
+    if not r.seen.has(k):
+        r.order.push(k)
+        r.seen.set(k, true)
+    r.flags.set(k, v)
+
+fn args_parse(av: Vec<str>) -> ArgSet:
+    let r: ArgSet
+    r.prog = ""
+    if av.len() > 0:
+        r.prog = av.get(0)
+    let mut i: i64 = 1                      # 0 是程序名，跳过
+    let mut dashdash = false
+    while i < av.len():
+        let t = av.get(i)
+        if dashdash:
+            r.rest.push(t)
+            i += 1
+            continue
+        if t == "--":
+            dashdash = true
+            i += 1
+            continue
+        if t.len() >= 2 and t.starts_with("--"):
+            let body = t.slice(2, t.len())
+            let eq = body.find("=")
+            if eq >= 0:
+                args_set(r, body.slice(0, eq), body.slice(eq + 1, body.len()))
+                i += 1
+                continue
+            if body.len() > 3 and body.starts_with("no-"):
+                # --no-color：GNU 的否定写法，等于 --color=false
+                args_set(r, body.slice(3, body.len()), "false")
+                i += 1
+                continue
+            if i + 1 < av.len() and not av.get(i + 1).starts_with("-"):
+                args_set(r, body, av.get(i + 1))
+                i += 2
+                continue
+            args_set(r, body, "true")
+            i += 1
+            continue
+        if t.len() >= 2 and t.starts_with("-"):
+            let body = t.slice(1, t.len())
+            let eq = body.find("=")
+            if eq >= 0:
+                args_set(r, body.slice(0, eq), body.slice(eq + 1, body.len()))
+                i += 1
+                continue
+            if body.len() == 1:
+                if i + 1 < av.len() and not av.get(i + 1).starts_with("-"):
+                    args_set(r, body, av.get(i + 1))
+                    i += 2
+                    continue
+                args_set(r, body, "true")
+                i += 1
+                continue
+            # -abc：连着写的短开关
+            for j in 0..body.len():
+                args_set(r, body.slice(j, j + 1), "true")
+            i += 1
+            continue
+        if t.len() == 1 and t == "-":
+            # 单独一个 - 惯例上是「标准输入」，当位置参数留着
+            r.pos.push(t)
+            i += 1
+            continue
+        r.pos.push(t)
+        i += 1
+    return r

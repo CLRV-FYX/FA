@@ -569,6 +569,7 @@ class BindResult:
         self.dropped: List[Tuple[str, str]] = []
         self.header = ""
         self.lib = ""
+        self.header_libs: Dict[str, str] = {}
 
 
 # ------------------------------------------------------------------ 声明归类
@@ -660,6 +661,21 @@ def _decl_name(u: str) -> str:
     body = u.rstrip(";").strip()
     body = re.sub(r"^typedef\s+", "", body)
     body = re.sub(r"^(extern|static)\s+", "", body)
+    # 返回结构体（指针）的**函数声明**不是结构体定义：
+    #   extern struct dirent *readdir (DIR *__dirp);
+    # 整条去掉分号后以 `)` 收尾，就是函数声明符，名字取第一个 `(` 前面那个标识符。
+    # 以前这条会掉进下面的 struct 分支，名字被取成返回类型里的 tag（dirent），
+    # 于是 --only readdir 一个都匹配不上、readdir 整个函数被悄悄丢掉。
+    # C 里返回 struct X* 的函数极常见（readdir / localtime / getpwnam / ...），
+    # 这一条不修，「绑任何库」就绑不动。
+    if body.endswith(")") and "(" in body and "{" not in body:
+        lp0 = body.find("(")
+        mm0 = re.findall(r"[A-Za-z_]\w*", body[:lp0])
+        if mm0:
+            cand0 = mm0[-1]
+            if cand0 in ("struct", "union", "enum", "sizeof") and len(mm0) > 1:
+                cand0 = mm0[-2]
+            return cand0
     if re.match(r"^(struct|union|enum)\b", body):
         t = _tag_of(body)
         if t:
@@ -685,6 +701,8 @@ def _include_spelling(hdr: str, extra_dirs) -> str:
     系统头文件写成相对形式（regex.h / curl/curl.h），换台机器也一样能用；
     项目自己的头文件写绝对路径，因为别人猜不到你放哪了。
     """
+    if not os.path.exists(hdr):
+        return hdr                      # 只写了名字（sys/stat.h）：原样交回去
     ap = os.path.abspath(hdr)
     for d in _SYS_INC:
         if ap.startswith(d):
@@ -727,6 +745,7 @@ def _c_num(text: str) -> Optional[object]:
 # ------------------------------------------------------------------ 主体
 class Binder:
     def __init__(self, headers: List[str], lib: str = "", only=None, exclude=None,
+                 ptr_return=None,
                  deep: bool = False, private: bool = False, verify: bool = True,
                  cc: str = "cc", include_dirs=None, defines=None,
                  no_probe: bool = False, strict: bool = False):
@@ -734,6 +753,13 @@ class Binder:
         self.lib = lib
         self.only = set(only) if only else None
         self.exclude = set(exclude) if exclude else set()
+        # 这些函数的 char* 返回值**不要**转成 str，保留 *u8。
+        # 转成 str 看着方便（自动拷、自动按 NUL 收尾），可是「返回 NULL」这个信息就没了：
+        # strptime 解析失败给 NULL、strchr 没找到给 NULL、getenv 变量不存在给 NULL，
+        # 在 FA 侧统统变成 ""，调用方分不清「没有」和「有个空字符串」。
+        self.ptr_return = set(ptr_return) if ptr_return else set()
+        # 预处理输出里出现过的文件 -> 用户命令行写的那个头文件（谁把它带进来的）
+        self.file_owner: Dict[str, str] = {}
         self.deep = deep
         self.private = private
         self.verify = verify
@@ -742,6 +768,8 @@ class Binder:
         self.defines = defines or []
         self.no_probe = no_probe
         self.strict = strict
+        self._tmp_dirs: List[str] = []
+        self._real_paths: Dict[str, str] = {}
         self.probed: Dict[str, dict] = {}
         self.typedefs: Dict[str, CType] = {}
         self.structs: Dict[str, Optional[List]] = {}     # tag → [(字段名, CType)] / None=union
@@ -760,6 +788,40 @@ class Binder:
         self._line_owner: Dict[int, str] = {}
 
     # ---------------------------------------------------------- 预处理
+    def resolve_header(self, header: str) -> Tuple[str, List[str]]:
+        """返回 (交给 cc 的路径, 算作「目标文件」的名字集合)。
+
+        写 `/usr/include/zlib.h` 就直接用；写 `sys/stat.h` 这种（Debian 上真身在
+        /usr/include/x86_64-linux-gnu/sys/stat.h）就生成一个临时 .c 去 include，
+        再用 `cc -M` 问出预处理器实际打开的是哪个文件，把它算成目标。
+        """
+        names = {os.path.realpath(header), os.path.abspath(header),
+                 os.path.basename(header), header}
+        if os.path.exists(header):
+            return header, sorted(names)
+        import tempfile
+        td = tempfile.mkdtemp(prefix="fa_bind_")
+        wrapper = os.path.join(td, "_fa_bind_wrapper.c")
+        with open(wrapper, "w") as f:
+            f.write(f"#include <{header}>\n")
+        self._tmp_dirs.append(td)
+        # 问 cc：这个 include 落到哪个文件上
+        cmd = [self.cc, "-M", "-D_GNU_SOURCE"]
+        for d in self.include_dirs:
+            cmd.append(f"-I{d}")
+        cmd.append(wrapper)
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0:
+            for tok in r.stdout.replace("\\", " ").split():
+                tok = tok.strip()
+                if tok.endswith("/" + header) or tok == header \
+                        or os.path.basename(tok) == os.path.basename(header):
+                    names.add(os.path.realpath(tok))
+                    names.add(tok)
+        names.add(header)
+        return wrapper, sorted(names)
+
+    # ---------------------------------------------------------- 预处理
     def preprocess(self, header: str) -> Optional[str]:
         cmd = [self.cc, "-E", "-dD", "-D_GNU_SOURCE",
                "-D__extension__=", "-D__attribute__(x)=", "-D__asm__(x)=",
@@ -775,7 +837,7 @@ class Binder:
         return p.stdout if p.returncode == 0 else None
 
     # ---------------------------------------------------------- 扫描
-    def scan(self, text: str) -> List[Tuple[str, str, str]]:
+    def scan(self, text: str, owner: str = "") -> List[Tuple[str, str, str]]:
         """[(来源文件, 类别, 声明文本)]。
 
         预处理输出里带 `# 行号 "文件"` 标记，据此知道每条声明出自哪个文件：
@@ -795,6 +857,14 @@ class Binder:
             m = re.match(r'^#\s+\d+\s+"([^"]+)"', raw)
             if m:
                 cur = m.group(1)
+                # 每个头文件是**各自**预处理的，所以这一段里出现过的文件都是从
+                # owner 那个头文件（直接或间接）拉进来的。记下来，输出时才知道
+                # 该把声明放进哪个 `use c` 块 —— math.h 的函数真身在
+                # bits/mathcalls.h，不记的话它们会被算到命令行第一个头文件头上，
+                # 跟着挂错 lib（-lm 的函数挂到 -lc 那块，链接就找不到符号了）。
+                if owner and cur not in self.file_owner \
+                        and not cur.startswith("<") and os.path.exists(cur):
+                    self.file_owner[cur] = owner
                 continue
             if raw.startswith("#"):
                 line = cont + raw
@@ -1048,22 +1118,24 @@ class Binder:
     # ---------------------------------------------------------- 绑定
     def bind(self) -> BindResult:
         target = set()
-        for h in self.headers:
-            target.add(os.path.realpath(h))
-            target.add(os.path.abspath(h))
-            target.add(os.path.basename(h))
         items: List[Tuple[str, str, str]] = []
         ok_headers = []
+        real_paths: Dict[str, str] = {}
         for h in self.headers:
-            text = self.preprocess(h)
+            path, names = self.resolve_header(h)
+            target.update(names)
+            text = self.preprocess(path)
             if text is None:
                 self.res.skipped.append(
                     (h, f"预处理失败：{self.cc} 读不了这个头文件（装对应的 -dev 包了吗？）"))
                 continue
             ok_headers.append(h)
-            items.extend(self.scan(text))
+            real_paths[h] = path
+            items.extend(self.scan(text, h))
         if not ok_headers:
+            self.cleanup()
             return self.res
+        self._real_paths = real_paths
         self.collect(items)
 
         def in_target(src: str) -> bool:
@@ -1087,24 +1159,57 @@ class Binder:
         # 结构体先定：函数签名里要写 FA 的结构体名。
         # 遍历收集到的所有结构体（而不是遍历声明单元）—— `typedef struct {...} X;`
         # 这种就地定义在声明层面是 typedef，按单元遍历会漏掉。
-        proto_blob = "\n".join(u for _s, c, u in items if c == "fn" and in_target(_s))
+        # 只看**会被输出**的那些函数原型：--only 挑了 4 个函数，就没必要把整个
+        # 头文件里出现过的结构体（statx / file_handle / random_data ...）都拖进来。
+        proto_blob = "\n".join(u for _s, c, u in items
+                               if c == "fn" and in_target(_s)
+                               and self._name_wanted(_decl_name(u)))
         want_tags = []
         for tag, src in self.struct_src.items():
-            if not in_target(src):
-                continue
             if tag in self.exclude:
                 continue
             if not self.private and tag.startswith(SKIP_PREFIX):
                 continue
-            if self.only is not None and tag not in self.only \
-                    and not re.search(r"\b" + re.escape(tag) + r"\b", proto_blob):
+            mentioned = re.search(r"\b" + re.escape(tag) + r"\b", proto_blob)
+            if not in_target(src):
+                # 定义在别的文件里的结构体：bits/dirent.h 的 struct dirent、
+                # bits/types/struct_timespec.h 的 struct timespec 都是这种。
+                # 只要**要输出的函数原型**里提到了它就得带上 —— 不带的话
+                # `struct dirent *readdir(DIR *)` 的返回类型映射不了，
+                # readdir 整个函数会被悄悄丢掉（--only readdir 也拿不到东西，
+                # 而且没有任何提示）。
+                if not mentioned:
+                    continue
+            elif self.only is not None and tag not in self.only and not mentioned:
                 continue
             want_tags.append(tag)
-        self.probed = {} if self.no_probe else self.probe_layouts(want_tags, ok_headers)
+        probe_headers = [self._real_paths.get(h, h) for h in ok_headers]
+        # 探针要量的不只是「会被输出」的那些：结构体字段里引用的**嵌套**结构体也得量。
+        # sys/stat.h 的 st_atim 是 struct timespec，而 timespec 的定义在
+        # bits/types/struct_timespec.h 里 —— 那不是目标文件，不进 want_tags，
+        # 于是量不到；_plan_struct 递归到它时发现没探针，只能报「映射不了」，
+        # 连累整个 struct stat 退化成 144 字节的不透明数组，st_size 都读不出来。
+        probe_tags = list(want_tags)
+        seen_probe = set(probe_tags)
+        pending = list(want_tags)
+        while pending:
+            t = pending.pop(0)
+            for _fn, fty in self.structs.get(t) or []:
+                inner = self._struct_tag_of(fty)
+                if not inner or inner not in self.structs or inner in seen_probe:
+                    continue
+                if inner in self.exclude:
+                    continue
+                if not self.private and inner.startswith(SKIP_PREFIX):
+                    continue
+                seen_probe.add(inner)
+                probe_tags.append(inner)
+                pending.append(inner)
+        self.probed = {} if self.no_probe else self.probe_layouts(probe_tags, probe_headers)
         for tag in want_tags:
             self._plan_struct(tag, [])
 
-        fn_lines: List[Tuple[str, str]] = []
+        fn_lines: List[Tuple[str, str, str]] = []      # (来源头文件, 名字, 声明行)
         const_lines: List[Tuple[str, str]] = []
         struct_lines: List[Tuple[str, str]] = []
         seen_fn: set = set()
@@ -1122,7 +1227,9 @@ class Binder:
                     fname, line = self._emit_fn(u)
                     if line and fname not in seen_fn:
                         seen_fn.add(fname)
-                        fn_lines.append((fname, line))
+                        fn_lines.append(
+                            (_owner_header(src, ok_headers, self.file_owner),
+                             fname, line))
                 elif cat == "define":
                     pending_defines.append((src, nm0, u))   # 过滤在输出阶段做
                 elif cat == "enum":
@@ -1163,16 +1270,47 @@ class Binder:
             if fa not in [x[0] for x in struct_lines]:
                 struct_lines.append(self._render_struct(tag, fa))
 
-        self.res.fns = [n for n, _ in fn_lines]
+        # --only 点名要、结果一个都没生成的名字：必须说出来。
+        # 静默少东西最难查 —— 用户以为是头文件里没有，其实是拼错了 / 那是个宏 /
+        # 它的类型映射不了。生成文件末尾的「跳过」清单就是干这个的。
+        if self.only:
+            got = set()
+            for _h, n, _l in fn_lines:
+                got.add(n)
+                got.add(_strip_c_prefix(n))
+            for n, _l in const_lines:
+                got.add(n)
+            for tag, fa in self.emitted_structs.items():
+                got.add(tag)
+                got.add(fa)
+            for nm in sorted(self.only - got):
+                self.res.skipped.append(
+                    (nm, "--only 点名要它，但没有任何声明生成出来："
+                         "名字拼错了？它是个宏（那要在常量里找）？还是它的类型 FA 映射不了"
+                         "（看上面几条的原因）"))
+
+        self.res.fns = [n for _h, n, _l in fn_lines]
         self.res.consts = [n for n, _ in const_lines]
         self.res.structs = [n for n, _ in struct_lines]
         self.res.header = ok_headers[0]
         self.res.lib = self.lib or GUESS_LIB.get(
-            os.path.basename(ok_headers[0]), GUESS_LIB.get(ok_headers[0], ""))
-        self.res.text = self._render(ok_headers, fn_lines, const_lines, struct_lines)
+            ok_headers[0], GUESS_LIB.get(os.path.basename(ok_headers[0]), ""))
+        # 每个头文件自己要链哪个库（--lib 只给了一个时用这个）
+        self.res.header_libs = {
+            h: (self.lib or GUESS_LIB.get(h, GUESS_LIB.get(os.path.basename(h), "")))
+            for h in ok_headers}
+        self.res.text = self._render(ok_headers, fn_lines, const_lines,
+                                     struct_lines, self.res.header_libs)
         if self.verify:
             self._verify_and_prune()
+        self.cleanup()
         return self.res
+
+    def cleanup(self):
+        import shutil
+        for d in getattr(self, "_tmp_dirs", []):
+            shutil.rmtree(d, ignore_errors=True)
+        self._tmp_dirs = []
 
     # --- 过滤
     def _name_wanted(self, nm: str) -> bool:
@@ -1186,6 +1324,13 @@ class Binder:
             # typedef 名在 only 里、但结构体 tag 不在：也算要
             real = self.typedefs.get(nm)
             if real is not None and real.kind == "struct" and real.name in self.only:
+                return True
+            # --only 也认**生成物里的名字**。C 的 sqrt 撞上 FA 的内建，输出时写成
+            # c_sqrt（后面带 = "sqrt" 绑回真符号）；用户照着生成出来的文件再收窄
+            # 一次，写的自然是 c_sqrt。只认 C 原名的话，这个块一个函数都绑不到，
+            # 生成出来只剩一句 fa_bind_nothing_found()，看着像 bindgen 坏了。
+            fa_nm, _alias = self._fn_name(nm)
+            if fa_nm != nm and fa_nm in self.only:
                 return True
             return False
         return True
@@ -1539,6 +1684,8 @@ class Binder:
                 # const char* → str（FA 自动转；C 返回的 char* 也自动拷成 str）；
                 # 非 const 的 char* 通常是要写进去的缓冲区，映射成 *u8 更安全。
                 if pos == "return" or "const" in (ty.qual or ""):
+                    if pos == "return" and name in self.ptr_return:
+                        return "*u8", ""
                     return "str", ""
                 return "*u8", ""
             fa, note = self.map_type(inner, pos="inner", name=name)
@@ -1632,31 +1779,41 @@ class Binder:
         return self._c_sizeof_align(ty)[0]
 
     # ---------------------------------------------------------- 输出
-    def _render(self, headers, fn_lines, const_lines, struct_lines) -> str:
-        hdr = headers[0]
-        lib = self.res.lib
+    def _render(self, headers, fn_lines, const_lines, struct_lines,
+                header_libs) -> str:
+        libs = sorted({l for l in header_libs.values() if l})
         out = ["# 由 `fa bind` 自动生成 —— 不要手改，改了下次生成会覆盖。",
                f"# 命令：fa bind {' '.join(headers)}"
-               + (f" --lib {lib}" if lib else "")
+               + (f" --lib {self.lib}" if self.lib else "")
                + (" --deep" if self.deep else "")
                + (" --strict" if self.strict else "")
                + (" --private" if self.private else ""),
-               f"# 头文件：{hdr}（预处理：{self.cc} -E -dD -D_GNU_SOURCE）",
+               f"# 头文件：{'、'.join(headers)}（预处理：{self.cc} -E -dD -D_GNU_SOURCE）",
                f"# 结果：函数 {len(fn_lines)} 个，常量 {len(const_lines)} 个，"
-               f"结构体 {len(struct_lines)} 个，跳过 {len(self.res.skipped)} 项",
+               f"结构体 {len(struct_lines)} 个，跳过 {len(self.res.skipped)} 项"
+               + (f"，链接 {' '.join('-l' + l for l in libs)}" if libs else ""),
                ""]
-        libtxt = f' lib "{lib}"' if lib else ""
-        out.append(f'use c "{_include_spelling(hdr, self.include_dirs)}"{libtxt}:')
         self._line_owner = {}
-        if fn_lines:
-            for nm, line in fn_lines:
-                for ln in line.split("\n"):
-                    out.append("    " + ln if ln.startswith("fn ") else ln)
-                self._line_owner[len(out)] = nm
-        else:
-            out.append("    fn fa_bind_nothing_found() -> void")
-            self._line_owner[len(out)] = "fa_bind_nothing_found"
-        out.append("")
+        # 按头文件分组：每组一个 use c 块，写自己的头文件与自己的 lib
+        by_header: Dict[str, List[Tuple[str, str]]] = {}
+        for h in headers:
+            by_header[h] = []
+        for h, nm, line in fn_lines:
+            by_header.setdefault(h, []).append((nm, line))
+        for h in headers:
+            group = by_header.get(h) or []
+            lib = header_libs.get(h, "")
+            libtxt = f' lib "{lib}"' if lib else ""
+            out.append(f'use c "{_include_spelling(h, self.include_dirs)}"{libtxt}:')
+            if group:
+                for nm, line in group:
+                    for ln in line.split("\n"):
+                        out.append("    " + ln if ln.startswith("fn ") else ln)
+                    self._line_owner[len(out)] = nm
+            else:
+                out.append("    fn fa_bind_nothing_found() -> void")
+                self._line_owner[len(out)] = "fa_bind_nothing_found"
+            out.append("")
         for nm, body in struct_lines:
             for ln in body.split("\n"):
                 out.append(ln)
@@ -1730,13 +1887,55 @@ class Binder:
         return False
 
 
+def _strip_c_prefix(nm: str) -> str:
+    """FA 侧名字 -> C 名字：c_sqrt -> sqrt（本来就是 C 名的原样返回）。"""
+    return nm[2:] if nm.startswith("c_") and nm[2:3].islower() else nm
+
+
+def _owner_header(src: str, headers: List[str],
+                  file_owner: Optional[Dict[str, str]] = None) -> str:
+    """预处理输出里的文件路径 → 用户在命令行写的那个头文件名。
+
+    两种情况会对不上：
+      * 绑 sys/stat.h 时，声明其实来自 /usr/include/x86_64-linux-gnu/sys/stat.h
+        （Debian 的多架构布局），可 `use c` 里该写的是用户给的 sys/stat.h；
+      * 声明出自被**间接**include 进来的文件：math.h 的函数真身全在
+        bits/mathcalls.h 里，dirent.h 会带出 bits/dirent.h。这种要靠 file_owner
+        （scan 时记下的「谁把它带进来的」）才知道归属。
+    以前没有第二层，间接文件一律算到 headers[0] 头上：一次绑
+    dirent.h + time.h + math.h，sqrt 会被写进 dirent.h 那块（挂 -lc），
+    math.h 那块反而空了（挂 -lm 却没人用）—— 链接必错。
+    """
+    if file_owner:
+        for key in (src, os.path.realpath(src)):
+            if key in file_owner:
+                return file_owner[key]
+    rp = os.path.realpath(src)
+    for h in headers:
+        if os.path.exists(h) and os.path.realpath(h) == rp:
+            return h
+        if src.endswith("/" + h) or src == h or os.path.basename(src) == os.path.basename(h):
+            return h
+    if file_owner:
+        # 还是对不上：找一个「和它同一套」的用户头文件，别一股脑塞给第一个
+        base = os.path.dirname(rp)
+        for f, h in file_owner.items():
+            if os.path.dirname(os.path.realpath(f)) == base and h in headers:
+                return h
+    return headers[0]
+
+
 def _safe_param_name(nm: str, i: int) -> str:
     """C 的参数名 → FA 的参数名：glibc 爱加下划线（__preg），撞关键字的也要换。"""
     if not nm:
         return f"a{i}"
     clean = nm.lstrip("_")
-    if not clean or clean in FA_RESERVED:
+    if not clean:
         return f"a{i}"
+    if clean in FA_RESERVED:
+        # `rename(const char *old, const char *new)`：new 在 FA 里是关键字，
+        # 直接叫 a1 看不出对应哪个参数，加个下标后缀更像原名。
+        return f"{clean}_{i}"
     return clean
 
 
@@ -1816,9 +2015,11 @@ def _split_top_commas(text: str) -> List[str]:
 
 # ------------------------------------------------------------------ 对外入口
 def bind(headers: List[str], lib: str = "", only=None, exclude=None, deep=False,
+         ptr_return=None,
          private=False, verify=True, cc="cc", include_dirs=None, defines=None,
          no_probe=False, strict=False) -> BindResult:
     b = Binder(list(headers), lib=lib, only=only, exclude=exclude, deep=deep,
+               ptr_return=ptr_return,
                private=private, verify=verify, cc=cc,
                include_dirs=include_dirs, defines=defines, no_probe=no_probe,
                strict=strict)
@@ -1833,8 +2034,13 @@ USAGE = """fa bind —— 把 C 头文件自动翻成 FA 的绑定
 选项:
   -o <文件.fa>     输出到文件（默认 <头文件名>_fa.fa；写 - 表示打到 stdout）
   --lib <名字>     链接的库（"m" -> -lm；也可以给 .so/.a 的路径）。不给就按头文件名猜
-  --only a,b,c     只绑这几个名字（函数 / 常量 / 结构体）
+  --only a,b,c     只绑这几个名字（函数 / 常量 / 结构体）。
+                   C 名字和生成物里的名字都认：--only sqrt 和 --only c_sqrt 是一回事
+                   （sqrt 撞上 FA 内建，输出时会改名成 c_sqrt）
   --exclude a,b    跳过这几个名字
+  --ptr-return a,b 这几个函数的 char* 返回值保留成 *u8（不转 str），
+                   因为它们返回 NULL 是有意义的：strptime 解析失败给 NULL，
+                   strchr 没找到给 NULL，getenv 变量不存在给 NULL
   --include <dir>  预处理时的 -I（可多次给）
   --define <X=1>   预处理时的 -D（可多次给）
   --strict         只要目标头文件自己的声明（默认还要它所属那套库的分片，
@@ -1864,6 +2070,7 @@ def main(argv: List[str]) -> int:
     lib = ""
     only = None
     exclude = None
+    ptr_return = None
     deep = private = False
     strict = False
     verify = True
@@ -1881,6 +2088,8 @@ def main(argv: List[str]) -> int:
             only = [x for x in argv[i + 1].split(",") if x]; i += 2; continue
         if a == "--exclude":
             exclude = [x for x in argv[i + 1].split(",") if x]; i += 2; continue
+        if a == "--ptr-return":
+            ptr_return = [x for x in argv[i + 1].split(",") if x]; i += 2; continue
         if a == "--include":
             incs.append(argv[i + 1]); i += 2; continue
         if a == "--define":
@@ -1920,6 +2129,7 @@ def main(argv: List[str]) -> int:
             print("  提示：需要装对应的 -dev 包（Debian/Ubuntu: apt install <库名>-dev）")
             return 1
     res = bind(headers, lib=lib, only=only, exclude=exclude, deep=deep,
+               ptr_return=ptr_return,
                private=private, verify=verify, cc=ccname, include_dirs=incs,
                defines=defs, strict=strict)
     if not res.text:

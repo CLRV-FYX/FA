@@ -1,0 +1,44 @@
+# 五个标准库模块一起导进来，确认它们互不冲突（都靠「空结构体 + 静态方法」
+# 当命名空间：Fs.join / Time.now / Re.find / Json.parse / Args.parse）。
+use std.fs
+use std.time
+use std.re
+use std.json
+use std.args
+
+fn main() -> i64:
+    # 路径 + 正则
+    let p = "/tmp/fa_case_148/data.log"
+    Fs.make_dir_all("/tmp/fa_case_148")
+    Fs.write(p, "2026-09-13 INFO 启动\n2026-09-13 ERROR 磁盘满了\n2026-09-14 INFO 恢复\n")
+    let lines = Fs.read_lines(p)
+    print("行数:", lines.len())
+    let mut errs: i64 = 0
+    for i in 0..lines.len():
+        if Re.test(lines.get(i), " ERROR "):
+            errs += 1
+    print("ERROR 行数:", errs)
+    print("第一行的日期:", Re.find(lines.get(0), "[0-9]+-[0-9]+-[0-9]+"))
+
+    # 时间 + JSON
+    let ts = Time.make_utc(2026, 9, 13, 6, 3, 22)
+    let rec = Json.object()
+    rec.set("when", Json.string(Time.iso_utc(ts)))
+    rec.set("size", Json.integer(Fs.size(p)))
+    rec.set("levels", Json.from_vec_str(Vec<str>["INFO", "ERROR"]))
+    rec.set("errors", Json.integer(errs))
+    let text = Json.dump(rec)
+    print("JSON:", text)
+    print("再解析回来:", Json.parse(text).path("levels.1").text())
+    print("时间对得上:", Json.parse(text).get("when").text() == Time.iso_utc(ts))
+
+    # 命令行（不带参数跑，所以只有程序名）
+    let a = Args.parse()
+    print("位置参数个数:", a.count())
+    print("要帮助吗:", a.want_help())
+
+    # 收尾
+    Fs.remove(p)
+    Fs.remove_dir("/tmp/fa_case_148")
+    print("删干净:", not Fs.exists("/tmp/fa_case_148"))
+    return 0

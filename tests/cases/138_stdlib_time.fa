@@ -1,0 +1,81 @@
+# 标准库 std.time：格式化、解析、算日期。
+# 精确输出全部走 UTC 版本（本地时区会随机器变，不能写进 .expected）；
+# 涉及本地时区的只断言「是不是合理」，不断言具体数字。
+use std.time
+
+fn main() -> i64:
+    # 2026-09-13 06:03:22 UTC，一个星期日
+    let ts = Time.make_utc(2026, 9, 13, 6, 3, 22)
+    print("make_utc:", ts)
+    print("iso_utc:", Time.iso_utc(ts))
+    print("format_utc:", Time.format_utc(ts, "%Y-%m-%d %H:%M:%S"))
+    print("date:", Time.format_utc(ts, "%Y-%m-%d"))
+    print("clock:", Time.format_utc(ts, "%H:%M:%S"))
+    print("weekday 全名:", Time.format_utc(ts, "%A"))
+    print("stamp_file:", Time.format_utc(ts, "%Y%m%d_%H%M%S"))
+    print("纪元:", Time.iso_utc(0))
+
+    let p = Time.utc_parts(ts)
+    print("utc_parts:", p.year, p.month, p.day, p.hour, p.min, p.sec, p.weekday, p.yearday)
+    print("is_utc:", p.is_utc)
+    print("weekday_cn:", Time.weekday_cn(ts))
+    print("is_weekend:", Time.is_weekend(ts))
+    print("is_weekend 周一:", Time.is_weekend(Time.make_utc(2026, 9, 14, 0, 0, 0)))
+
+    # 本地时区那组：只验证自洽，不验证具体钟点
+    let lp = Time.parts(ts)
+    print("本地 year 一致:", lp.year >= 2026 and lp.year <= 2027)
+    print("本地 iso 长度:", Time.iso(ts).len())
+    print("本地 iso_offset 带符号:", Time.iso_offset(ts).len() >= 19)
+    print("tz_name 非空:", Time.tz_name(ts).len() > 0)
+    print("tz_offset 是 15 分钟的整数倍:", (Time.tz_offset(ts) % 900) == 0)
+
+    # 解析
+    print("parse UTC:", Time.parse("1970-01-02 00:00:00", "%Y-%m-%d %H:%M:%S") > 0)
+    print("parse 坏输入:", Time.parse("不是日期", "%Y-%m-%d"))
+    print("parse_date 合理:", Time.parse_date("2026-09-13") > 1700000000)
+    print("parse_iso 合理:", Time.parse_iso("2026-09-13T14:03:22") > 1700000000)
+    print("make 非法日期:", Time.make(2026, 2, 30, 0, 0, 0))
+    print("make 合法日期:", Time.make_utc(2026, 2, 28, 0, 0, 0) > 0)
+
+    # 算
+    print("add_days:", Time.iso_utc(Time.add_days(ts, 1)))
+    print("add_hours:", Time.iso_utc(Time.add_hours(ts, 3)))
+    print("add_weeks:", Time.iso_utc(Time.add_weeks(ts, 1)))
+    print("day_start 是本地当天零点:", Time.iso(Time.day_start(ts)).ends_with("T00:00:00"),
+          Time.day_start(ts) <= ts)
+    print("month_start 是本地当月一号:", Time.iso(Time.month_start(ts)).starts_with("2026-09-01T00:00:00"))
+    print("year_start 是本地当年元旦:", Time.iso(Time.year_start(ts)).starts_with("2026-01-01T00:00:00"))
+    print("day_end 比 day_start 大 86399:", Time.day_end(ts) - Time.day_start(ts))
+    print("days_between:", Time.days_between(ts, Time.add_days(ts, 10)))
+    print("days_between 反向:", Time.days_between(Time.add_days(ts, 10), ts))
+    print("days_between 同一天:", Time.days_between(ts, ts + 3600))
+    print("sec_between:", Time.sec_between(ts, ts + 90))
+    print("is_leap:", Time.is_leap(2024), Time.is_leap(2026), Time.is_leap(2000), Time.is_leap(1900))
+    print("days_in_month:", Time.days_in_month(2026, 2), Time.days_in_month(2024, 2),
+          Time.days_in_month(2026, 7), Time.days_in_month(2026, 4))
+    print("days_in_year:", Time.days_in_year(2026), Time.days_in_year(2024))
+
+    # 给人看的
+    print("human:", Time.human(3725))
+    print("human 0:", Time.human(0))
+    print("human 天:", Time.human(90061))
+    print("human 负:", Time.human(-65))
+    print("ago 刚刚:", Time.ago_from(ts - 2, ts))
+    print("ago 秒:", Time.ago_from(ts - 30, ts))
+    print("ago 分:", Time.ago_from(ts - 300, ts))
+    print("ago 时:", Time.ago_from(ts - 7200, ts))
+    print("ago 天:", Time.ago_from(ts - 86400 * 3, ts))
+    print("ago 周:", Time.ago_from(ts - 86400 * 10, ts))
+    print("ago 将来:", Time.ago_from(ts + 3600, ts))
+
+    # 时钟
+    print("now 合理:", Time.now() > 1700000000)
+    print("now_ms 合理:", Time.now_ms() > 1700000000000)
+    print("now_us 合理:", Time.now_us() > 1700000000000000)
+    let m0 = Time.monotonic_ms()
+    let u0 = Time.monotonic_us()
+    print("elapsed_ms 不为负:", Time.elapsed_ms(m0) >= 0)
+    print("elapsed_us 不为负:", Time.elapsed_us(u0) >= 0)
+    print("单调时钟只用来算差:", Time.monotonic_ms() > 0)
+    return 0

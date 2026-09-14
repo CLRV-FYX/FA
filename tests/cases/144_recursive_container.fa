@@ -1,0 +1,62 @@
+# 隔着容器的递归：struct Node 里有 Vec<Node> 和 Map<str, Node>。
+# 容器字段就是一个 8 字节的指针，装什么类型都不会让外层结构体变大，
+# 所以这是安全的 —— 以前会被误判成「按值包含自己（大小无限）」，
+# 于是 JSON 值、树、AST 这类天生递归的结构全得改用 *Node + new/free。
+struct Node:
+    name: str
+    weight: i64
+    kids: Vec<Node>
+    index: Map<str, Node>
+
+fn total_weight(n: Node) -> i64:
+    let mut sum = n.weight
+    for i in 0..n.kids.len():
+        sum += total_weight(n.kids.get(i))
+    return sum
+
+fn main() -> i64:
+    let root: Node
+    root.name = "根"
+    root.weight = 1
+
+    let a: Node
+    a.name = "a"
+    a.weight = 10
+    let b: Node
+    b.name = "b"
+    b.weight = 100
+
+    let a1: Node
+    a1.name = "a1"
+    a1.weight = 1000
+    a.kids.push(a1)
+
+    root.kids.push(a)
+    root.kids.push(b)
+    root.index.set("第一个", a)
+
+    print("sizeof(Node):", sizeof(Node))
+    print("根的孩子数:", root.kids.len())
+    print("a 的孩子数:", root.kids.get(0).kids.len())
+    print("孙辈名字:", root.kids.get(0).kids.get(0).name)
+    print("权重合计:", total_weight(root))
+    print("Map 里那份:", root.index.get("第一个").name, root.index.get("第一个").weight)
+    print("Map 的键数:", root.index.keys().len())
+
+    # 深层再套一层，确认不是只有两层能用
+    let deep: Node
+    deep.name = "深"
+    deep.weight = 1
+    let mut cur = deep
+    for i in 0..5:
+        let kid: Node
+        kid.name = "第" + i.to_str() + "层"
+        kid.weight = i
+        cur.kids.push(kid)
+        cur = cur.kids.get(cur.kids.len() - 1)
+    print("链长:", deep.kids.len(), deep.kids.get(0).name)
+
+    # 容器共享：结构体赋值是浅的，里面的 Vec 是同一份
+    let copy = root
+    print("拷贝看到同样的孩子:", copy.kids.len())
+    return 0

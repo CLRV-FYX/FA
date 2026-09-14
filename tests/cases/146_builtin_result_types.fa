@@ -1,0 +1,29 @@
+# file_write 和 sign 的静态类型以前是 any：
+#   if file_write(p, s) != 0   ->  「无法比较 any 与 i64」
+#   if sign(x) < 0             ->  同样报错
+# 只能 as i64 绕过去。运行时返回的一直是对的（file_write 给 1/0，
+# sign 给 -1/0/1 且跟随实参类型），漏的只是语义层的类型。
+use std.fs
+
+fn main() -> i64:
+    let path = "/tmp/fa_case_146.txt"
+    let ok = file_write(path, "内容")
+    print("file_write 返回:", ok)
+    print("能和整数比:", ok != 0, ok == 1)
+    print("能当条件:", ok != 0)
+    print("读回来:", file_read(path))
+    print("写不进不存在的目录:", file_write("/tmp/fa_case_146_没有这个目录/x.txt", "x"))
+    print("读不到给空串:", "[" + file_read("/tmp/fa_case_146_没有") + "]")
+
+    print("sign 整数:", sign(-5), sign(0), sign(5))
+    print("sign 浮点:", sign(-2.5), sign(0.0), sign(2.5))
+    print("sign 能比较:", sign(-1) < 0, sign(1) > 0, sign(0) == 0)
+    let si: i64 = sign(-7)
+    let sf: f64 = sign(-7.5)
+    print("sign 能直接赋值:", si, sf)
+    print("sign 能参与算术:", sign(-3) + sign(4), sign(-1.5) * 2.0)
+
+    print("abs 一直是对的:", abs(-3), abs(-3.5))
+    print("min/max 也一直是:", min(3, 7), max(2.5, 1.5))
+    Fs.remove(path)
+    return 0

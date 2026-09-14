@@ -1,0 +1,26 @@
+# str.rfind：从后往前找。以前只有 find（从头找），取扩展名、取最后一段路径
+# 都得自己循环 slice，现在一个方法搞定。
+fn main() -> i64:
+    let p = "a.tar.gz"
+    print("rfind 最后一个点:", p.rfind("."))
+    print("find 第一个点:", p.find("."))
+    print("扩展名:", p.slice(p.rfind(".") + 1, p.len()))
+
+    print("没有就给 -1:", "noext".rfind("."))
+    print("空串找东西:", "".rfind("x"))
+    print("空模式给长度:", "abc".rfind(""))
+    print("路径最后一段:", "/a/b/c".rfind("/"))
+    print("整个串就是模式:", "aa".rfind("aa"))
+    print("模式比串长:", "ab".rfind("abc"))
+    print("中文按字节:", "甲乙甲".rfind("甲"))
+    print("多字节模式:", "a::b::c".rfind("::"))
+
+    # 和 find 配着用：第一个和最后一个
+    let s = "one,two,three"
+    print("首段:", s.slice(0, s.find(",")))
+    print("末段:", s.slice(s.rfind(",") + 1, s.len()))
+
+    # contains 之类不受影响
+    print("contains:", s.contains("two"), s.contains("four"))
+    print("count:", "aaa".count("a"))
+    return 0

@@ -101,6 +101,7 @@ FaStr *fa_str_of_ptr(void *v);
 int64_t fa_str_byte(FaStr *s, int64_t i);
 FaStr  *fa_str_chr(int64_t cp);
 int64_t fa_str_find(FaStr *s, FaStr *sub);
+int64_t fa_str_rfind(FaStr *s, FaStr *sub);
 FaStr *fa_str_trim(FaStr *s);
 FaStr *fa_str_upper(FaStr *s);
 FaStr *fa_str_lower(FaStr *s);

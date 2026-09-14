@@ -262,6 +262,7 @@ class FnGen:
 
         sc = self.push_scope()
         # self / 形参落地
+        self.addr_taken_names = self._addr_taken_roots(self.body)
         off = 0
         if self.self_type is not None:
             st = self.sema.structs.get(self.self_type) or self.sema.enums.get(self.self_type)
@@ -280,7 +281,9 @@ class FnGen:
             #     impl P: fn add(self, k: i64) -> i64   # docs/02 里的标准写法
             src = ptemps[i + (1 if sret else 0)]
             sym = VarSym(p.name, pty, mutable=True, is_param=True)
-            if is_agg(pty) or sym.addr_taken:
+            # 这里的 sym 是新建的，addr_taken 永远是 False，所以要看函数体里
+            # 到底有没有人取过这个形参的地址（见 _addr_taken_roots 的说明）。
+            if is_agg(pty) or p.name in self.addr_taken_names:
                 slot = self.emit_alloca(pty.size)
                 self.emit_copy(slot, src if is_agg(pty) else src, pty)
                 loc = VarLoc("mem", slot, pty, borrowed=True, sym=sym)
@@ -1025,6 +1028,30 @@ class FnGen:
 
     def gen_let(self, s: Let):
         ty = s.sym.ty
+        if not is_agg(ty) and (getattr(s.sym, "addr_taken", False)
+                               or s.name in getattr(self, "addr_taken_names", ())):
+            # 见 _addr_taken_roots：地址必须在声明处就确定下来，不能等到
+            # 某个分支里第一次写 &x 才溢出，否则另一个分支拿到的是死寄存器。
+            slot = self.emit_alloca(max(ty.size, 1))
+            if s.init is None:
+                if T.t_is_refcounted(ty):
+                    z = self.tail_zero_value(ty)
+                    self.take_owned(z, ty)
+                    self.emit("STORE", args=[slot, z], extra=0, ty=ty)
+                else:
+                    self.emit("STORE", args=[slot, self.const_zero(ty)],
+                              extra=0, ty=ty)
+            else:
+                v = self.gen_expr(s.init)
+                cv = self.coerce(v, s.init.ty, ty)
+                self.emit("STORE", args=[slot, cv], extra=0, ty=ty)
+                if T.t_is_refcounted(ty):
+                    if not self.take_owned(v, s.init.ty):
+                        self.emit_rcinc(v, s.init.ty)
+            loc = VarLoc("mem", slot, ty, sym=s.sym)
+            self.scope.vars[s.name] = loc
+            self.scope.drops.append((loc, ty))
+            return
         if s.init is None:
             if is_agg(ty):
                 slot = self.emit_alloca(ty.size)
@@ -1302,6 +1329,8 @@ class FnGen:
         self.emit("LABEL", extra=cond_lbl)
         if s.cond is not None:
             c = self.gen_cond(s.cond)
+            # 同 gen_while：C 风格 for 的条件也是每轮重新求值，临时引用要每轮放
+            self.flush_owned()
             self.emit("BR", args=[c], extra=(body_lbl, end_lbl))
         else:
             self.emit("JMP", extra=body_lbl)
@@ -1314,6 +1343,14 @@ class FnGen:
         end = self.new_label("wend")
         self.emit("LABEL", extra=top)
         c = self.gen_cond(s.cond)
+        # 循环条件里新建的临时引用必须**每一轮**释放。
+        # flush_owned 是语句收尾时做的，而循环条件不属于任何一条语句的收尾：
+        # `while n > 1 and p.slice(n - 1, n) == "/"` 每轮都 slice 出一个新 FaStr，
+        # 一个都没人放。更坏的是 mark_owned 按 Temp.id 去重，第二轮拿到的还是
+        # 同一个虚拟寄存器，登记不进去 —— 最后只释放了末一轮那个对象，
+        # 前面每轮都漏（ASan: 18 byte(s) leaked in 1 allocation(s)）。
+        # 放在 BR 之前，跳去 body 还是跳去 end 都已经清干净了。
+        self.flush_owned()
         self.emit("BR", args=[c], extra=(body, end))
         self.emit("LABEL", extra=body)
         outer = self.scope
@@ -1703,10 +1740,20 @@ class FnGen:
         return t
 
     def _is_cstr_ptr(self, ty: Type) -> bool:
-        """`*u8` —— C 互操作里的 `char *`。"""
+        """`*u8` / `*char` —— C 互操作里的 `char *`。
+
+        绑 C 头文件时，结构体字段经常是定长 char 数组（struct dirent 的 d_name
+        是 char[256]），`&x.d_name[0]` 拿到的是 *char。按 C 的规矩这种指针就是
+        字符串，print / str() 该打**内容**而不是地址。以前只认 *u8，于是
+        `print(str(&e.d_name[0]))` 打出来是 0x800d2e3，非得先手动 `as *u8`
+        （或者改用 cstr()）才行 —— 绑库的时候十次有九次会踩。
+        """
         inner = getattr(ty, "inner", None)
-        return (ty is not None and ty.kind == "ptr" and isinstance(inner, Type)
-                and inner.kind == "int" and inner.name == "u8")
+        if ty is None or ty.kind != "ptr" or not isinstance(inner, Type):
+            return False
+        if inner.kind == "char":
+            return True
+        return inner.kind == "int" and inner.name == "u8"
 
     def gen_to_str(self, v, ty: Type) -> Temp:
         r = self.new_temp(STR)
@@ -2213,6 +2260,45 @@ class FnGen:
     def gen_cast(self, e: Cast):
         v = self.gen_expr(e.operand)
         return self.coerce(v, e.operand.ty, e.ty)
+
+    def _addr_taken_roots(self, node, out=None):
+        """扫一遍函数体，收集所有被 `&` 取过地址的变量名。
+
+        为什么非得**提前**扫：`&x` 的实现是「x 住在栈槽里，取那个槽的地址」。
+        以前的做法是等到生成 `&x` 的那一刻，才把 x 从寄存器溢出到栈槽 ——
+        溢出指令（lea + store）落在**当时所在的那个基本块**里，而变量的位置记录
+        已经被永久改写成那个槽了，于是别的分支再写 `&x` 时直接复用了那个只在
+        一个分支里赋过值的寄存器：
+
+            fn helper(ts: i64, utc: bool) -> tm:
+                let mut sec = ts
+                let t: tm
+                if utc:
+                    gmtime_r(&sec, &t)        # lea r13, [rbp-112] 只生成在这里
+                else:
+                    localtime_r(&sec, &t)     # mov rdi, r13 —— r13 里是垃圾
+
+        localtime_r 拿到野指针，段错误。定义必须支配使用，所以这类变量在
+        **声明处**（形参是函数入口处）就安排到栈槽里，地址全函数稳定。
+        """
+        if out is None:
+            out = set()
+        if isinstance(node, AddrOf):
+            n = node.operand
+            while isinstance(n, (Field, Index)):
+                n = getattr(n, "obj", None)      # &p.field / &a[i] 的根
+                if n is None:
+                    break
+            if isinstance(n, NameRef):
+                out.add(n.name)
+        for v in list(vars(node).values()):
+            if isinstance(v, Node):
+                self._addr_taken_roots(v, out)
+            elif isinstance(v, (list, tuple)):
+                for it in v:
+                    if isinstance(it, Node):
+                        self._addr_taken_roots(it, out)
+        return out
 
     def gen_addrof(self, e: AddrOf):
         return self.gen_addrof1(e.operand)
@@ -2779,11 +2865,13 @@ class FnGen:
                      "char_at": ("fa_str_char_at", I64),
                      "codepoints": ("fa_str_codepoints", vec_of(I64)),
                      "slice_chars": ("fa_str_slice_chars", STR)}
-            if name in ("find", "contains", "starts_with", "ends_with", "eq", "replace"):
-                if name == "find":
+            if name in ("find", "rfind", "contains", "starts_with", "ends_with",
+                        "eq", "replace"):
+                if name in ("find", "rfind"):
                     a = self.gen_expr(e.args[0])
                     r = self.new_temp(I64)
-                    self.emit("CALL", r, [Sym("fa_str_find"), obj,
+                    self.emit("CALL", r, [Sym("fa_str_rfind" if name == "rfind"
+                                              else "fa_str_find"), obj,
                                           self.gen_to_str(a, e.args[0].ty)], ty=I64)
                     return r
                 if name == "contains":
@@ -3301,6 +3389,14 @@ class FnGen:
                     self.emit_rcdec_val(held, inner)
             self.emit("CALL", None, [Sym("fa_free"), v])
             return self.const(0, VOID)
+        if name == "cstr":
+            # C 的 char*（以 \0 结尾）→ 拷一份成 FA 的 str。运行时那份
+            # fa_str_from_cstr 本来就在（extern 函数返回 char* 时走的就是它），
+            # 这里只是把它开放成一个能直接写的内建函数。
+            v = self.gen_expr(e.args[0])
+            r = self.call1("fa_str_from_cstr", v, STR)
+            self.mark_owned(r, STR)          # 新字符串归本语句所有，收尾要释放
+            return r
         if name == "chr":
             # 码点 -> UTF-8 字符串（1~4 字节）
             v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)

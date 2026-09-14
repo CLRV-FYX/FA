@@ -1,0 +1,79 @@
+# 标准库 std.re：POSIX 扩展正则。
+use std.re
+
+fn main() -> i64:
+    print("ok 好模式:", Re.ok("[0-9]+"))
+    print("ok 坏模式:", Re.ok("([0-9]+"))
+    print("err 有话:", Re.err("([0-9]+").len() > 0)
+    print("err 好模式给空:", "[" + Re.err("[0-9]+") + "]")
+
+    print("test:", Re.test("abc123", "[0-9]+"), Re.test("abc", "[0-9]+"))
+    print("test_i:", Re.test_i("ABC", "abc"), Re.test("ABC", "abc"))
+    print("find:", "[" + Re.find("abc123def456", "[0-9]+") + "]")
+    print("find 没有:", "[" + Re.find("abc", "[0-9]+") + "]")
+    print("find_i:", Re.find_i("xxABCyy", "abc"))
+    print("find_all:", Re.find_all("a1b22c333", "[0-9]+").to_str())
+    print("find_all_i:", Re.find_all_i("aAbB", "[ab]").to_str())
+    print("count:", Re.count("a1b22c333", "[0-9]+"))
+    print("spans:", Re.spans("a1b22c333", "[0-9]+").to_str())
+
+    let m = Re.search("2026-09-13", "[0-9]+-[0-9]+")
+    print("search:", m.found, m.start, m.end)
+    let nomatch = Re.search("abc", "[0-9]+")
+    print("search 没匹配:", nomatch.found, nomatch.start, nomatch.end, nomatch.n)
+
+    print("groups:", Re.groups("2026-09-13", "([0-9]+)-([0-9]+)-([0-9]+)").to_str())
+    print("groups 没匹配:", Re.groups("abc", "([0-9]+)").len())
+
+    print("replace:", Re.replace("a1b2c3", "[0-9]", "#"))
+    print("replace 多字节:", Re.replace("a1b22", "[0-9]+", "<数>"))
+    print("replace_first:", Re.replace_first("a1b2c3", "[0-9]", "#"))
+    print("replace_i:", Re.replace_i("aAbB", "[ab]", "-"))
+    print("replace 没匹配:", Re.replace("abc", "[0-9]", "#"))
+    print("replace 坏模式原样返回:", Re.replace("abc", "([0-9]", "#"))
+    print("split:", Re.split("a, b ,c", " *, *").to_str())
+    print("split 没匹配:", Re.split("abc", "[0-9]").to_str())
+    print("escape:", Re.escape("a.b+c(d)"))
+
+    # 零长度匹配：不能死循环，行为和各家的正则库一致
+    print("零长度 find_all:", Re.find_all("bbb", "a*").len())
+    print("零长度 replace:", "[" + Re.replace("bbb", "a*", "X") + "]")
+    # ^ 只该在真正的开头成立一次（内部切片时带了 REG_NOTBOL）
+    print("^ 只匹配一次:", Re.find_all("abc", "^.").to_str())
+    print("$ 只匹配一次:", Re.find_all("abc", ".$").to_str())
+
+    # 编译一次反复用
+    let r = Re.compile("[0-9]+")
+    print("r.ok:", r.ok, "r.err:", "[" + r.err + "]")
+    let mut total: i64 = 0
+    for i in 0..5:
+        total += r.find_all("x" + i.to_str() + "y" + (i * 11).to_str()).len()
+    print("复用同一个正则:", total)
+    print("r.test:", r.test("a1"), r.test("ab"))
+    print("r.find:", r.find("a12b"))
+    print("r.groups:", r.groups("a12b").to_str())
+    print("r.replace:", r.replace("a1b22", "!"))
+    print("r.replace_n:", r.replace_n("a1b2c3", "#", 2))
+    print("r.split:", r.split("a1b22c").to_str())
+    r.free()
+
+    let bad = Re.compile("([0-9]")
+    print("编译失败:", bad.ok, bad.err.len() > 0)
+    print("失败的 test 是 false:", bad.test("123"))
+    bad.free()
+
+    let ci = Re.compile_i("abc")
+    print("compile_i:", ci.find("xxABCyy"), ci.test("ABC"))
+    ci.free()
+
+    let basic = Re.basic("[0-9]\\+")
+    print("BRE 基本正则:", basic.find("a123b"))
+    basic.free()
+
+    let nl = Re.compile_with("^b", REG_NEWLINE)
+    print("REG_NEWLINE 行首:", nl.find_all("a\nb\nc").to_str())
+    nl.free()
+
+    # 中文按字节匹配，UTF-8 的字符边界由模式自己保证
+    print("中文:", Re.find_all("甲1乙22丙", "[0-9]+").to_str())
+    return 0

@@ -1,0 +1,13 @@
+# expect-compile-error: 'f' 的第 1 个实参: 类型不匹配，期望 i64，实际 str
+struct A:
+    x: i64
+
+impl A:
+    fn f(self, a: i64) -> i64:
+        return a + self.x
+
+fn main() -> i64:
+    let v: A
+    v.x = 1
+    print(v.f("一个字符串"))
+    return 0

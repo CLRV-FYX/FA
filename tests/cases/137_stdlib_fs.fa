@@ -1,0 +1,80 @@
+# 标准库 std.fs：目录、读写、路径。
+# 全部输出都是确定值（不打印 cwd、不打印 mtime 的具体数字、列目录先排序），
+# 所以 .expected 可以逐字节比对。
+use std.fs
+
+fn sorted_names(p: str) -> str:
+    let v = Fs.list_dir(p)
+    v.sort()
+    return v.join(",")
+
+fn main() -> i64:
+    let d = "/tmp/fa_case_137"
+    # 先把上一次的残留清掉，保证每次跑的都一样
+    for name in Fs.walk(d):
+        let full = Fs.join(d, name)
+        if not Fs.is_dir(full):
+            Fs.remove(full)
+    Fs.remove_dir(d + "/x/y")
+    Fs.remove_dir(d + "/x")
+    Fs.remove_dir(d)
+
+    print("不存在的目录列出来是空表:", Fs.list_dir(d).len())
+    print("exists 假:", Fs.exists(d))
+    print("make_dir_all:", Fs.make_dir_all(d + "/x/y"))
+    print("exists 真:", Fs.exists(d))
+    print("is_dir:", Fs.is_dir(d), Fs.is_file(d))
+
+    print("write:", Fs.write(d + "/a.txt", "第一行\n第二行\n"))
+    print("append:", Fs.append(d + "/a.txt", "第三行\n"))
+    print("read:", Fs.read(d + "/a.txt").replace("\n", "|"))
+    print("read_lines 段数:", Fs.read_lines(d + "/a.txt").len())
+    print("read_lines 内容:", Fs.read_lines(d + "/a.txt").join("/"))
+    print("write_lines:", Fs.write_lines(d + "/l.txt", Vec<str>["p", "q"]))
+    print("size:", Fs.size(d + "/a.txt"))
+    print("读不到的文件给空串:", "[" + Fs.read(d + "/没有这个") + "]")
+    print("read_lines 空文件:", Fs.read_lines(d + "/没有这个").len())
+
+    Fs.write(d + "/x/b.txt", "b")
+    Fs.write(d + "/x/y/c.txt", "c")
+    print("list_dir 排序:", sorted_names(d))
+    print("entries 个数:", Fs.entries(d).len())
+    let w = Fs.walk(d)
+    w.sort()
+    print("walk 排序:", w.join(","))
+    print("count_dir:", Fs.count_dir(d + "/x"))
+
+    print("rename_to:", Fs.rename_to(d + "/a.txt", d + "/a2.txt"), Fs.exists(d + "/a2.txt"))
+    print("copy:", Fs.copy(d + "/a2.txt", d + "/a3.txt"), Fs.size(d + "/a3.txt"))
+    print("set_mode:", Fs.set_mode(d + "/a3.txt", 0o600))
+    let inf = Fs.info(d + "/a3.txt")
+    print("info:", inf.ok, inf.is_file, inf.is_dir, inf.size, inf.mode & 0o777)
+    print("linfo 不是符号链接:", Fs.linfo(d + "/a3.txt").is_link)
+    print("mtime 是个合理的数:", Fs.mtime(d + "/a3.txt") > 1000000000)
+    print("readable/writable:", Fs.readable(d + "/a3.txt"), Fs.writable(d + "/a3.txt"))
+    print("remove:", Fs.remove(d + "/a3.txt"), Fs.exists(d + "/a3.txt"))
+    print("非空目录删不掉:", Fs.remove_dir(d + "/x"))
+
+    # 路径全是纯字符串运算，不碰文件系统
+    print("join:", Fs.join("/a", "b"), Fs.join("/a/", "b"), Fs.join("", "b"), Fs.join("/a", "/b"))
+    print("base:", Fs.base("/a/b/c.txt"), Fs.base("c.txt"), Fs.base("/a/b/"))
+    print("dir:", Fs.dir("/a/b/c.txt"), "[" + Fs.dir("c.txt") + "]", Fs.dir("/c.txt"))
+    print("ext:", Fs.ext("a.tar.gz"), "[" + Fs.ext(".bashrc") + "]", "[" + Fs.ext("noext") + "]")
+    print("stem:", Fs.stem("a.tar.gz"), Fs.stem("noext"))
+    print("is_abs:", Fs.is_abs("/a"), Fs.is_abs("a"))
+    print("parts:", Fs.parts("/a/b/c").join(","))
+    print("relative:", Fs.relative("/a/b", "/a/b/c.txt"), Fs.relative("/a/b", "/z/c"))
+    print("trim_slash:", Fs.trim_slash("/a/b//"), Fs.trim_slash("/"))
+    print("cwd 非空:", Fs.cwd().len() > 0)
+    print("abs 是绝对路径:", Fs.abs(d).starts_with("/"))
+
+    # 收尾
+    Fs.remove(d + "/a2.txt")
+    Fs.remove(d + "/l.txt")
+    Fs.remove(d + "/x/b.txt")
+    Fs.remove(d + "/x/y/c.txt")
+    print("清空后 walk:", Fs.walk(d).len())
+    Fs.remove_dir(d + "/x/y")
+    Fs.remove_dir(d + "/x")
+    print("删干净:", Fs.remove_dir(d), Fs.exists(d))
+    return 0

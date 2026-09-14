@@ -1,0 +1,7 @@
+# expect-compile-error: 标准库里没有
+# use std.<名字> 找不到模块时，要把「找的是哪个路径」和「现有哪些模块」都说出来，
+# 而不是只来一句「找不到模块」。
+use std.nosuch
+
+fn main() -> i64:
+    return 0

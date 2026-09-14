@@ -1,0 +1,133 @@
+# 由 `fa bind` 自动生成 —— 不要手改，改了下次生成会覆盖。
+# 命令：fa bind dirent.h sys/stat.h unistd.h fcntl.h time.h regex.h stdlib.h stdio.h
+# 头文件：dirent.h、sys/stat.h、unistd.h、fcntl.h、time.h、regex.h、stdlib.h、stdio.h（预处理：cc -E -dD -D_GNU_SOURCE）
+# 结果：函数 33 个，常量 23 个，结构体 6 个，跳过 0 项，链接 -lc
+
+use c "dirent.h" lib "c":
+    fn closedir(dirp: *void) -> i32
+    fn opendir(name: str) -> *void
+    fn readdir(dirp: *void) -> *dirent
+
+use c "sys/stat.h":
+    fn stat(file: str, buf: *stat) -> i32
+    fn lstat(file: str, buf: *stat) -> i32
+    fn chmod(file: str, mode: u32) -> i32
+    fn mkdir(path: str, mode: u32) -> i32
+
+use c "unistd.h" lib "c":
+    fn access(name: str, type: i32) -> i32
+    fn lseek(fd: i32, offset: i64, whence: i32) -> i64
+    fn close(fd: i32) -> i32
+    fn c_write(fd: i32, buf: *void, n: usize) -> isize = "write"
+    fn getcwd(buf: *u8, size: usize) -> str
+    fn unlink(name: str) -> i32
+    fn rmdir(path: str) -> i32
+
+use c "fcntl.h" lib "c":
+    # 变参函数：调用时按 C 的规矩传（浮点走 xmm，char/short 会提升成 int）
+    fn open(file: str, oflag: i32, ...) -> i32
+
+use c "time.h" lib "c":
+    fn time(timer: *i64) -> i64
+    fn difftime(time1: i64, time0: i64) -> f64
+    fn mktime(tp: *tm) -> i64
+    fn strftime(s: *u8, maxsize: usize, format: str, tp: *tm) -> usize
+    fn strptime(s: str, fmt: str, tp: *tm) -> *u8
+    fn gmtime(timer: *i64) -> *tm
+    fn localtime(timer: *i64) -> *tm
+    fn gmtime_r(timer: *i64, tp: *tm) -> *tm
+    fn localtime_r(timer: *i64, tp: *tm) -> *tm
+    fn clock_gettime(clock_id: i32, tp: *timespec) -> i32
+    fn getdate(string: str) -> *tm
+
+use c "regex.h" lib "c":
+    fn regcomp(preg: *re_pattern_buffer, pattern: str, cflags: i32) -> i32
+    fn regexec(preg: *re_pattern_buffer, String: str, nmatch: usize, pmatch: *void, eflags: i32) -> i32
+    fn regerror(errcode: i32, preg: *re_pattern_buffer, errbuf: *u8, errbuf_size: usize) -> usize
+    fn regfree(preg: *re_pattern_buffer)
+
+use c "stdlib.h" lib "c":
+    fn realpath(name: str, resolved: *u8) -> str
+
+use c "stdio.h" lib "c":
+    fn remove(filename: str) -> i32
+    fn rename(old: str, new_1: str) -> i32
+
+struct dirent:
+    d_ino: u64
+    d_off: i64
+    d_reclen: u16
+    d_type: u8
+    d_name: [char; 256]
+# 由 C 的 struct dirent 生成；sizeof = 280 字节，每个字段的 offsetof 都用真编译器量过，与 FA 的布局逐个对得上，两边可以直接互传指针
+
+struct timespec:
+    tv_sec: i64
+    tv_nsec: i64
+# 由 C 的 struct timespec 生成；sizeof = 16 字节，每个字段的 offsetof 都用真编译器量过，与 FA 的布局逐个对得上，两边可以直接互传指针
+
+struct stat:
+    st_dev: u64
+    st_ino: u64
+    st_nlink: u64
+    st_mode: u32
+    st_uid: u32
+    st_gid: u32
+    pad0: i32
+    st_rdev: u64
+    st_size: i64
+    st_blksize: i64
+    st_blocks: i64
+    st_atim: timespec
+    st_mtim: timespec
+    st_ctim: timespec
+    glibc_reserved: [i64; 3]
+# 由 C 的 struct stat 生成；sizeof = 144 字节，每个字段的 offsetof 都用真编译器量过，与 FA 的布局逐个对得上，两边可以直接互传指针
+
+struct tm:
+    tm_sec: i32
+    tm_min: i32
+    tm_hour: i32
+    tm_mday: i32
+    tm_mon: i32
+    tm_year: i32
+    tm_wday: i32
+    tm_yday: i32
+    tm_isdst: i32
+    tm_gmtoff: i64
+    tm_zone: *u8
+# 由 C 的 struct tm 生成；sizeof = 56 字节，每个字段的 offsetof 都用真编译器量过，与 FA 的布局逐个对得上，两边可以直接互传指针
+
+struct re_pattern_buffer:
+    raw: [u8; 64]
+# C 的 struct re_pattern_buffer 在 FA 侧只能按不透明的 64 字节用：结构体里有位域（`unsigned x : 3` 这种），FA 没有位域。字段 FA 看不见，但大小是对的 —— 可以在 FA 侧分配（let x: 名字，全零）再取地址传给 C，由 C 那头填
+
+struct regmatch_t:
+    rm_so: i32
+    rm_eo: i32
+# 由 C 的 struct regmatch_t 生成；sizeof = 8 字节，每个字段的 offsetof 都用真编译器量过，与 FA 的布局逐个对得上，两边可以直接互传指针
+
+const S_IFDIR: i64 = 16384
+const S_IFREG: i64 = 32768
+const S_IFLNK: i64 = 40960
+const S_IRUSR: i64 = 256
+const S_IWUSR: i64 = 128
+const S_IXUSR: i64 = 64
+const R_OK: i64 = 4
+const W_OK: i64 = 2
+const X_OK: i64 = 1
+const F_OK: i64 = 0
+const O_RDONLY: i64 = 0
+const O_WRONLY: i64 = 1
+const O_RDWR: i64 = 2
+const O_CREAT: i64 = 64
+const O_TRUNC: i64 = 512
+const O_APPEND: i64 = 1024
+const CLOCK_REALTIME: i64 = 0
+const REG_EXTENDED: i64 = 1
+const REG_ICASE: i64 = 2
+const REG_NEWLINE: i64 = 4
+const REG_NOSUB: i64 = 8
+const REG_NOTBOL: i64 = 1
+const REG_NOTEOL: i64 = 2
+

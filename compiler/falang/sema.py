@@ -7,6 +7,22 @@ from .ast import *
 from . import types as T
 from .types import Type, TYPES, VOID, BOOL, CHAR, STR, ANY, PYOBJ, JOBJ, ptr_to, vec_of, map_of, arr_of, layout_struct, layout_enum
 
+# `use std.json` 找的就是这里的文件：<仓库根>/stdlib/json.fa
+FA_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+STDLIB_DIR = os.path.join(FA_ROOT, "stdlib")
+
+
+def stdlib_modules() -> List[str]:
+    """stdlib/ 下有哪些模块（报错时列给用户看，省得猜名字）。"""
+    out: List[str] = []
+    for root, _dirs, files in os.walk(STDLIB_DIR):
+        for f in files:
+            if not f.endswith(".fa"):
+                continue
+            rel = os.path.relpath(os.path.join(root, f), STDLIB_DIR)
+            out.append("std." + rel[:-3].replace(os.sep, "."))
+    return sorted(out)
+
 # ----------------------------------------------------------------- 内建
 # 由 codegen 特判实现的多态内建（不进入普通符号表解析流程）
 BUILTIN_FNS = {
@@ -16,13 +32,13 @@ BUILTIN_FNS = {
     "concat", "contains", "keys", "values", "gcd", "random", "env",
     "file_read", "file_write", "cmd",
     "hex", "oct", "bin", "args", "round", "trunc", "log2", "log10", "exp2",
-    "hypot", "clamp", "sign", "sum", "sort", "reverse", "join", "chr",
+    "hypot", "clamp", "sign", "sum", "sort", "reverse", "join", "chr", "cstr",
     "free",          # 释放 new / C 那边拿来的指针（引用计数类型不需要它）
 }
 
 # str / Vec / Map / pyobj / jobj 的内建方法
 BUILTIN_METHODS = {
-    "str": {"len", "at", "slice", "eq", "find", "trim", "split", "contains",
+    "str": {"len", "at", "slice", "eq", "find", "rfind", "trim", "split", "contains",
             "to_i64", "to_f64", "to_str", "bytes", "upper", "lower",
             "starts_with", "ends_with", "replace", "chars", "cstr",
             "repeat", "count", "lines", "trim_start", "trim_end",
@@ -56,7 +72,8 @@ BUILTIN_METHODS = {
 # 两种都改成编译期的中文报错。
 METHOD_ARITY = {
     "str": {"len": (0, 0), "at": (1, 1), "slice": (2, 2), "eq": (1, 1),
-            "find": (1, 1), "trim": (0, 0), "split": (1, 1), "contains": (1, 1),
+            "find": (1, 1), "rfind": (1, 1), "trim": (0, 0), "split": (1, 1),
+            "contains": (1, 1),
             "to_i64": (0, 0), "to_f64": (0, 0), "to_str": (0, 0), "bytes": (0, 0),
             "upper": (0, 0), "lower": (0, 0), "starts_with": (1, 1),
             "ends_with": (1, 1), "replace": (2, 2), "chars": (0, 0),
@@ -336,6 +353,30 @@ class Sema:
                 f"想按结构体查，就用它那个唯一字段当键，或者用 Vec 自己找",
                 node)
 
+    def resolve_container_elem(self, node: Type) -> Type:
+        """Vec<T> / Map<K, V> 的类型参数：T 正在布局中也没关系，先给占位的 Type。
+
+        容器字段就是一个指针（8 字节），装什么类型都不会让外层结构体的大小变一下，
+        所以「隔着容器递归」是安全的：
+
+            struct Node:
+                kids: Vec<Node>          # 合法：字段里存的是 8 字节的 Vec 头
+                index: Map<str, Node>    # 同理
+
+        以前这里直接 resolve_type，撞上 _laying_out 就报
+        「结构体 'Node' 按值包含了自己（大小无限）」—— 可它并没有按值包含自己。
+        于是 JSON 值、树、AST 这类天生递归的结构全得改成 `*Node` + new/free，
+        引用计数白搭一趟，还容易漏 free。
+        占位的 Type 对象登记在 self.structs 里，_fill_in_place 会**就地**把它填完整，
+        所以此刻引用它的 Vec/Map 跟着就完整了，不用回头再解析一遍。
+        数组 [Node; 4] 不走这里：数组要按值内嵌，元素大小必须当场知道。
+        """
+        if isinstance(node, TName) and node.name in self._laying_out:
+            tgt = self.structs.get(node.name) or self.enums.get(node.name)
+            if tgt is not None:
+                return tgt
+        return self.resolve_type(node)
+
     def resolve_type(self, node: Type) -> Type:
         if isinstance(node, TPtr):
             # 指针目标只要「已登记」就够了，不必现在完成布局：
@@ -372,13 +413,13 @@ class Sema:
         if name == "Vec":
             if not node.args:
                 self.error("Vec 需要元素类型：Vec<T>", node)
-            return vec_of(self.resolve_type(node.args[0]))
+            return vec_of(self.resolve_container_elem(node.args[0]))
         if name == "Map":
             if len(node.args) != 2:
                 self.error("Map 需要两个类型参数：Map<K, V>", node)
-            kt = self.resolve_type(node.args[0])
+            kt = self.resolve_container_elem(node.args[0])
             self.check_map_key(kt, node)
-            return map_of(kt, self.resolve_type(node.args[1]))
+            return map_of(kt, self.resolve_container_elem(node.args[1]))
         if name in self.structs:
             t = self.structs[name]
             if t.fields is None:                    # 还没布局：现在就补上
@@ -425,8 +466,31 @@ class Sema:
         out: List[Decl] = []
         for d in mod.decls:
             if isinstance(d, Use) and d.kind == "std":
-                self.error("FA 没有可导入的标准库模块（内建的 print / len / Vec / Map "
-                           "等直接可用，不需要 use）", d)
+                # `use std.json` = 导入仓库 stdlib/json.fa；`use std.re.posix` =
+                # stdlib/re/posix.fa。以前这里直接报「FA 没有可导入的标准库模块」，
+                # 于是标准库这个东西根本没法存在。
+                parts = d.path.split(".")
+                if parts[0] != "std" or len(parts) < 2 or not parts[1]:
+                    self.error(
+                        f"use 的模块路径 '{d.path}' 看不懂：标准库写 use std.<名字>"
+                        '（例如 use std.json），自己的文件写 use "xxx.fa"', d)
+                    continue
+                if d.alias:
+                    self.error(
+                        f'暂不支持 `use {d.path} as {d.alias}` 的命名空间写法；'
+                        "去掉 as，模块里的声明会直接进入当前文件（名字冲突时会在"
+                        "语义分析阶段报「重复定义」）", d)
+                    continue
+                path = os.path.join(STDLIB_DIR, *parts[1:]) + ".fa"
+                if not os.path.exists(path):
+                    have = stdlib_modules()
+                    self.error(
+                        f"标准库里没有 '{d.path}'（找的是 {path}）。"
+                        + ("现有的模块：" + "、".join(have) if have
+                           else "stdlib/ 目录还是空的"), d)
+                    continue
+                d.kind = "file"                    # 之后按普通文件导入展开
+                d.path = path
             if not (isinstance(d, Use) and d.kind == "file"):
                 out.append(d)
                 continue
@@ -1585,7 +1649,10 @@ class Sema:
             if name in ("sqrt", "sin", "cos", "tan", "pow", "log", "exp",
                         "floor", "ceil", "to_f64", "now"):
                 e.ty = TYPES["f64"]
-            elif name == "abs":                       # 跟随实参类型
+            elif name in ("abs", "sign"):              # 跟随实参类型
+                # codegen 那边 sign 早就是「浮点走 fa_sign_f64、整数走 fa_sign_i64」，
+                # sema 却漏了它，于是 sign(x) 的静态类型是 any：`sign(x) > 0` 直接
+                # 报「无法比较 any 与 i64」，只能 as i64 绕过去。abs 是对的，跟上。
                 e.ty = TYPES["f64"] if (ats and ats[0].is_float) else TYPES["i64"]
             elif name in ("min", "max"):
                 # min(a, b) -> 标量类型；min(v) -> 容器元素类型
@@ -1595,7 +1662,10 @@ class Sema:
                     e.ty = self._container_elem(ats[0])
                 else:
                     e.ty = ats[0] if ats else TYPES["i64"]
-            elif name in ("len", "i64", "to_i64", "gcd", "random", "at", "bytes"):
+            elif name in ("len", "i64", "to_i64", "gcd", "random", "at", "bytes",
+                          "file_write"):
+                # file_write 返回 1（写成了）/ 0（打不开、没权限），一直是 any：
+                # `if file_write(p, s) != 0` 报「无法比较 any 与 i64」。
                 e.ty = TYPES["i64"]
             elif name in ("str", "to_str", "read_line", "concat", "env",
                           "file_read", "cmd", "hex", "oct", "bin", "chr"):
@@ -1604,6 +1674,20 @@ class Sema:
                 e.ty = STR
             elif name == "args":
                 e.ty = vec_of(STR)
+            elif name == "cstr":
+                # C 字符串（以 \0 结尾的 char*）→ FA 的 str。
+                # 反方向早就有了（str 传进 extern 函数会自动转成 const char*，
+                # 方法 s.cstr() 拿到 char*），可**从 C 结构体字段里**读字符串没有路：
+                # `struct dirent` 的 d_name 是 char[256]，FA 侧只能一个字节一个字节抠。
+                if len(ats) != 1:
+                    self.error(f"cstr(p) 需要 1 个参数（指向 C 字符串的指针），"
+                               f"这里给了 {len(ats)} 个", e)
+                elif ats[0].kind not in ("ptr",):
+                    self.error(
+                        f"cstr() 要的是指向 C 字符串（以 0 字节结尾）的指针，得到 {ats[0]}。"
+                        "FA 的 str 自己知道长度，不用这个函数；要拿 str 的 char* 用 "
+                        "s.cstr()；字段是 char 数组就取它的地址：cstr(&x.d_name as *u8)", e)
+                e.ty = STR
             elif name == "free":
                 if len(ats) != 1:
                     self.error(f"free(p) 需要 1 个参数（要释放的指针），"
@@ -1802,6 +1886,40 @@ class Sema:
             self.error(f"方法 '{e.name}' 没有 self（静态方法），要用类型名调用："
                        f"{lk.name}.{e.name}(...)", e)
 
+    def check_method_args(self, e: MethodCall, fs: FnSym):
+        """自己写在 impl 里的方法，实参也要按形参核对个数和类型。
+
+        这一步以前整个没有。后果不是「报错报得晚」，而是**根本不报错**：
+
+            impl A:
+                fn f(self, a: i64) -> i64:
+                    return a
+            v.f(1, 2, 3)        # 编得过，2 和 3 被悄悄丢掉
+            v.f("一个字符串")    # 也编得过，后端把 FaStr* 当整数用，结果是垃圾
+
+        自由函数那条路（expr_call）早就查了个数、类型和变参，方法这边跟上。
+        fs.params 里不含 self（self 是隐式的，实参列表里也没有它）。
+        """
+        ptys = list(getattr(fs, "params", None) or [])
+        varargs = bool(getattr(fs, "varargs", False))
+        if varargs:
+            if len(e.args) < len(ptys):
+                self.error(f"方法 '{e.name}' 至少需要 {len(ptys)} 个实参，"
+                           f"实际传入 {len(e.args)} 个", e)
+            for i, a in enumerate(e.args[:len(ptys)]):
+                at = a.ty if getattr(a, "ty", None) is not None else self.expr(a)
+                self.check_assignable(ptys[i], at, a, f"'{e.name}' 的第 {i+1} 个实参")
+            return
+        if len(ptys) != len(e.args):
+            self.error(f"方法 '{e.name}' 需要 {len(ptys)} 个实参，"
+                       f"实际传入 {len(e.args)} 个", e)
+            return
+        for i, a in enumerate(e.args):
+            # 实参在 expr_method 开头就已经全部 self.expr() 过一遍了，
+            # 这里直接拿它的类型，别再走一次（重复走会把同一个错误报两遍）。
+            at = a.ty if getattr(a, "ty", None) is not None else self.expr(a)
+            self.check_assignable(ptys[i], at, a, f"'{e.name}' 的第 {i+1} 个实参")
+
     def expr_method(self, e: MethodCall) -> Type:
         ot = self.expr(e.obj)
         # 枚举变体构造器在语法上和方法调用一模一样：Shape.Circle(2.0)
@@ -1840,6 +1958,7 @@ class Sema:
             fs = self.methods.get((lk.name, e.name))
         if fs is not None:
             self.check_method_receiver(e, ot, fs)
+            self.check_method_args(e, fs)
             e.resolved = fs
             e.ty = fs.ret
             return fs.ret
@@ -1859,7 +1978,7 @@ class Sema:
                 self.check_container_args(ot, e)
             if e.name == "to_f64":
                 e.ty = TYPES["f64"]
-            elif e.name in ("len", "at", "to_i64", "find", "bytes",
+            elif e.name in ("len", "at", "to_i64", "find", "rfind", "bytes",
                             "char_len", "char_at"):
                 e.ty = TYPES["i64"]
             elif e.name == "codepoints":

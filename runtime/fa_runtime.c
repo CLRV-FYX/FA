@@ -706,6 +706,18 @@ int64_t fa_str_find(FaStr *s, FaStr *sub) {
     return -1;
 }
 
+/* 从后往前找：路径/扩展名这类事情总要知道「最后一个分隔符在哪」。
+   以前只有 find（从头找），要拿扩展名就得自己循环 slice，一处一处地抠。 */
+int64_t fa_str_rfind(FaStr *s, FaStr *sub) {
+    if (!s || !sub) return -1;
+    if (sub->len == 0) return s->len;
+    if (sub->len > s->len) return -1;
+    for (int64_t i = s->len - sub->len; i >= 0; i--) {
+        if (memcmp(s->data + i, sub->data, (size_t)sub->len) == 0) return i;
+    }
+    return -1;
+}
+
 int64_t fa_str_starts(FaStr *s, FaStr *p) {
     if (!s || !p) return 0;
     if (p->len > s->len) return 0;
