@@ -1877,6 +1877,63 @@ class FnGen:
             return sv
         return self.concat_str(self.concat_str(self.make_str(q), sv), self.make_str(q))
 
+    def gen_vec_join_agg(self, v, et: Type, sep) -> Temp:
+        """`Vec<结构体/枚举>.join(sep)`：在编译期逐元素取文本再拼。
+
+        运行时的 fa_vec_join 只认元素 kind，结构体/枚举一律打成 `{...}`。
+        `to_str()` 早就为这种情况走了编译期展开（gen_container_to_str_agg），
+        join 却没走 —— 于是 `Vec<P>.to_str()` 是 `[P { x: 1 }, P { x: 2 }]`，
+        `Vec<P>.join(",")` 却是 `{...},{...}`：同一张表两种样子，而后者根本没信息。
+        这里补上同一条路，只有两点不同：分隔符用调用方给的，
+        而且**不加方括号、str/char 元素也不加引号**（join 的语义，
+        和运行时 fa_vec_join 的 quote_str=0 对齐）。
+        """
+        entry_refs = set(self.owned_ids)
+        entry_aggs = set(self.agg_owned_ids)
+
+        pieces = self.new_temp(vec_of(STR))
+        self.emit("CALL", pieces,
+                  [Sym("fa_vec_new"), self.const(elem_kind(STR, self.sema)),
+                   self.const(vec_esz(STR)), self.const(0),
+                   self.const(T.ty_code(STR))], ty=vec_of(STR))
+        self.mark_owned(pieces, vec_of(STR))
+
+        n = self.new_temp(I64)
+        self.emit("LOAD", n, [v], extra=8, ty=I64)
+        i = self.new_temp(I64)
+        self.emit("MOV", i, [self.const(0)], ty=I64)
+
+        top = self.new_label("vja")
+        body = self.new_label("vjab")
+        step = self.new_label("vjas")
+        end = self.new_label("vjae")
+        self.emit("LABEL", extra=top)
+        c = self.new_temp(BOOL)
+        self.emit("CMP", c, [i, n], extra="<", ty=I64)
+        self.emit("BR", args=[c], extra=(body, end))
+        self.emit("LABEL", extra=body)
+
+        # 每轮新建的中间引用要在本轮内放掉（和 gen_container_to_str_agg 同理：
+        # 它们是语句级登记的，留到语句末尾就已经在循环外面了）
+        ref_before = set(self.owned_ids)
+        agg_before = set(self.agg_owned_ids)
+        piece = self.gen_to_str(self._vec_elem_at(v, i, et), et)
+        # fa_vec_push 自己会加一次引用，所以这一份在本轮末尾放掉正好
+        self.emit("CALL", None, [Sym("fa_vec_push"), pieces, piece])
+        self.release_new_refs(None, ref_before, agg_before)
+
+        self.emit("LABEL", extra=step)
+        self.emit("BIN", i, [i, self.const(1)], extra="+", ty=I64)
+        self.emit("JMP", extra=top)
+        self.emit("LABEL", extra=end)
+
+        out = self.new_temp(STR)
+        self.emit("CALL", out, [Sym("fa_vec_join"), pieces, sep], ty=STR)
+        self.mark_owned(out, STR)
+        # pieces 在这里放掉；out 留在语句级所有权表里交给调用方释放
+        self.release_new_refs(out, entry_refs, entry_aggs)
+        return out
+
     def gen_container_to_str_agg(self, v, ty: Type) -> Temp:
         """`[P { x: 1 }, P { x: 2 }]` / `{"甲": P { x: 1 }}`。
 
@@ -3027,11 +3084,24 @@ class FnGen:
                       "fa_vec_sort_str" if et == STR else "fa_vec_sort_i64")
                 self.emit("CALL", None, [Sym(fn), obj])
                 return self.const(0, VOID)
+            if name == "sort_by":
+                # 取键函数：函数名经 gen_nameref 出来是 LEA_SYM，就是一个代码地址，
+                # 运行时按 System V 调用约定直接调（§19.4 的 C 回调走的是同一条路）。
+                kf = self.gen_expr(e.args[0])
+                boxed = 1 if et.kind in ("struct", "enum") else 0
+                rt = e.args[0].ty.ret
+                kind = 2 if rt.kind == "str" else (1 if rt.is_float else 0)
+                self.emit("CALL", None,
+                          [Sym("fa_vec_sort_by"), obj, kf,
+                           self.const(boxed, I64), self.const(kind, I64)])
+                return self.const(0, VOID)
             if name == "reverse":
                 self.emit("CALL", None, [Sym("fa_vec_reverse"), obj])
                 return self.const(0, VOID)
             if name == "join":
                 sep = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+                if self._ty_has_agg(et):
+                    return self.gen_vec_join_agg(obj, et, sep)
                 r = self.call2("fa_vec_join", obj, sep, STR)
                 self.mark_owned(r, STR)
                 return r
@@ -3211,7 +3281,7 @@ class FnGen:
 
     # ------------------------------------------------------------ 内建函数
     # 只对容器有意义的内建（写在 sema 的 BUILTIN_FNS 里，但 codegen 一直没实现）
-    CONTAINER_FNS = ("sum", "sort", "reverse", "join", "index_of")
+    CONTAINER_FNS = ("sum", "sort", "sort_by", "reverse", "join", "index_of")
     # 这些内建既有 v.push(x) 的方法写法，也有 push(v, x) 的全局写法
     VEC_GLOBAL_FNS = ("push", "pop", "get", "set", "clear", "resize", "contains")
     # 标量/容器两用的内建：实参是容器时走容器实现

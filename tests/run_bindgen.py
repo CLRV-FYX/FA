@@ -418,7 +418,15 @@ def main(argv) -> int:
         ("/usr/include/regex.h", "c",
          ["fn regcomp(preg: *re_pattern_buffer", "struct regmatch_t:",
           "    rm_so: i32", "const REG_EXTENDED: i64 = 1",
-          "struct re_pattern_buffer:", "    raw: [u8; "],
+          "struct re_pattern_buffer:", "    raw: [u8; ",
+          # 数组参数退化成**带类型**的指针：`regmatch_t pmatch[]` -> *regmatch_t。
+          # 以前元素先按参数位置映射（结构体被包了一层指针），再撞上「已经是指针
+          # 的不能再包一层」的保护，pmatch 就成了 *void —— 结构体明明就在同一个
+          # 文件里生成出来了。
+          "pmatch: *regmatch_t",
+          # `typedef struct re_pattern_buffer regex_t;` 这种 typedef 别名要能解开，
+          # regerror 的 preg 才是 *re_pattern_buffer 而不是 *void
+          "fn regerror(errcode: i32, preg: *re_pattern_buffer"],
          "位域结构体退化成同样大小的字节数组，sizeof 是真编译器量的"),
         ("/usr/include/dirent.h", "c",
          ["fn opendir(", "fn readdir(", "struct dirent"],

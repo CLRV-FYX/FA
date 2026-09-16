@@ -1,7 +1,7 @@
 # 由 `fa bind` 自动生成 —— 不要手改，改了下次生成会覆盖。
 # 命令：fa bind dirent.h sys/stat.h unistd.h fcntl.h time.h regex.h stdlib.h stdio.h
 # 头文件：dirent.h、sys/stat.h、unistd.h、fcntl.h、time.h、regex.h、stdlib.h、stdio.h（预处理：cc -E -dD -D_GNU_SOURCE）
-# 结果：函数 33 个，常量 23 个，结构体 6 个，跳过 0 项，链接 -lc
+# 结果：函数 30 个，常量 23 个，结构体 6 个，跳过 0 项，链接 -lc
 
 use c "dirent.h" lib "c":
     fn closedir(dirp: *void) -> i32
@@ -33,16 +33,13 @@ use c "time.h" lib "c":
     fn mktime(tp: *tm) -> i64
     fn strftime(s: *u8, maxsize: usize, format: str, tp: *tm) -> usize
     fn strptime(s: str, fmt: str, tp: *tm) -> *u8
-    fn gmtime(timer: *i64) -> *tm
-    fn localtime(timer: *i64) -> *tm
     fn gmtime_r(timer: *i64, tp: *tm) -> *tm
     fn localtime_r(timer: *i64, tp: *tm) -> *tm
     fn clock_gettime(clock_id: i32, tp: *timespec) -> i32
-    fn getdate(string: str) -> *tm
 
 use c "regex.h" lib "c":
     fn regcomp(preg: *re_pattern_buffer, pattern: str, cflags: i32) -> i32
-    fn regexec(preg: *re_pattern_buffer, String: str, nmatch: usize, pmatch: *void, eflags: i32) -> i32
+    fn regexec(preg: *re_pattern_buffer, String: str, nmatch: usize, pmatch: *regmatch_t, eflags: i32) -> i32
     fn regerror(errcode: i32, preg: *re_pattern_buffer, errbuf: *u8, errbuf_size: usize) -> usize
     fn regfree(preg: *re_pattern_buffer)
 

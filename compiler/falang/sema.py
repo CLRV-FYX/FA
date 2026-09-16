@@ -32,7 +32,7 @@ BUILTIN_FNS = {
     "concat", "contains", "keys", "values", "gcd", "random", "env",
     "file_read", "file_write", "cmd",
     "hex", "oct", "bin", "args", "round", "trunc", "log2", "log10", "exp2",
-    "hypot", "clamp", "sign", "sum", "sort", "reverse", "join", "chr", "cstr",
+    "hypot", "clamp", "sign", "sum", "sort", "sort_by", "reverse", "join", "chr", "cstr",
     "free",          # 释放 new / C 那边拿来的指针（引用计数类型不需要它）
 }
 
@@ -45,7 +45,7 @@ BUILTIN_METHODS = {
             # UTF-8 码点：char 是一个字节，这组按「字符」而不是按字节算
             "char_len", "char_at", "codepoints", "slice_chars"},
     "vec": {"len", "push", "get", "set", "pop", "clear", "contains", "to_str",
-            "resize", "sort", "reverse", "join", "sum", "min", "max",
+            "resize", "sort", "sort_by", "reverse", "join", "sum", "min", "max",
             "index_of", "copy"},
     # contains 是 has 的别名。以前 Map 只有全局写法 contains(m, k) 编得过
     # （sema 把它 forwarded 到 _builtin_on_container），方法写法 m.contains(k) 被拒，
@@ -82,7 +82,8 @@ METHOD_ARITY = {
             "char_at": (1, 1), "codepoints": (0, 0), "slice_chars": (2, 2)},
     "vec": {"len": (0, 0), "push": (1, 1), "get": (1, 1), "set": (2, 2),
             "pop": (0, 0), "clear": (0, 0), "contains": (1, 1), "to_str": (0, 0),
-            "resize": (1, 2), "sort": (0, 0), "reverse": (0, 0), "join": (1, 1),
+            "resize": (1, 2), "sort": (0, 0), "sort_by": (1, 1),
+            "reverse": (0, 0), "join": (1, 1),
             "sum": (0, 0), "min": (0, 0), "max": (0, 0), "index_of": (1, 1),
             "copy": (0, 0)},
     "map": {"len": (0, 0), "get": (1, 1), "set": (2, 2), "has": (1, 1),
@@ -305,6 +306,53 @@ class Sema:
     VEC_CONTENT_OPS = ("sort", "min", "max", "contains", "index_of", "sum")
     VEC_BOXED = ("struct", "enum", "vec", "map", "arr")
 
+    def check_sort_by(self, vt, arg, node):
+        """`v.sort_by(取键函数)`：Vec<结构体> 排不了序的出路。
+
+        表里存的是装箱指针，qsort 直接排排的是堆地址；给一个
+        `fn(*元素) -> i64 / f64 / str` 的取键函数，运行时先把键一个个取出来，
+        排的是键，元素跟着键走。
+        """
+        et = vt.elem
+        boxed = et is not None and et.kind in ("struct", "enum")
+        flat = et is not None and (et.kind == "str" or et.kind == "ptr"
+                                   or et.kind == "float"
+                                   or (et.kind == "int" and et.size == 8))
+        if not (boxed or flat):
+            self.error(
+                f"Vec<{et}> 不能 sort_by()：元素在表里占的不是 8 字节（{et}），"
+                "取键函数拿不到稳定的元素地址。这种元素本来就能直接 v.sort()"
+                "（按位/按字节序）；要按算出来的键排，先把键收进一个 Vec<i64> 再 sort_by",
+                node)
+            return
+        ft = getattr(arg, "ty", None)
+        if ft is None or ft.kind != "fn":
+            self.error(
+                f"sort_by() 要的是一个**取键函数**：fn(*{et}) -> i64 / f64 / str，"
+                f"这里得到 {ft if ft is not None else '一个不是函数的东西'}。"
+                "写函数名，不要加括号：v.sort_by(by_age)", node)
+            return
+        if len(ft.params) != 1:
+            self.error(
+                f"sort_by() 的取键函数要正好 1 个参数（元素的地址，类型 *{et}），"
+                f"这个有 {len(ft.params)} 个", node)
+            return
+        p0 = ft.params[0]
+        if p0 is None or p0.kind != "ptr" or p0.inner != et:
+            self.error(
+                f"sort_by() 的取键函数参数类型要是 *{et}（元素的地址），"
+                f"这个写的是 {p0}", node)
+            return
+        rt = ft.ret
+        ok_ret = rt is not None and (rt.kind == "str"
+                                     or (rt.kind == "float" and rt.size == 8)
+                                     or (rt.kind == "int" and rt.size == 8))
+        if not ok_ret:
+            self.error(
+                f"sort_by() 的取键函数返回值要能排序：i64 / f64 / str，这个返回 {rt}。"
+                "窄类型（i32 这些）自己 `as i64` 一下 —— 运行时是按 8 字节读返回值的",
+                node)
+
     def check_vec_content_op(self, et, op, node):
         """Vec 的元素类型撑不撑得起这个按内容比较的操作。"""
         if et is None or op not in self.VEC_CONTENT_OPS:
@@ -319,7 +367,9 @@ class Sema:
                 "sum": "把地址加起来，得到一个垃圾数",
             }[op]
             hint = {
-                "sort": "想按结构体的某个字段排，就自己写一趟排序（教程 §9.6 有插入排序的例子）",
+                "sort": ("想按结构体的某个字段排，用 v.sort_by(取键函数)："
+                         "给一个 fn(*元素) -> i64 / f64 / str，运行时先把键取出来再排"
+                         "（教程 §9.6）"),
                 "contains": "想找就自己遍历：`for x in v { if x.字段 == 目标 { ... } }`",
                 "index_of": "想找下标就自己遍历，记下 i 再 break",
                 "min": "想取最小就自己遍历比较字段",
@@ -1712,6 +1762,18 @@ class Sema:
                 if ats and ats[0].kind == "vec":
                     self.check_vec_content_op(ats[0].elem, name, e)
                 e.ty = self._container_elem(ats[0]) if ats else TYPES["i64"]
+            elif name == "sort_by":
+                # 全局写法 sort_by(v, 取键函数)：这条链上 ats[0] 就是第一个实参
+                # （表），取键函数在 e.args[1]；方法写法 v.sort_by(k) 走的是
+                # check_method 那条路，两边都要验。
+                if not ats or ats[0].kind != "vec":
+                    self.error("sort_by() 只能用在 Vec 上（Map 没有顺序，排不了）", e)
+                elif len(e.args) != 2:
+                    self.error(f"sort_by(表, 取键函数) 需要 2 个参数，"
+                               f"这里给了 {len(e.args)} 个", e)
+                else:
+                    self.check_sort_by(ats[0], e.args[1], e)
+                e.ty = VOID
             elif name in ("sort", "reverse", "push", "clear", "resize"):
                 if name == "sort" and ats and ats[0].kind == "vec":
                     self.check_vec_content_op(ats[0].elem, name, e)
@@ -1976,6 +2038,11 @@ class Sema:
                 self.check_vec_content_op(ot.elem if ot.kind == "vec" else None,
                                           e.name, e)
                 self.check_container_args(ot, e)
+                # sort_by 的取键函数要单独验：参数必须是 *元素，返回值必须能排序。
+                # 这条以前只写在全局调用那条路上，方法写法 v.sort_by(k) 走的是
+                # 这里，等于完全没验 —— 错误的键函数一路编到运行时才炸。
+                if e.name == "sort_by" and ot.kind == "vec" and e.args:
+                    self.check_sort_by(ot, e.args[0], e)
             if e.name == "to_f64":
                 e.ty = TYPES["f64"]
             elif e.name in ("len", "at", "to_i64", "find", "rfind", "bytes",
@@ -2016,7 +2083,7 @@ class Sema:
             elif e.name == "copy":
                 # v.copy() / m.copy()：另起一份容器，类型和接收者完全一样
                 e.ty = ot
-            elif e.name in ("sort", "reverse", "resize"):
+            elif e.name in ("sort", "sort_by", "reverse", "resize"):
                 e.ty = VOID
             elif e.name in ("contains", "has", "starts_with", "ends_with", "eq"):
                 e.ty = BOOL

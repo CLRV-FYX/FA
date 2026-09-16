@@ -1,0 +1,27 @@
+# join() 对聚合元素（结构体/枚举）以前打成 `{...},{...}`：运行时的 fa_vec_join
+# 只认元素 kind，而 to_str() 早就为这种情况走了编译期展开 —— 同一张表两种样子。
+# 现在 join 也走编译期展开，只有两点不同：分隔符用调用方给的，不加方括号也不加引号。
+# 这一例钉住：结构体/枚举 join 出真内容、str 元素仍然不加引号、
+# Vec<i64> 的负数不打成无符号大数（fa_vec_new 曾经对 esz==8 强制 sgn=0）、空表不炸。
+struct P:
+    name: str
+    age: i64
+
+enum Color:
+    Red
+    Green(i64)
+
+fn main() -> i64:
+    let v = Vec<P>[P{name: "甲", age: 30}, P{name: "乙", age: 25}]
+    print(v.join(" | "))
+    print(v.join(","))
+    print(v.to_str())
+    let c = Vec<Color>[Color.Green(7), Color.Red]
+    print(c.join("/"))
+    let s = Vec<str>["甲", "乙"]
+    print(s.join("-"))
+    let n = Vec<i64>[1, -2, 3]
+    print(n.join(","))
+    let e = Vec<P>[]
+    print("空表 join: [" + e.join(",") + "]")
+    return 0

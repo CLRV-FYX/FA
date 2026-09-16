@@ -221,7 +221,7 @@ impl Regex:
         if not self.ok:
             return false                # 编译都没成，preg 是块没初始化的内存
         let m: [regmatch_t; 1]
-        let rc = regexec(&self.preg, s, 1, &m as *void, 0)
+        let rc = regexec(&self.preg, s, 1, &m as *regmatch_t, 0)
         return rc == 0
 
     fn find(self, s: str) -> str:
@@ -239,7 +239,7 @@ impl Regex:
         r.end = -1
         r.n = 0
         let m: [regmatch_t; RE_GROUPS]
-        let rc = regexec(&self.preg, s, RE_GROUPS as usize, &m as *void, 0)
+        let rc = regexec(&self.preg, s, RE_GROUPS as usize, &m as *regmatch_t, 0)
         if rc != 0:
             return r
         r.found = true
@@ -258,7 +258,7 @@ impl Regex:
         if not self.ok:
             return out
         let m: [regmatch_t; RE_GROUPS]
-        let rc = regexec(&self.preg, s, RE_GROUPS as usize, &m as *void, 0)
+        let rc = regexec(&self.preg, s, RE_GROUPS as usize, &m as *regmatch_t, 0)
         if rc != 0:
             return out
         for i in 0..RE_GROUPS:
@@ -286,7 +286,7 @@ impl Regex:
             let ef: i64 = 0
             if at > 0:
                 ef = REG_NOTBOL
-            let rc = regexec(&self.preg, rest, 1, &m as *void, ef as i32)
+            let rc = regexec(&self.preg, rest, 1, &m as *regmatch_t, ef as i32)
             if rc != 0:
                 break
             let so = m[0].rm_so as i64

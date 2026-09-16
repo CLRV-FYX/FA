@@ -486,6 +486,92 @@ void fa_vec_sort_i64(FaVec *v) {
 void fa_vec_sort_f64(FaVec *v) { if (v && v->len > 1) qsort(v->data, (size_t)v->len, 8, cmp_f64); }
 void fa_vec_sort_str(FaVec *v) { if (v && v->len > 1) qsort(v->data, (size_t)v->len, 8, cmp_strp); }
 
+/* ---- sort_by：按「取键函数」排 --------------------------------------------------
+
+   Vec<结构体> 不能直接 sort()：表里存的是装箱指针，qsort 排的是堆地址
+   （不报错，结果毫无意义），所以编译期就拦住了。sort_by 是出路 —— 调用方给一个
+   FA 的取键函数 `fn(*元素) -> i64 / f64 / str`，这里先把键一个个取出来，
+   排的是键，元素跟着键走。
+
+   qsort 的比较函数带不了上下文，而 FA 目前没有线程，所以取键函数、键的种类、
+   键数组、下标数组都放在文件级静态变量里，排完清空。
+
+   只对 **8 字节槽**的元素开放（装箱的结构体/枚举、i64、f64、str、指针）：
+   取键函数拿到的是元素的地址，窄元素（i32/u8/bool/char）槽宽不是 8，
+   编译器那边就不让用 —— 它们本来能直接 sort()。
+   取键函数返回 str 时，那份字符串的所有权归这里，用完 rc_dec 掉。 */
+static void    *fa_sort_keyfn;      /* FA 的取键函数（就是它的代码地址） */
+static int      fa_sort_keykind;    /* 0 = i64, 1 = f64, 2 = str */
+static void    *fa_sort_keys;       /* 预取的键，n 个 8 字节 */
+static int64_t *fa_sort_idx;        /* 正在排的下标数组 */
+
+typedef int64_t (*FaKeyI64)(void *);
+typedef double  (*FaKeyF64)(void *);
+typedef FaStr  *(*FaKeyStr)(void *);
+
+static int cmp_str_direct(FaStr *x, FaStr *y) {
+    if (!x) return y ? -1 : 0;
+    if (!y) return 1;
+    size_t n = x->len < y->len ? (size_t)x->len : (size_t)y->len;
+    int r = n ? memcmp(x->data, y->data, n) : 0;
+    if (r) return r;
+    return (x->len > y->len) - (x->len < y->len);
+}
+
+static int cmp_by_key(const void *pa, const void *pb) {
+    int64_t ia = *(const int64_t *)pa, ib = *(const int64_t *)pb;
+    int r;
+    if (fa_sort_keykind == 0) {
+        const int64_t *k = (const int64_t *)fa_sort_keys;
+        r = (k[ia] > k[ib]) - (k[ia] < k[ib]);
+    } else if (fa_sort_keykind == 1) {
+        const double *k = (const double *)fa_sort_keys;
+        double x = k[ia], y = k[ib];
+        if (x != x)      r = (y != y) ? 0 : 1;     /* NaN 排到最后，和 cmp_f64 一致 */
+        else if (y != y) r = -1;
+        else             r = (x > y) - (x < y);
+    } else {
+        r = cmp_str_direct(((FaStr *const *)fa_sort_keys)[ia],
+                           ((FaStr *const *)fa_sort_keys)[ib]);
+    }
+    /* 键相同就按原下标排。qsort 自己不稳定，但这里排的是下标数组，
+       加这一句 sort_by 就成了**稳定排序**：同键的元素保持输入顺序
+       （和手写插入排序一致，也是 Rust sort_by 的语义）。两个 NaN 算同键。 */
+    if (r == 0) return (ia > ib) - (ia < ib);
+    return r;
+}
+
+void fa_vec_sort_by(FaVec *v, void *keyfn, int64_t boxed, int64_t kind) {
+    if (!v || v->len < 2 || !keyfn) return;
+    int64_t n = v->len;
+    fa_sort_keyfn   = keyfn;
+    fa_sort_keykind = (int)kind;
+    fa_sort_keys    = fa_alloc(n * 8);
+    fa_sort_idx     = (int64_t *)fa_alloc(n * 8);
+    for (int64_t i = 0; i < n; i++) {
+        /* 装箱元素：槽里存的就是盒子地址；扁平元素：给槽自己的地址 */
+        void *e = boxed ? (void *)(uintptr_t)vec_load(v, i) : (void *)(v->data + i);
+        if (kind == 0)      ((int64_t *)fa_sort_keys)[i] = ((FaKeyI64)keyfn)(e);
+        else if (kind == 1) ((double  *)fa_sort_keys)[i] = ((FaKeyF64)keyfn)(e);
+        else                ((FaStr  **)fa_sort_keys)[i] = ((FaKeyStr)keyfn)(e);
+        fa_sort_idx[i] = i;
+    }
+    qsort(fa_sort_idx, (size_t)n, 8, cmp_by_key);
+    /* 元素跟着键走：先按新下标拷一份出来，再写回去（和 reverse 一样搬裸槽，
+       不动引用计数 —— 只是换了位置，没有新增/减少持有者） */
+    uint64_t *tmp = (uint64_t *)fa_alloc(n * 8);
+    for (int64_t i = 0; i < n; i++) tmp[i] = vec_load(v, fa_sort_idx[i]);
+    for (int64_t i = 0; i < n; i++) vec_store(v, i, tmp[i]);
+    fa_free(tmp);
+    if (kind == 2) {
+        FaStr **k = (FaStr **)fa_sort_keys;
+        for (int64_t i = 0; i < n; i++) if (k[i]) fa_rc_dec(k[i], FA_K_STR);
+    }
+    fa_free(fa_sort_keys);
+    fa_free(fa_sort_idx);
+    fa_sort_keys = 0; fa_sort_idx = 0; fa_sort_keyfn = 0;
+}
+
 void fa_vec_reverse(FaVec *v) {
     if (!v) return;
     for (int64_t i = 0, j = v->len - 1; i < j; i++, j--) {
@@ -947,7 +1033,11 @@ FaVec *fa_vec_new(int64_t kind, int64_t esz, int64_t sgn, int64_t ety) {
     FaVec *v = (FaVec *)fa_alloc((int64_t)sizeof(FaVec));
     v->rc = 1; v->len = 0; v->cap = 8; v->kind = kind;
     v->esz = (esz == 1 || esz == 2 || esz == 4) ? esz : 8;
-    v->sgn = (v->esz == 8) ? 0 : (sgn ? 1 : 0);
+    /* sgn 有两个用途：窄元素（1/2/4 字节）读出时的符号扩展，以及
+     * fa_fmt_elem 选择 %lld/%llu。8 字节元素不需要扩展，但格式化仍然需要
+     * 知道符号 —— 早期这里对 esz==8 强制置 0，导致 Vec<i64> 的负数在
+     * join()/to_str() 里打成巨大的无符号数。 */
+    v->sgn = sgn ? 1 : 0;
     v->ety = ety;
     v->data = (uint64_t *)fa_alloc(8 * (size_t)v->esz);
     return v;

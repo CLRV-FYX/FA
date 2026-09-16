@@ -1599,6 +1599,24 @@ class Binder:
         return fa_name, "\n".join(lines)
 
     # --- 类型映射
+    def _td_target(self, nm: str) -> Optional[CType]:
+        """typedef 名 -> 它真正指着的类型；认不出来给 None。
+
+        两种情形：
+          * `typedef unsigned long size_t;` —— typedefs 表里有；
+          * `typedef struct { ... } regmatch_t;` —— **就地定义**，收集器把字段记在
+            regmatch_t 名下（structs 表 + struct_is_alias），typedefs 表里没有它。
+        第二种以前一律按「认不得的 typedef = 不透明句柄」给 *void，于是
+        regexec 的 `regmatch_t pmatch[]`、一堆库的 `xxx_t *` 参数全退化成 *void，
+        明明结构体就在同一个文件里生成出来了，用户还得自己 as 一次。
+        """
+        real = self.typedefs.get(nm)
+        if real is not None:
+            return real
+        if nm in self.structs and self.structs[nm] is not None:
+            return CType("struct", name=nm)
+        return None
+
     def map_type(self, ty: Optional[CType], pos: str, name: str, index: int = 0
                  ) -> Tuple[Optional[str], str]:
         if ty is None:
@@ -1612,7 +1630,7 @@ class Binder:
                 return None, UNMAPPABLE[nm]
             if nm in BASE_TO_FA:
                 return BASE_TO_FA[nm], ""
-            real = self.typedefs.get(nm)
+            real = self._td_target(nm)
             if real is None:
                 return "*void", ""                 # 认不得的 typedef = 不透明句柄
             ty = real
@@ -1654,7 +1672,7 @@ class Binder:
                     return ("*void" if fa.startswith("*") else "*" + fa), ""
                 if inner.name in UNMAPPABLE:
                     return None, UNMAPPABLE[inner.name]
-                real = self.typedefs.get(inner.name)
+                real = self._td_target(inner.name)
                 if real is None:
                     return "*void", ""
                 inner = real
@@ -1696,15 +1714,23 @@ class Binder:
             return "*" + fa, ""
         if ty.kind == "arr":
             inner = ty.inner
-            fa, note = self.map_type(inner, pos=pos, name=name)
-            if fa is None:
-                return None, note
             if pos == "field":
+                fa, note = self.map_type(inner, pos="inner", name=name)
+                if fa is None:
+                    return None, note
                 if ty.count is None:
                     return None, "不定长数组字段（柔性数组成员）FA 表达不了"
                 return f"[{fa}; {ty.count}]", ""
-            # 参数位置的数组退化成指针；已经是指针的（不透明句柄）不能再包一层，
-            # 否则就是 `**void` —— FA 的词法分析把 `**` 当乘方运算符，直接语法错误。
+            # 参数/返回位置的数组退化成指针：`regmatch_t pmatch[]` 就是
+            # `regmatch_t *pmatch`。元素类型要按**值**映射（结构体给名字，不是给
+            # 指针），所以借 pos="field" 那条路 —— 它返回裸类型名。以前按参数位置
+            # 映射，结构体先被包了一层指针，再撞上下面「已经是指针的不能再包一层」
+            # 的保护，regexec 的 pmatch 就成了 *void（结构体明明生成出来了）。
+            fa, note = self.map_type(inner, pos="field", name=name)
+            if fa is None:
+                return None, note
+            # 元素本身就是指针（char *argv[]）：FA 写不出 `**void`
+            # （词法分析把 `**` 当乘方运算符），只能按不透明指针给，用时 as 转。
             if fa == "void" or fa.startswith("*"):
                 return "*void", ""
             return "*" + fa, ""

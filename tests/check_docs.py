@@ -104,7 +104,12 @@ for rel in FILES:
             continue
         code = textwrap.dedent("\n".join(
             l[2:] if l.startswith("> ") else l for l in raw.split("\n")))
-        if "❌" in code or "expect-compile-error" in code or PLACEHOLDER.search(code):
+        # 变参声明里的 `...`（`fn printf(fmt: *u8, ...) -> i32`、绑 C 的
+        # `fn open(file: str, oflag: i32, ...) -> i32`）是**真语法**，不是省略号占位符。
+        # 先摘掉再判，不然教程 §30 那种「绑一个 C 变参函数」的完整例子会被整块跳过，
+        # 文档里印的输出就没人复核了。
+        probe = re.sub(r",\s*\.\.\.\s*\)", ")", code)
+        if "❌" in probe or "expect-compile-error" in probe or PLACEHOLDER.search(probe):
             stats["skip"] += 1                     # 反面教材 / 带占位符的模板
             continue
         if any(l.count("fn ") > 1 for l in code.split("\n")):

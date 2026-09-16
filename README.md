@@ -36,8 +36,29 @@ fa build hello.fa -o hello && ./hello   # 或编译成可执行文件
 | `fa build x.fa -o out` | 编译为可执行文件 |
 | `fa asm x.fa` | 只输出 x86-64 汇编：打到 stdout，并存一份 `x.s`（`-o` 可指定路径） |
 | `fa check x.fa` | 只做语法/类型检查 |
+| `fa bind 头.h [...] [选项]` | **C 头文件 → FA 绑定**：生成 `use c` 块 + 结构体 + 常量，结构体布局用真 C 编译器量（`sizeof`/`offsetof` 逐个对过）。`--lib` / `--only` / `--ptr-return` / `-o` 等，`fa bind --help` 有全表 |
 | `fa tokens x.fa` / `fa ast x.fa` | 转储词法 / 语法树（自举比对用） |
 | `fa version` | 版本 + Python/JVM 环境探测 |
+
+绑库和标准库这两件事不用手写胶水：
+
+```bash
+fa bind zlib.h --lib z -o zlib.fa      # 任何 C 库：从头文件生成 FA 声明
+fa bind math.h --lib m --only sqrt,pow -   # 只要几个，打到 stdout
+```
+
+```fa
+use std.fs        # 路径 / 读写 / 目录 / stat（39 个方法）
+use std.time      # 时间戳 / 格式化 / 解析 / 人类可读（50 个）
+use std.re        # POSIX 扩展正则：匹配 / 分组 / 替换 / 切分
+use std.json      # JSON 解析 / 构造 / 序列化 / 路径访问
+use std.args      # 命令行参数（--k=v、--no-k、-abc、--、位置参数）
+```
+
+这五个模块是 FA 写的（`stdlib/*.fa`，可以直接打开看、复制、改），底下的 C 声明
+`stdlib/c/libc.fa` 是 `fa bind` 生成的 —— **标准库自己就是这套工具建出来的**。
+导览见 [08_完全教程.md §31](docs/08_完全教程.md#31-标准库导览)，
+绑任何 C/C++ 库见 [§30](docs/08_完全教程.md#30-跟世界上的库打交道fa-bind-与真实-c-库)。
 
 常用选项：`-O 0..3` 优化级别（默认 2）、`--emit-asm` 额外导出汇编、`-v` 显示详细过程、`-k` 保留中间产物。
 
@@ -86,11 +107,11 @@ fn main() -> i64:
 
 | 文档 | 内容 |
 |---|---|
-| [08_完全教程.md](docs/08_完全教程.md) | **官方教学文档**：29 节，从装机到内嵌汇编，逐行讲透。380 个代码块全部过 `fa check`，每个印出来的输出都是真跑的结果，77 个反面教材的报错逐字对得上编译器（推荐从这里开始，其它几份是它的分册/索引） |
+| [08_完全教程.md](docs/08_完全教程.md) | **官方教学文档**：31 节，从装机到内嵌汇编、`fa bind` 绑库、标准库导览，逐行讲透。393 个代码块全部过 `fa check`，每个印出来的输出都是真跑的结果，79 个反面教材的报错逐字对得上编译器（推荐从这里开始，其它几份是它的分册/索引） |
 | [01_教程.md](docs/01_教程.md) | **零基础教程**：从 `print` 到结构体、容器、错误处理，一步一步来 |
 | [02_语言参考.md](docs/02_语言参考.md) | 完整语法与语义（类型、运算符、控制流、所有权规则） |
-| [03_标准库.md](docs/03_标准库.md) | 内建函数、字符串 / Vec / Map 的全部方法 |
-| [04_互操作.md](docs/04_互操作.md) | 调用 **C / C++ / Python / Java** 的全部写法与示例 |
+| [03_标准库.md](docs/03_标准库.md) | 内建函数、字符串 / Vec / Map 的全部方法，以及 `stdlib/` 五个模块 |
+| [04_互操作.md](docs/04_互操作.md) | 调用 **C / C++ / Python / Java** 的全部写法与示例，含 `fa bind` 绑定生成器 |
 | [05_迁移速查.md](docs/05_迁移速查.md) | 从 Python / C / Java / Go / Rust 过来的对照表 |
 | [06_性能.md](docs/06_性能.md) | 与 C、Python 的实测基准对比 |
 | [07_编译器架构.md](docs/07_编译器架构.md) | 编译器内部：lexer → parser → sema → IR → 寄存器分配 → 汇编 |
