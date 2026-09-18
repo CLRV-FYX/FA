@@ -136,6 +136,7 @@ void    fa_vec_sort_i64(FaVec *v);
 void    fa_vec_sort_f64(FaVec *v);
 void    fa_vec_sort_str(FaVec *v);
 /* 按取键函数排：boxed = 元素是装箱指针（结构体/枚举），kind = 0 i64 / 1 f64 / 2 str */
+void   *fa_vec_elem_addr(FaVec *v, int64_t i, int64_t boxed);
 void    fa_vec_sort_by(FaVec *v, void *keyfn, int64_t boxed, int64_t kind);
 void    fa_vec_reverse(FaVec *v);
 FaStr  *fa_vec_join(FaVec *v, FaStr *sep);

@@ -33,6 +33,7 @@ BUILTIN_FNS = {
     "file_read", "file_write", "cmd",
     "hex", "oct", "bin", "args", "round", "trunc", "log2", "log10", "exp2",
     "hypot", "clamp", "sign", "sum", "sort", "sort_by", "reverse", "join", "chr", "cstr",
+    "map", "filter", "any", "all", "index_where", "for_each",
     "free",          # 释放 new / C 那边拿来的指针（引用计数类型不需要它）
 }
 
@@ -46,7 +47,9 @@ BUILTIN_METHODS = {
             "char_len", "char_at", "codepoints", "slice_chars"},
     "vec": {"len", "push", "get", "set", "pop", "clear", "contains", "to_str",
             "resize", "sort", "sort_by", "reverse", "join", "sum", "min", "max",
-            "index_of", "copy"},
+            "index_of", "copy",
+            # 回调式（高阶）方法：回调一律是 fn(*元素) -> R，写函数名不加括号
+            "map", "filter", "any", "all", "index_where", "for_each"},
     # contains 是 has 的别名。以前 Map 只有全局写法 contains(m, k) 编得过
     # （sema 把它 forwarded 到 _builtin_on_container），方法写法 m.contains(k) 被拒，
     # 而 codegen 两条路都没实现 —— 全局写法一路走到后端才报
@@ -84,6 +87,8 @@ METHOD_ARITY = {
             "pop": (0, 0), "clear": (0, 0), "contains": (1, 1), "to_str": (0, 0),
             "resize": (1, 2), "sort": (0, 0), "sort_by": (1, 1),
             "reverse": (0, 0), "join": (1, 1),
+            "map": (1, 1), "filter": (1, 1), "any": (1, 1), "all": (1, 1),
+            "index_where": (1, 1), "for_each": (1, 1),
             "sum": (0, 0), "min": (0, 0), "max": (0, 0), "index_of": (1, 1),
             "copy": (0, 0)},
     "map": {"len": (0, 0), "get": (1, 1), "set": (2, 2), "has": (1, 1),
@@ -314,15 +319,15 @@ class Sema:
         排的是键，元素跟着键走。
         """
         et = vt.elem
-        boxed = et is not None and et.kind in ("struct", "enum")
-        flat = et is not None and (et.kind == "str" or et.kind == "ptr"
-                                   or et.kind == "float"
-                                   or (et.kind == "int" and et.size == 8))
-        if not (boxed or flat):
+        # 窄元素（i8/u16/i32/bool/char）现在是**允许**的：fa_vec_elem_addr 按真实
+        # 槽宽算地址，回调拿到的 *元素 指的就是那一格。早期这里按「必须是 8 字节槽」
+        # 一刀切，是因为 sort_by 内部用 v->data + i 取地址（那是按 8 字节跨的）。
+        # 真正撑不住的只有数组元素：排完要把元素搬回原位，而搬运是按 8 字节槽做的。
+        if et is not None and et.kind == "arr":
             self.error(
-                f"Vec<{et}> 不能 sort_by()：元素在表里占的不是 8 字节（{et}），"
-                "取键函数拿不到稳定的元素地址。这种元素本来就能直接 v.sort()"
-                "（按位/按字节序）；要按算出来的键排，先把键收进一个 Vec<i64> 再 sort_by",
+                f"Vec<{et}> 不能 sort_by()：数组元素的槽宽超过 8 字节，"
+                "而 sort_by 排完要把元素搬回原位（按 8 字节槽搬）。"
+                "把要排的键收进一个 Vec<i64> 再排，或者自己写一趟排序",
                 node)
             return
         ft = getattr(arg, "ty", None)
@@ -352,6 +357,75 @@ class Sema:
                 f"sort_by() 的取键函数返回值要能排序：i64 / f64 / str，这个返回 {rt}。"
                 "窄类型（i32 这些）自己 `as i64` 一下 —— 运行时是按 8 字节读返回值的",
                 node)
+
+    # 回调式方法 -> (回调返回值要求, 报错里怎么描述这个要求)
+    CALLBACK_METHODS = {
+        "map":         ("any",  "任意类型（结构体/枚举/数组暂时不行）"),
+        "filter":      ("bool", "bool"),
+        "any":         ("bool", "bool"),
+        "all":         ("bool", "bool"),
+        "index_where": ("bool", "bool"),
+        "for_each":    ("void", "void（不返回东西）"),
+    }
+
+    def check_callback_method(self, name, vt, arg, node):
+        """`v.map(f)` / `v.filter(p)` 这一组：回调必须是 `fn(*元素) -> R`。
+
+        FA 没有 lambda，所以传的是**顶层函数的名字**（不加括号）—— 和 sort_by
+        同一条路：codegen 把函数名求成代码地址，运行时/生成的循环按 System V
+        调用约定直接调。校验全部在 fa check 阶段做完，不留给运行时。
+        """
+        want, want_txt = self.CALLBACK_METHODS[name]
+        et = vt.elem
+        if et is not None and et.kind == "arr":
+            self.error(
+                f"Vec<{et}> 不能 {name}()：数组元素的槽宽超过 8 字节，"
+                f"回调要的是元素地址，运行时按 8 字节槽算的那套搬不动它。用 for 循环写",
+                node)
+            return None
+        ft = getattr(arg, "ty", None)
+        if ft is None or ft.kind != "fn":
+            got = ft if ft is not None else "一个不是函数的东西"
+            self.error(
+                f"{name}() 要的是一个**函数**：fn(*{et}) -> {want_txt}，这里得到 {got}。"
+                f"写函数名，不要加括号：v.{name}(f)。FA 没有 lambda，"
+                "要传的逻辑就写成一个顶层函数", node)
+            return None
+        if len(ft.params) != 1:
+            self.error(
+                f"{name}() 的回调要正好 1 个参数（元素的地址，类型 *{et}），"
+                f"这个有 {len(ft.params)} 个。要带别的状态就用全局变量，"
+                "FA 的回调没有捕获", node)
+            return None
+        p0 = ft.params[0]
+        if p0 is None or p0.kind != "ptr" or p0.inner != et:
+            self.error(
+                f"{name}() 的回调参数类型要是 *{et}（元素的地址），这个写的是 {p0}。"
+                f"想在回调里改元素就通过它改：`fn f(x: *{et}): *x = ...`", node)
+            return None
+        rt = ft.ret
+        if want == "bool":
+            if rt is None or rt.kind != "bool":
+                self.error(
+                    f"{name}() 的回调要返回 bool（判定成立不成立），这个返回 {rt}", node)
+        elif want == "void":
+            if rt is not None and rt.kind != "void":
+                self.error(
+                    f"for_each() 的回调不返回东西（返回 {rt} 没人收）。"
+                    "要把结果收进新表用 v.map(f)", node)
+        else:                                   # map：返回值就是新表的元素类型
+            if rt is None or rt.kind == "void":
+                self.error(
+                    "map() 的回调要有返回值 —— 它就是要装进新表的元素。"
+                    "只想遍历一遍不做新表，用 v.for_each(f) 或者直接 for", node)
+                return None
+            if rt.kind in ("struct", "enum", "arr"):
+                self.error(
+                    f"map() 的回调返回值暂时不能是 {rt}：通过函数指针调用没有"
+                    "「大返回值走隐藏指针（sret）」那条路，装进新表会拿到垃圾。"
+                    "先返回它的某个字段（比如 p.name），或者用 for 循环建新表", node)
+                return None
+        return rt
 
     def check_vec_content_op(self, et, op, node):
         """Vec 的元素类型撑不撑得起这个按内容比较的操作。"""
@@ -1762,18 +1836,33 @@ class Sema:
                 if ats and ats[0].kind == "vec":
                     self.check_vec_content_op(ats[0].elem, name, e)
                 e.ty = self._container_elem(ats[0]) if ats else TYPES["i64"]
-            elif name == "sort_by":
-                # 全局写法 sort_by(v, 取键函数)：这条链上 ats[0] 就是第一个实参
-                # （表），取键函数在 e.args[1]；方法写法 v.sort_by(k) 走的是
-                # check_method 那条路，两边都要验。
+            elif name == "sort_by" or name in self.CALLBACK_METHODS:
+                # 全局写法 sort_by(v, f) / map(v, f) / filter(v, p) ...：
+                # 这条链上 ats[0] 就是第一个实参（表），回调在 e.args[1]；
+                # 方法写法 v.sort_by(k) 走的是 check_method 那条路，两边都要验。
                 if not ats or ats[0].kind != "vec":
-                    self.error("sort_by() 只能用在 Vec 上（Map 没有顺序，排不了）", e)
+                    self.error(f"{name}() 只能用在 Vec 上"
+                               + ("（Map 没有顺序，排不了）" if name == "sort_by"
+                                  else "（要遍历 Map 用 for k in m.keys()）"), e)
                 elif len(e.args) != 2:
-                    self.error(f"sort_by(表, 取键函数) 需要 2 个参数，"
+                    self.error(f"{name}(表, 回调函数) 需要 2 个参数，"
                                f"这里给了 {len(e.args)} 个", e)
                 else:
-                    self.check_sort_by(ats[0], e.args[1], e)
-                e.ty = VOID
+                    if name == "sort_by":
+                        self.check_sort_by(ats[0], e.args[1], e)
+                        e.ty = VOID
+                    else:
+                        rt = self.check_callback_method(name, ats[0], e.args[1], e)
+                        if name == "map":
+                            e.ty = vec_of(rt) if rt is not None else vec_of(TYPES["i64"])
+                        elif name == "filter":
+                            e.ty = ats[0]
+                        elif name in ("any", "all"):
+                            e.ty = TYPES["bool"]
+                        elif name == "index_where":
+                            e.ty = TYPES["i64"]
+                        else:
+                            e.ty = VOID
             elif name in ("sort", "reverse", "push", "clear", "resize"):
                 if name == "sort" and ats and ats[0].kind == "vec":
                     self.check_vec_content_op(ats[0].elem, name, e)
@@ -2043,6 +2132,9 @@ class Sema:
                 # 这里，等于完全没验 —— 错误的键函数一路编到运行时才炸。
                 if e.name == "sort_by" and ot.kind == "vec" and e.args:
                     self.check_sort_by(ot, e.args[0], e)
+                if (ot.kind == "vec" and e.args
+                        and e.name in self.CALLBACK_METHODS):
+                    self.check_callback_method(e.name, ot, e.args[0], e)
             if e.name == "to_f64":
                 e.ty = TYPES["f64"]
             elif e.name in ("len", "at", "to_i64", "find", "rfind", "bytes",
@@ -2083,8 +2175,19 @@ class Sema:
             elif e.name == "copy":
                 # v.copy() / m.copy()：另起一份容器，类型和接收者完全一样
                 e.ty = ot
-            elif e.name in ("sort", "sort_by", "reverse", "resize"):
+            elif e.name in ("sort", "sort_by", "reverse", "resize", "for_each"):
                 e.ty = VOID
+            elif e.name == "map":
+                # 新表的元素类型 = 回调的返回类型（校验保证了它不是 void / 聚合）
+                ft = e.args[0].ty if e.args else None
+                rt = getattr(ft, "ret", None) if ft is not None else None
+                e.ty = vec_of(rt) if rt is not None else vec_of(TYPES["i64"])
+            elif e.name == "filter":
+                e.ty = ot
+            elif e.name in ("any", "all"):
+                e.ty = BOOL
+            elif e.name == "index_where":
+                e.ty = TYPES["i64"]
             elif e.name in ("contains", "has", "starts_with", "ends_with", "eq"):
                 e.ty = BOOL
             elif e.name == "get":

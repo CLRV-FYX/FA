@@ -1,0 +1,18 @@
+map: [2, 4, 6, 8, 10]
+filter: [2, 4]
+any/all: false false true
+index_where: 1 -1
+for_each: 1 2 3 4 5 
+map 名字: 甲,乙,丙
+链式: 甲,丙
+判定: true false 0
+原表没动: [P { name: 甲, age: 30 }, P { name: 乙, age: 12 }, P { name: 丙, age: 66 }]
+长度: [1, 2, 0, 3]
+加叹号: a! bb! ! ccc!
+去空串: a,bb,ccc 4
+i8 map: [2, 3, 4]
+i8 filter: [3]
+空表: 0 0 false true -1
+map 出表: [[1], [2, 2]]
+改元素: 101,102,103
+全局写法: [2, 4] [2, 4, 6, 8, 10]

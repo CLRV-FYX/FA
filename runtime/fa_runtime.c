@@ -496,10 +496,21 @@ void fa_vec_sort_str(FaVec *v) { if (v && v->len > 1) qsort(v->data, (size_t)v->
    qsort 的比较函数带不了上下文，而 FA 目前没有线程，所以取键函数、键的种类、
    键数组、下标数组都放在文件级静态变量里，排完清空。
 
-   只对 **8 字节槽**的元素开放（装箱的结构体/枚举、i64、f64、str、指针）：
-   取键函数拿到的是元素的地址，窄元素（i32/u8/bool/char）槽宽不是 8，
-   编译器那边就不让用 —— 它们本来能直接 sort()。
+   元素槽宽 1/2/4/8 都行（窄整数走 fa_vec_elem_addr 按真实槽宽算地址）；
+   只有数组元素（槽宽 > 8）不行 —— 下面的重排是按 8 字节槽搬的。
    取键函数返回 str 时，那份字符串的所有权归这里，用完 rc_dec 掉。 */
+/* 回调收 *元素 时，元素地址从这里拿：
+     boxed（结构体/枚举）—— 槽里存的就是盒子地址，直接给出去；
+     扁平（整数/浮点/str/指针/容器）—— 给槽自己的地址，**按真实槽宽算偏移**，
+       所以 Vec<i8>/Vec<u16>/Vec<i32> 也成立（早期 sort_by 里写的是 v->data + i，
+       那是按 8 字节跨的，窄元素会指到别的元素上去）。
+   map / filter / any / all / index_where / for_each / sort_by 共用这一条路。 */
+void *fa_vec_elem_addr(FaVec *v, int64_t i, int64_t boxed) {
+    if (!v || i < 0 || i >= v->len) fa_bounds_error(i, v ? v->len : 0);
+    if (boxed) return (void *)(uintptr_t)vec_load(v, i);
+    return (void *)((char *)v->data + (size_t)i * (size_t)vec_esz(v));
+}
+
 static void    *fa_sort_keyfn;      /* FA 的取键函数（就是它的代码地址） */
 static int      fa_sort_keykind;    /* 0 = i64, 1 = f64, 2 = str */
 static void    *fa_sort_keys;       /* 预取的键，n 个 8 字节 */
@@ -549,8 +560,7 @@ void fa_vec_sort_by(FaVec *v, void *keyfn, int64_t boxed, int64_t kind) {
     fa_sort_keys    = fa_alloc(n * 8);
     fa_sort_idx     = (int64_t *)fa_alloc(n * 8);
     for (int64_t i = 0; i < n; i++) {
-        /* 装箱元素：槽里存的就是盒子地址；扁平元素：给槽自己的地址 */
-        void *e = boxed ? (void *)(uintptr_t)vec_load(v, i) : (void *)(v->data + i);
+        void *e = fa_vec_elem_addr(v, i, boxed);
         if (kind == 0)      ((int64_t *)fa_sort_keys)[i] = ((FaKeyI64)keyfn)(e);
         else if (kind == 1) ((double  *)fa_sort_keys)[i] = ((FaKeyF64)keyfn)(e);
         else                ((FaStr  **)fa_sort_keys)[i] = ((FaKeyStr)keyfn)(e);

@@ -1877,6 +1877,133 @@ class FnGen:
             return sv
         return self.concat_str(self.concat_str(self.make_str(q), sv), self.make_str(q))
 
+    # 回调式（高阶）方法：全部在编译期展开成循环，不走运行时泛型函数
+    VEC_CALLBACKS = ("map", "filter", "any", "all", "index_where", "for_each")
+
+    def gen_vec_callback(self, name: str, obj, et: Type, e: MethodCall):
+        """`v.map(f)` / `v.filter(p)` / `v.any(p)` / `v.all(p)` /
+        `v.index_where(p)` / `v.for_each(f)`。
+
+        为什么在编译期展开而不是写一个运行时函数：元素类型、结果表类型、回调签名
+        在 sema 那里已经全部钉死，这里按静态类型直接生成代码，不用在运行时做
+        类型分发，也不用给回调结果装箱再拆箱。
+
+        回调收到的是 **\*元素**（`fa_vec_elem_addr` 给的地址：装箱元素是盒子地址，
+        扁平元素是槽自己的地址，窄元素按真实槽宽算）。FA 没有 lambda、回调也不能
+        捕获局部变量，所以「带状态」的回调只能靠全局变量 —— 这一点和 C 的
+        qsort 回调一样。
+
+        循环上界在进循环前取一次：回调里改这张表（push/clear）是未定义行为，
+        和 sort_by 同一条规矩。
+        """
+        cb = e.args[0]
+        rt = cb.ty.ret
+        ptr = self.gen_expr(cb)                       # 函数名 -> LEA_SYM，代码地址
+        boxed = 1 if et.kind in ("struct", "enum") else 0
+
+        out = None
+        if name in ("map", "filter"):
+            out_et = rt if name == "map" else et
+            out = self.new_temp(vec_of(out_et))
+            self.emit("CALL", out,
+                      [Sym("fa_vec_new"), self.const(elem_kind(out_et, self.sema)),
+                       self.const(vec_esz(out_et)),
+                       self.const(1 if (out_et.kind == "int" and out_et.is_signed)
+                                  else 0),
+                       self.const(T.ty_code(out_et))], ty=vec_of(out_et))
+            self.mark_owned(out, vec_of(out_et))
+
+        res = None
+        if name in ("any", "all"):
+            res = self.new_temp(BOOL)
+            # 空表：any() 是 false，all() 是 true（和数学上的「存在/任意」一致）
+            self.emit("MOV", res, [self.const(1 if name == "all" else 0, BOOL)],
+                      ty=BOOL)
+        elif name == "index_where":
+            res = self.new_temp(I64)
+            self.emit("MOV", res, [self.const(-1)], ty=I64)
+
+        n = self.new_temp(I64)
+        self.emit("LOAD", n, [obj], extra=8, ty=I64)
+        i = self.new_temp(I64)
+        self.emit("MOV", i, [self.const(0)], ty=I64)
+
+        top = self.new_label("cb")
+        body = self.new_label("cbb")
+        step = self.new_label("cbs")
+        end = self.new_label("cbe")
+        self.emit("LABEL", extra=top)
+        c = self.new_temp(BOOL)
+        self.emit("CMP", c, [i, n], extra="<", ty=I64)
+        self.emit("BR", args=[c], extra=(body, end))
+        self.emit("LABEL", extra=body)
+
+        addr = self.new_temp(ptr_to(et))
+        self.emit("CALL", addr, [Sym("fa_vec_elem_addr"), obj, i,
+                                 self.const(boxed, I64)], ty=ptr_to(et))
+
+        if name == "for_each":
+            self.emit("CALLPTR", None, [ptr, addr])
+        elif name == "map":
+            ref_before = set(self.owned_ids)
+            agg_before = set(self.agg_owned_ids)
+            r = self.new_temp(rt)
+            self.emit("CALLPTR", r, [ptr, addr], ty=rt)
+            if T.t_is_refcounted(rt):
+                # 回调返回的这份归我们；push 自己会再加一次引用，
+                # 所以本轮末尾把回调那份放掉正好
+                self.mark_owned(r, rt)
+            rv = self.bitcast(r, I64) if rt.is_float else r
+            self.emit("CALL", None, [Sym("fa_vec_push"), out, rv])
+            self.release_new_refs(None, ref_before, agg_before)
+        elif name == "filter":
+            r = self.new_temp(BOOL)
+            self.emit("CALLPTR", r, [ptr, addr], ty=BOOL)
+            hit = self.new_label("cbf")
+            self.emit("BR", args=[r], extra=(hit, step))
+            self.emit("LABEL", extra=hit)
+            if boxed:
+                # 结构体/枚举元素要**装一份新箱**再进新表，不能把原箱地址直接塞进去：
+                # 纯数据箱（kind == FA_K_BOX，即结构体里没有 str/Vec/Map 这类
+                # 引用计数字段）根本没有引用计数，fa_agg_inc 对它是空操作 ——
+                # 两张表都以为自己独占那个箱子，释放时就是 double free（实测
+                # glibc 报 "free(): double free detected in tcache 2"）。
+                # 走 box_agg 和 push 方法一条路：拷一份，push 再按 kind retain
+                # 里面的引用计数字段。这也正好是 FA 结构体的值语义（v[i] 取出来
+                # 也是拷一份）。
+                self.emit("CALL", None,
+                          [Sym("fa_vec_push"), out, self.box_agg(addr, et)])
+            else:
+                val = self._vec_elem_at(obj, i, et)
+                vv = self.bitcast(val, I64) if et.is_float else val
+                self.emit("CALL", None, [Sym("fa_vec_push"), out, vv])
+        else:                                   # any / all / index_where
+            r = self.new_temp(BOOL)
+            self.emit("CALLPTR", r, [ptr, addr], ty=BOOL)
+            hit = self.new_label("cbh")
+            # any / index_where：命中（真）就收工；all：落空（假）就收工
+            self.emit("BR", args=[r], extra=(step, hit) if name == "all"
+                      else (hit, step))
+            self.emit("LABEL", extra=hit)
+            if name == "any":
+                self.emit("MOV", res, [self.const(1, BOOL)], ty=BOOL)
+            elif name == "all":
+                self.emit("MOV", res, [self.const(0, BOOL)], ty=BOOL)
+            else:
+                self.emit("MOV", res, [i], ty=I64)
+            self.emit("JMP", extra=end)
+
+        self.emit("LABEL", extra=step)
+        self.emit("BIN", i, [i, self.const(1)], extra="+", ty=I64)
+        self.emit("JMP", extra=top)
+        self.emit("LABEL", extra=end)
+
+        if out is not None:
+            return out
+        if res is not None:
+            return res
+        return self.const(0, VOID)
+
     def gen_vec_join_agg(self, v, et: Type, sep) -> Temp:
         """`Vec<结构体/枚举>.join(sep)`：在编译期逐元素取文本再拼。
 
@@ -3084,6 +3211,8 @@ class FnGen:
                       "fa_vec_sort_str" if et == STR else "fa_vec_sort_i64")
                 self.emit("CALL", None, [Sym(fn), obj])
                 return self.const(0, VOID)
+            if name in self.VEC_CALLBACKS:
+                return self.gen_vec_callback(name, obj, et, e)
             if name == "sort_by":
                 # 取键函数：函数名经 gen_nameref 出来是 LEA_SYM，就是一个代码地址，
                 # 运行时按 System V 调用约定直接调（§19.4 的 C 回调走的是同一条路）。
@@ -3281,7 +3410,8 @@ class FnGen:
 
     # ------------------------------------------------------------ 内建函数
     # 只对容器有意义的内建（写在 sema 的 BUILTIN_FNS 里，但 codegen 一直没实现）
-    CONTAINER_FNS = ("sum", "sort", "sort_by", "reverse", "join", "index_of")
+    CONTAINER_FNS = ("sum", "sort", "sort_by", "reverse", "join", "index_of",
+                     "map", "filter", "any", "all", "index_where", "for_each")
     # 这些内建既有 v.push(x) 的方法写法，也有 push(v, x) 的全局写法
     VEC_GLOBAL_FNS = ("push", "pop", "get", "set", "clear", "resize", "contains")
     # 标量/容器两用的内建：实参是容器时走容器实现

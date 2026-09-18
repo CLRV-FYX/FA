@@ -1,0 +1,74 @@
+# 回调式（高阶）方法：map / filter / any / all / index_where / for_each
+#
+# FA 没有 lambda，回调就是**顶层函数的名字**（不加括号），签名一律 fn(*元素) -> R。
+# 这一例钉住：
+#   1. map 换元素类型（Vec<i64> -> Vec<str>、Vec<P> -> Vec<str>、Vec<str> -> Vec<i64>）
+#   2. filter 保元素类型，且**原表不动**（结构体元素是装一份新箱进新表，
+#      不是共享盒子 —— 纯数据箱没有引用计数，共享就是 double free）
+#   3. 窄元素（Vec<i8>）也成立：回调拿到的 *元素 按真实槽宽算地址
+#   4. 空表：map/filter 给空表，any 是 false，all 是 true，index_where 是 -1
+#   5. any/all/index_where 短路；for_each 的回调不返回东西，但能**通过指针改元素**
+#   6. 链式调用与全局写法 map(v, f) / filter(v, p)
+#   7. map 的回调返回一个 Vec（引用计数类型）也不漏不重
+struct P:
+    name: str
+    age: i64
+
+fn double(x: *i64) -> i64: return (*x) * 2
+fn is_even(x: *i64) -> bool: return (*x) % 2 == 0
+fn has_neg(x: *i64) -> bool: return *x < 0
+fn bump(x: *i64):
+    *x = *x + 100
+fn rep(x: *i64) -> Vec<i64>:
+    let out = Vec<i64>()
+    for i in 0..*x:
+        out.push(*x)
+    return out
+fn name_of(p: *P) -> str: return p.name
+fn is_adult(p: *P) -> bool: return p.age >= 18
+fn len_of(s: *str) -> i64: return (*s).len()
+fn shout(s: *str) -> str: return (*s) + "!"
+fn not_empty(s: *str) -> bool: return (*s).len() > 0
+fn up(x: *i8) -> i8: return (*x) + 1
+fn big(x: *i8) -> bool: return *x > 2
+fn show(x: *i64):
+    write("{*x} ")
+
+fn main() -> i64:
+    let n = Vec<i64>[1, 2, 3, 4, 5]
+    print("map:", n.map(double).to_str())
+    print("filter:", n.filter(is_even).to_str())
+    print("any/all:", n.any(has_neg), n.all(is_even), Vec<i64>[2, 4].all(is_even))
+    print("index_where:", n.index_where(is_even), Vec<i64>[1, 3].index_where(is_even))
+    write("for_each: ")
+    n.for_each(show)
+    print("")
+
+    let v = Vec<P>[P{name: "甲", age: 30}, P{name: "乙", age: 12}, P{name: "丙", age: 66}]
+    print("map 名字:", v.map(name_of).join(","))
+    print("链式:", v.filter(is_adult).map(name_of).join(","))
+    print("判定:", v.any(is_adult), v.all(is_adult), v.index_where(is_adult))
+    print("原表没动:", v.to_str())
+
+    let s = Vec<str>["a", "bb", "", "ccc"]
+    print("长度:", s.map(len_of).to_str())
+    print("加叹号:", s.map(shout).join(" "))
+    print("去空串:", s.filter(not_empty).join(","), s.len())
+
+    let b = Vec<i8>[1, 2, 3]
+    print("i8 map:", b.map(up).to_str())
+    print("i8 filter:", b.filter(big).to_str())
+
+    let e = Vec<i64>[]
+    print("空表:", e.map(double).len(), e.filter(is_even).len(),
+          e.any(has_neg), e.all(has_neg), e.index_where(has_neg))
+
+    let m = Vec<i64>[1, 2]
+    print("map 出表:", m.map(rep).to_str())
+
+    let g = Vec<i64>[1, 2, 3]
+    g.for_each(bump)
+    print("改元素:", g.join(","))
+
+    print("全局写法:", filter(n, is_even).to_str(), map(n, double).to_str())
+    return 0
