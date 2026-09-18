@@ -1,0 +1,68 @@
+# 回归：函数掉到末尾（没有任何 return 被执行）时的兜底返回。
+# 以前发的是 RET Const(0)：Vec/Map/str 拿到空指针（调用方一用就段错误），
+# struct/enum 压根没写调用方的 sret 缓冲，而且 defer 不跑、局部引用全泄漏。
+struct P:
+    x: i64
+    y: i64
+
+enum E:
+    A
+    B(i64)
+
+fn fs() -> str:
+    defer print("  str 的 defer 跑了")
+    if false { return "不会走到" }
+
+fn fi() -> i64:
+    if false { return 1 }
+
+fn ff() -> f64:
+    if false { return 1.5 }
+
+fn fb() -> bool:
+    if false { return true }
+
+fn fv() -> Vec<i64>:
+    if false { return Vec<i64>[1] }
+
+fn fm() -> Map<str, i64>:
+    if false { return Map<str, i64>() }
+
+fn fp() -> P:
+    if false { return P{x: 1, y: 2} }
+
+fn fe() -> E:
+    if false { return E.B(9) }
+
+fn fq() -> *P:
+    if false { return nil }
+
+fn main() -> i64:
+    let s = fs()
+    print("str:", "[" + s + "]", s.len())
+    print("i64:", fi(), "f64:", ff(), "bool:", fb())
+
+    let v = fv()
+    print("Vec:", v.to_str(), v.len())
+    v.push(7)
+    print("  push 之后:", v.to_str())
+
+    let m = fm()
+    print("Map:", m.to_str(), m.len())
+    m.set("k", 1)
+    print("  set 之后:", m.to_str())
+
+    let p = fp()
+    print("struct:", p.x, p.y)
+    p.x = 3
+    print("  改字段之后:", p.x, p.y)
+
+    let e = fe()
+    match e:
+        E.A:
+            print("enum: A（全零 = 第 0 个变体）")
+        E.B(n):
+            print("enum: B", n)
+
+    print("指针是 nil:", fq() == nil)
+    return 0

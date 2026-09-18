@@ -1,0 +1,5 @@
+# 循环导入的一半：a 用 b，b 又用 a。展开时按文件去重，不会无限递归。
+use "cyc_b.fa"
+
+fn from_a() -> i64:
+    return 1

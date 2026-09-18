@@ -1,0 +1,81 @@
+# v.copy() / m.copy()：另起一份容器。
+#
+# 为什么需要它：`let b = v` 拷的是**把手**（引用计数 +1），两个名字指向同一个
+# 缓冲区，改一个另一个跟着变。要一份能独立改动的副本就得 copy()。
+#
+# 实现上有两个坑，这个用例都盯着：
+#   1) 引用计数元素（str / Vec / Map）要各加一次引用；
+#   2) 装箱的 struct / enum 元素**盒子不带引用计数** —— 直接共享盒子等于释放两次
+#      （实测 glibc 报 "double free detected in tcache 2"），必须另分配一份盒子。
+struct Tag:
+    name: str
+    n: i64
+
+enum Shape:
+    Circle(f64)
+    Rect(f64, f64)
+
+fn main() -> i64:
+    # 标量元素
+    let v = Vec<i64>[1, 2, 3]
+    let c = v.copy()
+    c.push(4)
+    c[0] = 99
+    print("i64:", v.to_str(), c.to_str())
+
+    # str 元素：两份表独立，字符串对象共享（不可变，无所谓）
+    let ss = Vec<str>["a", "b"]
+    let cs = ss.copy()
+    cs.push("c")
+    cs[0] = "A"
+    print("str:", ss.to_str(), cs.to_str())
+
+    # 嵌套 Vec：拷的是把手，内层还是同一份（想彻底独立要逐层 copy）
+    let nested = Vec<Vec<i64>>[]
+    nested.push(Vec<i64>[1])
+    let cn = nested.copy()
+    cn.push(Vec<i64>[2])
+    cn[0].push(9)
+    print("嵌套:", nested.to_str(), cn.to_str())
+
+    # 装箱的结构体元素：盒子必须各一份，改副本不影响原表
+    let ts = Vec<Tag>[]
+    ts.push(Tag{name: "甲", n: 1})
+    let ct = ts.copy()
+    ct.push(Tag{name: "乙", n: 2})
+    ct[0].n = 100
+    print("struct:", ts.len(), ct.len(), ts[0].n, ct[0].n, ct[0].name, ct[1].name)
+
+    # 装箱的枚举元素（带载荷）
+    let sh = Vec<Shape>[]
+    sh.push(Shape.Circle(1.0))
+    let ch = sh.copy()
+    ch.push(Shape.Rect(2.0, 3.0))
+    print("enum:", sh.len(), ch.len())
+    match ch[1]:
+        Shape.Rect(w, h):
+            print("  副本第二个:", w, h)
+        _:
+            print("  ?")
+
+    # Map：键值各自独立
+    let m = Map<str, i64>()
+    m.set("a", 1)
+    m.set("b", 2)
+    let m2 = m.copy()
+    m2.set("c", 3)
+    m2["a"] = 100
+    m.del("b")
+    print("map:", m.to_str(), m2.to_str(), m.len(), m2.len())
+
+    # Map 的值是装箱结构体
+    let mt = Map<str, Tag>()
+    mt.set("x", Tag{name: "原", n: 1})
+    let mt2 = mt.copy()
+    mt2["x"].n = 42
+    print("map<str,struct>:", mt["x"].n, mt2["x"].n)
+
+    # 空容器
+    let e = Vec<i64>[]
+    print("空表:", e.copy().to_str(), e.copy().len())
+    return 0

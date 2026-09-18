@@ -1,0 +1,38 @@
+# 数组的初始化：不写初值就是全零，字面量按标注转元素类型。
+#
+# 两个回归：
+#   1) `let a: [u8; 4] = [1, 2, 3, 4]` 报「期望 [u8 x 4]，实际 [i64 x 4]」——
+#      Vec 那条路会按标注转元素（`let v: Vec<u8> = [1,2,3]` 一直是对的），
+#      数组却先按第一个元素推成 [i64 x N] 再和标注比。写字节缓冲最自然的写法编不过。
+#   2) 未初始化的 `[str; N]` 槽里是 NULL，`m.to_str()` 走 fa_str_concat，
+#      而它给 NULL 顶替身时调 fa_str_from_cstr("") —— 每次堆上分配 17 字节，
+#      那两份替身从来没人释放。ASan 实测漏 34 字节 2 个对象。
+#      现在运行时里所有「NULL 就当空串」的地方统一用一份永生空串（rc = -1）。
+fn main() -> i64:
+    # 不写初值：全零（str 元素是空串，Vec 元素是空表，不是野值）
+    let buf: [u8; 16]
+    print("未初始化 u8:", buf.to_str(), buf.len())
+    buf[0] = 255
+    buf[15] = 1
+    print("写两头:", buf[0], buf[15])
+    let s: [str; 2]
+    print("未初始化 str:", s.to_str(), s[0].len())
+    let vv: [Vec<i64>; 2]
+    print("未初始化 Vec:", vv.to_str())
+    let n: [i64; 3]
+    print("未初始化 i64:", n.to_str())
+
+    # 字面量按标注转元素类型
+    let a: [u8; 4] = [1, 2, 3, 4]
+    print("u8 字面量:", a.to_str())
+    let f: [f64; 2] = [1, 2]
+    print("整数升浮点:", f.to_str(), f[0] + 0.5)
+    let v: Vec<u8> = [1, 2, 3]
+    print("对照 Vec<u8>:", v.to_str())
+    let i32s: [i32; 3] = [1, 2, 3]
+    print("i32:", i32s.to_str())
+
+    # 拼接、比较这些照常用（NULL 顶替身那条路要多走几次）
+    # NULL 元素按空串对待：拼接、比较、长度、to_str 四种口径要一致
+    print("拼:" + s[0] + "|", s[1] == "", s[0] == s[1], s[0] < "甲")
+    return 0

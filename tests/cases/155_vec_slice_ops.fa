@@ -1,0 +1,109 @@
+# 切片语法 a[lo:hi] 与 Vec 的 insert / remove / dedup / slice
+#
+# 这一例钉住四件事，每一件都出过真问题或者很容易出错：
+#
+#   1. **切片语法**在 str 和 Vec 上都能用，四种写法都成立：
+#      a[lo:hi] / a[lo:] / a[:hi] / a[:]。省掉的那一头由运行时按长度夹边，
+#      和早就有的 str.slice(a, b) 是同一套规矩：负的夹到 0、超过长度的夹到长度、
+#      反了给空结果 —— str 和 Vec 不用记两遍。
+#
+#   2. **切片返回新值，不是原数据的一段视图**。str 本来就不可变；Vec 只有一份
+#      数据，做成视图的话引用计数就说不清了（原表和视图谁负责释放？）。
+#      所以改切片不动原表，改原表也不动切片。
+#
+#   3. **装箱元素必须克隆，不能共享盒子**。Vec<结构体> / Vec<枚举> 的元素在表里
+#      存的是堆上「盒子」的地址，而盒子**不带引用计数**（fa_agg_inc 对它是空操作）。
+#      两张表共享同一个盒子 = 释放两次 = double free。slice / dedup / copy 都得
+#      把盒子大小告诉运行时，让它另装一箱。这一例里 Vec<P> 和 Vec<Vec<i64>>
+#      各切一份，程序正常退出、ASan 干净，就说明克隆对了。
+#
+#   4. **dedup 按内容比，不按地址**，而且保留第一次出现的那个、顺序不变
+#      （不是排序去重）。contains / index_of 当年就是比地址，两张内容相同的
+#      Vec<i64> 判 false / -1；str 元素更要按内容比，字面量池里的同一个串
+#      和运行时拼出来的串地址不同。
+#
+# 顺带钉住 insert 的边界：i == len 就等于 push；越界报的和 a[i] 是同一套话。
+
+struct P { x: i64, y: i64 }
+
+fn main() -> i64:
+    # ---- 1. str 上的切片语法，四种写法 ----
+    let s = "0123456789"
+    print("str s[2:5]  ", s[2:5])
+    print("str s[7:]   ", s[7:])
+    print("str s[:3]   ", s[:3])
+    print("str s[:]    ", s[:])
+    print("str 方法    ", s.slice(2, 5))
+    print("链式        ", s[2:8][1:4])
+
+    # ---- 2. 夹边：越界、空、反了，都不该崩 ----
+    print("超长度      ", s[8:99], "|len=", s[8:99].len())
+    print("空的        ", s[5:5], "|len=", s[5:5].len())
+    print("反了        ", s[7:3], "|len=", s[7:3].len())
+    print("起点越界    ", s[99:], "|len=", s[99:].len())
+
+    # ---- 3. Vec<i64> 上的切片，原表不动 ----
+    let v = Vec<i64>[10, 20, 30, 40]
+    print("vec v[1:3]  ", v[1:3].to_str())
+    print("vec v[:2]   ", v[:2].to_str())
+    print("vec v[2:]   ", v[2:].to_str())
+    print("vec v[:]    ", v[:].to_str())
+    let c = v[1:3]
+    c.push(99)
+    print("改切片      ", c.to_str(), " 原表 ", v.to_str())
+
+    # ---- 4. 引用计数元素：Vec<str> 切片要各自持有 ----
+    let vs = Vec<str>["甲", "乙", "丙", "丁"]
+    let cs = vs[1:3]
+    cs.push("戊")
+    print("Vec<str>    ", cs.to_str(), " 原表 ", vs.to_str())
+
+    # ---- 5. 装箱元素：盒子必须克隆，共享就是 double free ----
+    let vp = Vec<P>[P{x: 1, y: 2}, P{x: 3, y: 4}, P{x: 5, y: 6}]
+    let cp = vp[1:3]
+    print("Vec<结构体> ", cp.len(), " cp[0].x=", cp[0].x, " cp[1].y=", cp[1].y,
+          " 原表 ", vp.len(), " vp[0].x=", vp[0].x)
+
+    let vv = Vec<Vec<i64>>[Vec<i64>[1], Vec<i64>[2], Vec<i64>[3]]
+    let cv = vv[0:2]
+    print("Vec<Vec>    ", cv.to_str(), " 原表 ", vv.to_str())
+
+    # ---- 6. insert：中间插入、末尾插入（== push）、开头插入 ----
+    let iv = Vec<i64>[1, 2, 3]
+    iv.insert(1, 9)
+    print("insert 中间 ", iv.to_str())
+    iv.insert(4, 8)
+    print("insert 末尾 ", iv.to_str())
+    iv.insert(0, 0)
+    print("insert 开头 ", iv.to_str())
+
+    # ---- 7. remove：删完后面的整体前移 ----
+    iv.remove(0)
+    print("remove 开头 ", iv.to_str())
+    iv.remove(3)
+    print("remove 中间 ", iv.to_str())
+    iv.remove(2)
+    print("remove 末尾 ", iv.to_str())
+
+    # ---- 8. dedup：按内容、保序、留第一次出现的 ----
+    print("dedup 整数  ", Vec<i64>[1, 1, 2, 3, 2, 1].dedup().to_str())
+    print("dedup 字符串", Vec<str>["a", "b", "a", "c", "b"].dedup().to_str())
+    let d = Vec<i64>[5, 5, 6]
+    let u = d.dedup()
+    print("dedup 不改原表 ", d.to_str(), "->", u.to_str())
+    print("dedup 空表  ", Vec<i64>[].dedup().to_str())
+    print("dedup 浮点  ", Vec<f64>[1.5, 1.5, 2.5].dedup().to_str())
+
+    # ---- 9. 窄元素：i8/u16 的槽宽不是 8 字节，挪动和切片都得按真实宽度 ----
+    let nb = Vec<i8>[1, 2, 3, 4]
+    nb.insert(2, 9)
+    print("Vec<i8>     ", nb.to_str(), " 切片 ", nb[1:4].to_str())
+    nb.remove(0)
+    print("Vec<i8> 删后", nb.to_str())
+
+    # ---- 10. 浮点元素：insert 的值按位传给运行时 ----
+    let fv = Vec<f64>[1.5, 2.5]
+    fv.insert(1, 9.25)
+    print("Vec<f64>    ", fv.to_str(), " 切片 ", fv[1:3].to_str())
+
+    return 0

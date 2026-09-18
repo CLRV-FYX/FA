@@ -1,0 +1,90 @@
+# 三个后端 bug 的定点回归（都是「单独测不出来、叠起来才炸」的那类）。
+#
+# 1) 形参当下标：`fn f(rows: Vec<str>, i: i64): rows[i]`
+#    比例变址的 LOAD 把下标藏在 extra=(Temp, scale) 元组里，而 lower_params
+#    给形参换号时只处理了 dst / args / 「extra 本身就是 Temp」三种情况 ——
+#    元组里那个下标仍指向换号前的旧 Temp：活性分析看得到它、却找不到定义，
+#    分配器给了个没人写过的寄存器（实测 `mov r11, [r10+r13*8]`，r13 是垃圾）。
+#
+# 2) RET 的尾声：以前按「此刻 self.loc 里出现过哪些被调用者保存寄存器」重新算
+#    一份列表，与序言 push 的那份不一致时，push 了 4 个只 pop 3 个 ——
+#    rbx/r12-r15 是被调用者保存的，调用方正拿它们存活跃值，一层递归回来数据就变了。
+#
+# 3) `for x in <函数调用>`：可迭代对象以前在循环体里又求值了一遍，
+#    每轮新建一个容器、每轮释放一次（RCDEC 落在循环体内），第二轮就把还在用的
+#    对象放掉了 -> malloc(): unaligned tcache chunk detected。
+struct W:
+    t: str
+    c: i64
+
+fn rec_index(rows: Vec<str>, i: i64) -> i64:
+    if i >= rows.len() { return 0 }
+    return rows[i].len() + rec_index(rows, i + 1)
+
+fn rec_index_arr(a: [i64; 4], i: i64) -> i64:
+    if i >= 4 { return 0 }
+    return a[i] + rec_index_arr(a, i + 1)
+
+# 深层递归 + 多个跨调用存活的值：逼编译器用满被调用者保存寄存器
+fn deep(n: i64, acc: Vec<i64>, tag: str) -> i64:
+    if n <= 0 { return acc.len() + tag.len() }
+    acc.push(n)
+    return deep(n - 1, acc, tag + "x")
+
+fn keys_of(m: Map<str, i64>) -> Vec<str>:
+    return m.keys()
+
+fn collect(m: Map<str, i64>) -> Vec<W>:
+    let out = Vec<W>[]
+    for k in m.keys() {              # 可迭代对象是一次函数调用
+        out.push(W { t: k, c: m[k] })
+    }
+    return out
+
+fn upperish(s: str) -> str:
+    let out = ""
+    for i in 0..s.len() {
+        let b = s[i]
+        out = out + str(chr(b))      # char -> 整数 -> chr 回来
+    }
+    return out
+
+fn main() -> i64:
+    let rows = Vec<str>["aa", "bbb", "c", "dddd"]
+    print("1) 形参当下标（递归）:", rec_index(rows, 0))
+    print("1) 数组版:", rec_index_arr([10, 20, 30, 40], 0))
+
+    let m = Map<str, i64>["aa": 1, "bb": 2, "cc": 3]
+    # 3) 反复调用同一个「遍历函数调用结果」的函数
+    let k1 = keys_of(m)
+    let k2 = keys_of(m)
+    let k3 = keys_of(m)
+    print("3) keys:", k1.len(), k2.len(), k3.len(), k1[0].len())
+
+    let ws = collect(m)
+    let ws2 = collect(m)
+    print("3) collect:", ws.len(), ws2.len(), ws[0].t, ws2[1].c)
+
+    # 直接在 for 里调用（最容易触发的那个写法）
+    let n = 0
+    for k in keys_of(m) { n += k.len() }
+    for k in keys_of(m) { n += m[k] }
+    print("3) for in 调用:", n)
+
+    # 2) 深递归：跨调用存活的值必须完好无损
+    let acc = Vec<i64>[]
+    print("2) 深递归:", deep(60, acc, "seed"))
+    print("2) 调用方自己的值还在:", acc.len())
+
+    # char 算术（C 风格的整型提升）
+    let s = "Hi!"
+    print("char 算术:", upperish(s), s[0] - 'A', chr(s[0] - 'A' + 'a'))
+    let shifted = ""
+    for i in 0..s.len() { shifted = shifted + chr(s[i] + 1) }
+    print("char +1:", shifted)
+
+    # 大量后续分配：有任何悬垂指针/双重释放都会在这里暴露
+    let junk = Vec<str>[]
+    for i in 0..5000 { junk.push("填充{i}") }
+    print("堆检查:", junk.len(), junk[4999], ws[2].t, k3[2])
+    return 0

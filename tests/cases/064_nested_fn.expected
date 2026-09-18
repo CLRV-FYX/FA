@@ -1,0 +1,9 @@
+square: 25
+cube: 27
+countdown: 15
+deep3: 26
+结构体: 5 50
+当函数指针: 81
+outer(5) = 33
+方法里的嵌套: 7 14
+全局 hits = 7

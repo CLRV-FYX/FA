@@ -1,0 +1,27 @@
+# 定长数组放聚合值 + 链式取址（曾经直接让编译器崩掉）
+struct Item:
+    id: i64
+    name: str
+
+fn mk(i: i64) -> Item:
+    return Item { id: i, name: "item{i}" }
+
+fn main() -> i64:
+    let a: [Item; 3] = [Item { id: 1, name: "a" },
+                        Item { id: 2, name: "b" },
+                        Item { id: 3, name: "c" }]
+    print(len(a), a[0].id, a[1].name, a[2].id)
+    a[1].id = 99
+    print(a[1].id)
+
+    print(mk(7).id, mk(7).name)     # 调用结果直接取字段
+
+    let p = &a[0]
+    print(p[2].id)
+
+    let strs: [str; 3] = ["x", "y", "z"]
+    print(strs[1], len(strs))
+
+    let nested: [Item; 2] = [mk(10), mk(20)]
+    print(nested[0].name, nested[1].id)
+    return 0

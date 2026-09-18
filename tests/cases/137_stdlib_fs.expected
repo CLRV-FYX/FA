@@ -1,0 +1,40 @@
+不存在的目录列出来是空表: 0
+exists 假: false
+make_dir_all: true
+exists 真: true
+is_dir: true false
+write: true
+append: true
+read: 第一行|第二行|第三行|
+read_lines 段数: 3
+read_lines 内容: 第一行/第二行/第三行
+write_lines: true
+size: 30
+读不到的文件给空串: []
+read_lines 空文件: 0
+list_dir 排序: a.txt,l.txt,x
+entries 个数: 3
+walk 排序: a.txt,l.txt,x/,x/b.txt,x/y/,x/y/c.txt
+count_dir: 2
+rename_to: true true
+copy: true 30
+set_mode: true
+info: true true false 30 384
+linfo 不是符号链接: false
+mtime 是个合理的数: true
+readable/writable: true true
+remove: true false
+非空目录删不掉: false
+join: /a/b /a/b b /b
+base: c.txt c.txt b
+dir: /a/b [] /
+ext: gz [] []
+stem: a.tar noext
+is_abs: true false
+parts: a,b,c
+relative: c.txt /z/c
+trim_slash: /a/b /
+cwd 非空: true
+abs 是绝对路径: true
+清空后 walk: 2
+删干净: true false

@@ -1,0 +1,84 @@
+# 元素是引用计数/装箱类型时的 resize：**每格都得是新建的一份**。
+#
+# 以前不管什么元素都走 fa_vec_resize(v, n, val) —— 它把同一个 val push n 次：
+#   * 不给填充值时 val 是常量 0（空指针）：实测 Vec<Vec<i64>>().resize(2) 之后
+#     c[0].push(1) 什么都不发生（fa_vec_push 对 NULL 直接 return，打出来还是 [[], []]）；
+#     Vec<P>().resize(2) 当场段错误（box_agg 拿常量 0 当结构体值装箱），连 len() 都崩；
+#   * 给了填充值时 n 格共享同一个对象：改一格全表跟着变，装箱结构体还会被释放 n 次。
+# 现在编译器自己发循环：变短一格一格 pop，变长每轮新建一份再 push；
+# 填充值只求值一次（resize(3, mk()) 不会调三回 mk），Vec/Map 每格 clone，
+# 装箱元素每格 alloc + memcpy 一份新盒子。
+struct P:
+    x: i64
+    name: str
+
+enum E:
+    Empty
+    Tag(str)
+
+fn mk() -> Vec<i64>:
+    return Vec<i64>[1, 2]
+
+fn main() -> i64:
+    # 不给填充值：每格一张**自己的**空表
+    let c = Vec<Vec<i64>>()
+    c.resize(2)
+    c[0].push(1)
+    print("嵌套 Vec:", c.to_str())
+
+    let m = Vec<Map<str, i64>>()
+    m.resize(2)
+    m[0].set("k", 1)
+    print("Map 元素:", m.to_str())
+
+    let s = Vec<str>()
+    s.resize(2)
+    s[0] = "甲"
+    print("str 元素:", s.to_str(), s[0].len(), s[1].len())
+
+    # 给填充值：结构体每格一份新盒子，改一格不动别的
+    let ps = Vec<P>()
+    ps.resize(3, P{x: 7, name: "七"})
+    ps[0].x = 100
+    ps[1].name = "改过"
+    print("结构体元素:", ps.to_str())
+
+    let es = Vec<E>()
+    es.resize(2, E.Empty)
+    es[1] = E.Tag("载荷")
+    print("枚举元素:", es.to_str())
+
+    # Vec 填充值：每格 clone 一份（浅拷），原表不动
+    let fill = mk()
+    let cc = Vec<Vec<i64>>()
+    cc.resize(2, fill)
+    cc[0].push(99)
+    print("填充值每格独立:", cc.to_str(), "原填充值:", fill.to_str())
+
+    # 变短：截断，被删掉的元素正常释放
+    c.resize(1)
+    ps.resize(1)
+    print("截断:", c.to_str(), ps.to_str(), c.len(), ps.len())
+
+    # resize(0) 等于 clear
+    cc.resize(0)
+    print("归零:", cc.to_str(), cc.len())
+
+    # str 元素截断：被删掉的那些串要还掉（fa_vec_pop 只交值、不释放）
+    let ss = Vec<str>()
+    ss.resize(4, "很长的字符串用来确保它是堆上分配的而不是静态串")
+    ss.resize(1)
+    print("str 截断:", ss.len(), ss[0].len())
+
+    # pop 出来的值归调用方：当语句丢掉时也要释放
+    let pq = Vec<str>["甲".repeat(40), "乙".repeat(40)]
+    pq.pop()
+    print("pop 丢弃:", pq.to_str())
+
+    # 大一点：确认循环里的引用计数是平的（ASan 盯着泄漏和重复释放）
+    let big = Vec<Vec<i64>>()
+    big.resize(500)
+    for i in 0..big.len() { big[i].push(i) }
+    big.resize(10)
+    print("500 -> 10:", big.len(), big.to_str().slice(0, 20))
+    return 0

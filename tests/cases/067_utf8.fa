@@ -1,0 +1,48 @@
+# 按码点（而不是按字节）处理字符串 —— README「已知限制」里那条
+# 「s[i] 取的是字节（char = u8），要按码点处理请自行解码」现在有运行时支持了：
+#   s.char_len()          码点个数
+#   s.char_at(i)          第 i 个码点（i64；越界和别的下标一样报错退出）
+#   s.codepoints()        Vec<i64>，全部码点
+#   s.slice_chars(a, b)   按码点切片
+# 码点用 i64 而不是 char，因为 char 就是一个字节，装不下 > 255 的码点。
+# 非法/截断的 UTF-8 序列按单字节码点兜底，不会读到缓冲区外面。
+fn main() -> i64:
+    let s = "你好, FA! αβ"
+    print("字节 =", s.len(), "码点 =", s.char_len())
+    print("chars() 仍是字节:", s.chars().len())
+
+    let cps = s.codepoints()
+    print("码点表:", cps.len(), cps[0], cps[1], cps[8])
+
+    print("char_at:", chr(s.char_at(0)), chr(s.char_at(1)), chr(s.char_at(5)))
+    print("slice_chars:", s.slice_chars(0, 2), "|", s.slice_chars(2, 7),
+          "|", s.slice_chars(8, 100))
+
+    # 逐码点遍历：多字节的标注出来
+    let out = ""
+    for i in 0..s.char_len() {
+        let cp = s.char_at(i)
+        out = out + chr(cp) + (if cp > 127 { "[多]" } else { "" })
+    }
+    print(out)
+
+    # 纯 ASCII 时码点数 == 字节数
+    let a = "hello"
+    print("ascii:", a.len(), a.char_len(), a.char_at(4), a.slice_chars(1, 4))
+
+    # 空串 / 越界夹紧
+    let e = ""
+    print("空串:", e.len(), e.char_len(), e.codepoints().len(), "[{e.slice_chars(0, 5)}]")
+
+    # chr 反向编码（本来就支持，这里和码点表对起来验证往返一致）
+    let rt = ""
+    for cp in cps { rt = rt + chr(cp) }
+    print("往返一致:", rt == s, rt.char_len())
+
+    # 大量多字节字符串：引用计数/分配有问题会在压堆时暴露
+    let many = Vec<str>[]
+    for i in 0..2000 { many.push("第{i}号α") }
+    let total = 0
+    for x in many { total += x.char_len() }
+    print("批量码点数:", total, many[1999], many[1999].slice_chars(0, 3))
+    return 0

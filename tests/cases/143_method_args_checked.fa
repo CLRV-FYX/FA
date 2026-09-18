@@ -1,0 +1,16 @@
+# expect-compile-error: 方法 'f' 需要 1 个实参，实际传入 3 个
+# 自己写在 impl 里的方法，实参个数和类型都要核对。
+# 以前这一步整个没有：多给的实参被悄悄丢掉，类型不对也照样编过，
+# 后端把一个 FaStr* 当整数用，算出来是垃圾 —— 不报错、结果错，最难查。
+struct A:
+    x: i64
+
+impl A:
+    fn f(self, a: i64) -> i64:
+        return a + self.x
+
+fn main() -> i64:
+    let v: A
+    v.x = 1
+    print(v.f(1, 2, 3))
+    return 0

@@ -1,0 +1,60 @@
+# new / free 配对，外加两个用 ASan 抓出来的引用计数 bug 的回归：
+#
+# 1) `new P { name: "x" + "y", ... }` 以前只 MEMCPY 结构体字节，不给字段加引用：
+#    临时字符串在语句末尾就被释放，堆上那份拷贝的字段成了悬垂指针，
+#    下一次读它是 heap-use-after-free（小字符串 glibc 常常不吭声，所以一直没暴露）。
+#    现在 gen_new 在 memcpy 之后调 __fa_retain_<T>（聚合路径），与标量路径一致。
+#
+# 2) 有了 new 却没有释放手段：libc 的 free 只还内存，不还字段引用，
+#    结构体里的 str / Vec 一定漏。新增内建 free(p)：先把指向对象自己拥有的
+#    引用逐个还掉（__fa_drop_<T> / fa_drop_arr / RCDEC），再 fa_free(p)。
+#    下面 1000 轮的循环在 ASan（含泄漏检测）下必须是干净的。
+struct P:
+    name: str
+    items: Vec<i64>
+
+struct Node:
+    val: i64
+    next: *Node
+
+enum Ev:
+    Empty
+    Tagged(s: str)
+
+fn main() -> i64:
+    let p = new P { name: "x" + "y", items: Vec<i64>[1, 2, 3] }
+    print(p.name, p.items.len(), p.items[2])
+    free(p)
+
+    # 链式：两个节点各自释放
+    let n2 = new Node { val: 2, next: nil }
+    let n1 = new Node { val: 1, next: n2 }
+    print(n1.val, n1.next.val, n1.next == n2)
+    free(n1)
+    free(n2)
+
+    # 标量指针
+    let q = new 42
+    print(q[0])
+    q[0] = 7
+    print(q[0])
+    free(q)
+
+    # 带引用的枚举
+    let ev = new Ev.Tagged("标" + "签")
+    match ev[0]:
+        Ev.Tagged(txt):
+            print("枚举字段:", txt)
+        Ev.Empty:
+            print("枚举字段: 空")
+    free(ev)
+
+    # 压堆：每轮都 new + free，有漏放/多放都会在这里堆出来
+    let vs = Vec<str>[]
+    for i in 0..1000 {
+        let t = new P { name: "第{i}号", items: Vec<i64>[i, i + 1] }
+        vs.push(t.name)
+        free(t)
+    }
+    print(vs.len(), vs[999])
+    return 0

@@ -1,0 +1,8 @@
+# expect-compile-error: 按值包含了自己
+# expect-compile-error: 行 3
+struct Bad:
+    x: i64
+    inner: Bad
+
+fn main() -> i64:
+    return 0

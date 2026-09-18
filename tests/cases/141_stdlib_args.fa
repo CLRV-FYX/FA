@@ -1,0 +1,56 @@
+# 标准库 std.args：命令行解析。用 parse_of 喂固定的参数表，输出与真实命令行无关。
+use std.args
+
+fn main() -> i64:
+    let a = Args.parse_of(Vec<str>["/usr/bin/prog", "--name=FA", "-v", "--out", "x.txt",
+                                   "in1", "in2", "--no-color", "-abc", "--level=3",
+                                   "--", "--keep", "-5"])
+    print("程序名:", a.program())
+    print("base:", a.base())
+    print("长选项带等号:", a.text("name", "?"))
+    print("短开关:", a.boolean("v", false))
+    print("长选项带值:", a.text("out", "?"))
+    print("no- 前缀:", a.boolean("color", true))
+    print("连写短开关:", a.boolean("a", false), a.boolean("b", false), a.boolean("c", false))
+    print("数字选项:", a.int("level", 0))
+    print("位置参数:", a.count(), a.pos(0), a.pos(1))
+    print("越界给空:", "[" + a.pos(9) + "]", "默认值:", a.pos_or(9, "默认"))
+    print("-- 之后:", a.after_dashdash().join(","))
+    print("选项顺序:", a.names().join(","))
+    print("has:", a.has("name"), a.has("没有"))
+    print("没给的用默认:", a.text("没有", "缺省"), a.int("没有", -1),
+          a.num("没有", 2.5), a.boolean("没有", true))
+    print("value 没给是空:", "[" + a.value("没有") + "]")
+    print("unknown 全允许:", a.unknown(Vec<str>["name", "v", "out", "color", "a", "b", "c", "level"]).len())
+    print("unknown 挑出拼错:", Args.parse_of(Vec<str>["p", "--naem=x"]).unknown(Vec<str>["name"]).join(","))
+    print("require_int:", a.require_int("level"))
+    print("summary:")
+    print(a.summary())
+
+    # 各种真假写法
+    let b = Args.parse_of(Vec<str>["p", "--x=false", "--y=0", "--z=no", "--w=off", "--t=yes"])
+    print("假值四种写法:", b.boolean("x", true), b.boolean("y", true),
+          b.boolean("z", true), b.boolean("w", true), "真值:", b.boolean("t", false))
+
+    # 空值、负数、单独的 -
+    let c = Args.parse_of(Vec<str>["p", "--empty=", "-5", "-", "--n=-7"])
+    print("空值算给过:", c.has("empty"), "[" + c.text("empty", "d") + "]")
+    print("-5 被当成短选项 5:", c.has("5"))
+    print("单独的 - 是位置参数:", c.pos(0))
+    print("--n=-7:", c.int("n", 0))
+
+    # 短选项带值
+    let d = Args.parse_of(Vec<str>["p", "-o", "out.txt", "-v"])
+    print("-o 带值:", d.text("o", "?"), "末尾 -v 是开关:", d.boolean("v", false))
+
+    # help / version
+    print("-h:", Args.parse_of(Vec<str>["p", "-h"]).want_help())
+    print("--help:", Args.parse_of(Vec<str>["p", "--help"]).want_help())
+    print("--version:", Args.parse_of(Vec<str>["p", "--version"]).want_version())
+    print("没给 help:", Args.parse_of(Vec<str>["p", "x"]).want_help())
+
+    # 真实命令行（这个用例不带参数跑，所以只有程序名）
+    let real = Args.parse()
+    print("真实位置参数:", real.count(), "rest:", real.after_dashdash().len())
+    print("真实 argv0 非空:", real.program().len() > 0)
+    return 0

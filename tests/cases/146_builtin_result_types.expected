@@ -1,0 +1,13 @@
+file_write 返回: 1
+能和整数比: true true
+能当条件: true
+读回来: 内容
+写不进不存在的目录: 0
+读不到给空串: []
+sign 整数: -1 0 1
+sign 浮点: -1.0 0.0 1.0
+sign 能比较: true true true
+sign 能直接赋值: -1 -1.0
+sign 能参与算术: 0 -2.0
+abs 一直是对的: 3 3.5
+min/max 也一直是: 3 2.5

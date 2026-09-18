@@ -1,0 +1,8 @@
+quit
+move 1,2
+write hello
+color 255/128/0
+point 3/4
+4 write a move 7,8 23
+write own write own
+stress ok

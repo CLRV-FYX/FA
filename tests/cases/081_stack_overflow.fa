@@ -1,0 +1,14 @@
+# expect-exit: 1
+# expect-stderr: 栈溢出
+# 回归：递归太深撞穿栈时，必须打一句人话再退，不能静默消失。
+# 以前处理器是 signal() 装的、没有备用栈 —— 主栈耗尽时内核连信号帧都放不下，
+# 处理器根本跑不起来，进程被静默干掉（shell 只看到一个奇怪的退出码）。
+# 现在用 sigaltstack + SA_ONSTACK，并按「出错地址是否紧贴 RSP 下方」区分
+# 栈溢出和野指针（后者照旧报「段错误」）。
+fn deep(n: i64) -> i64:
+    if n <= 0 { return 0 }
+    return 1 + deep(n - 1)
+
+fn main() -> i64:
+    print(deep(1000000))
+    return 0

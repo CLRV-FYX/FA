@@ -1,0 +1,20 @@
+# 被 tests/cases/119_multi_file.fa 导入：常量、结构体、枚举、全局、函数、方法。
+const SCALE: i64 = 10
+
+struct Pt:
+    x: i64 = 0
+    y: i64 = 0
+
+impl Pt:
+    fn sum(self) -> i64:
+        return self.x + self.y
+
+enum Level:
+    Low
+    High(n: i64)
+
+let hits: i64 = 0
+
+fn make(a: i64, b: i64) -> Pt:
+    hits += 1
+    return Pt { x: a * SCALE, y: b * SCALE }

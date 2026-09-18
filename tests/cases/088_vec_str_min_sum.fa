@@ -1,0 +1,8 @@
+# expect-compile-error: Vec<str> 没有 min()
+# str 元素能按内容比较（cmp_strp 逐字节 memcmp），所以 sort / contains / index_of
+# 都成立；但极值只实现了整数和浮点，求和更是无意义（字符串不能相加）。
+# 以前 min/max 是到了后端才报「暂不支持」，sum 直接编过、跑出一个指针的和。
+fn main() -> i64:
+    let s = Vec<str>["乙", "甲"]
+    print(s.min())
+    return 0

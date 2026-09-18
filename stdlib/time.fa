@@ -1,0 +1,432 @@
+# stdlib/time.fa —— 时间：取、格式化、解析、算
+#
+#   use std.time
+#
+#   let t = Time.now()                      # Unix 秒
+#   print(Time.iso(t))                      # 2026-09-13T14:03:22
+#   print(Time.format(t, "%Y年%m月%d日 %H:%M"))
+#   let p = Time.parts(t)
+#   print(p.year, p.month, p.day, Time.weekday_cn(t))
+#   print(Time.parse("2026-09-13", "%Y-%m-%d"))
+#
+# FA 的内建里有 now()（毫秒，f64）和 sleep()，可「把时间戳变成人能读的字符串」
+# 这件事一直得自己算闰年、自己拼位数。strftime / strptime / localtime_r 都在 libc 里，
+# 绑过来就是（见 c/libc.fa，布局由真编译器量过）。
+#
+# 约定：
+#   - 时间戳一律是 **Unix 秒**（i64），和本地时区无关
+#   - 需要时区的地方：默认按**本地时区**（localtime_r），带 _utc 后缀的按 UTC（gmtime_r）
+#   - 出错：返回 i64 的给 -1，返回 str 的给 ""
+use "c/libc.fa"
+
+# 一个时间戳拆开之后的样子。Time.parts() 返回它。
+struct TimeParts:
+    year: i64           # 2026（已经加过 1900，不是 tm_year 那个「距 1900 的年数」）
+    month: i64          # 1-12（已经加过 1）
+    day: i64            # 1-31
+    hour: i64           # 0-23
+    min: i64            # 0-59
+    sec: i64            # 0-60（60 是闰秒）
+    weekday: i64        # 0=周日，1=周一 ... 6=周六（和 C 的 tm_wday 一致）
+    yearday: i64        # 一年里的第几天，0-365（和 C 的 tm_yday 一致）
+    tz_offset: i64      # 相对 UTC 的秒数（东八区是 28800）
+    tz_name: str        # 时区缩写，比如 CST
+    is_utc: bool        # 这份结果是不是按 UTC 算的
+
+struct Time:
+    _ns: i64
+
+impl Time:
+    # ---------------------------------------------------------- 现在几点
+    fn now() -> i64:
+        # 当前 Unix 秒
+        return time(nil)
+
+    fn now_ms() -> i64:
+        # 当前 Unix 毫秒（clock_gettime(CLOCK_REALTIME)）
+        let ts: timespec
+        if clock_gettime(CLOCK_REALTIME as i32, &ts) != 0:
+            return time(nil) * 1000
+        return ts.tv_sec * 1000 + ts.tv_nsec / 1000000
+
+    fn now_us() -> i64:
+        # 当前 Unix 微秒。量一段代码的耗时用 Time.elapsed_us(起点) 更直接。
+        let ts: timespec
+        if clock_gettime(CLOCK_REALTIME as i32, &ts) != 0:
+            return time(nil) * 1000000
+        return ts.tv_sec * 1000000 + ts.tv_nsec / 1000
+
+    fn monotonic_us() -> i64:
+        # 单调时钟的微秒版，配 elapsed_us 用
+        let ts: timespec
+        if clock_gettime(1, &ts) != 0:
+            return Time.now_us()
+        return ts.tv_sec * 1000000 + ts.tv_nsec / 1000
+
+    fn monotonic_ms() -> i64:
+        # 单调时钟：只用来量**时间差**，不代表任何日期（不会被调时钟影响）。
+        # 沙箱里 CLOCK_MONOTONIC 是 1。
+        let ts: timespec
+        if clock_gettime(1, &ts) != 0:
+            return Time.now_ms()
+        return ts.tv_sec * 1000 + ts.tv_nsec / 1000000
+
+    fn elapsed_ms(start_ms: i64) -> i64:
+        # start_ms 必须来自 Time.monotonic_ms()（理由同 elapsed_us）：
+        #   let t0 = Time.monotonic_ms()
+        #   ...干活...
+        #   print(Time.elapsed_ms(t0), "毫秒")
+        return Time.monotonic_ms() - start_ms
+
+    fn elapsed_us(start_us: i64) -> i64:
+        # start_us 必须来自 Time.monotonic_us()。拿 now_us()（真实时钟）的读数
+        # 传进来会得到一个巨大的负数 —— 两个时钟的起点不一样（单调时钟从开机算，
+        # 真实时钟从 1970 算），减在一起没有意义。
+        let ts: timespec
+        if clock_gettime(1, &ts) != 0:
+            return Time.monotonic_us() - start_us
+        let now_us = ts.tv_sec * 1000000 + ts.tv_nsec / 1000
+        return now_us - start_us
+
+    # ---------------------------------------------------------- 格式化
+    fn format(ts: i64, fmt: str) -> str:
+        # strftime 的格式串，本地时区。常用：%Y 年 %m 月 %d 日 %H 时 %M 分 %S 秒
+        # %A 星期几全名 %a 缩写 %B 月名 %e 日（不补零）%T 等于 %H:%M:%S %F 等于 %Y-%m-%d
+        # %s Unix 秒 %j 一年里的第几天 %% 一个百分号
+        return time_format_with(ts, fmt, false)
+
+    fn format_utc(ts: i64, fmt: str) -> str:
+        return time_format_with(ts, fmt, true)
+
+    fn iso(ts: i64) -> str:
+        # 2026-09-13T14:03:22（本地时区，不带偏移；要带偏移用 iso_offset）
+        return Time.format(ts, "%Y-%m-%dT%H:%M:%S")
+
+    fn iso_utc(ts: i64) -> str:
+        # 2026-09-13T06:03:22Z
+        return Time.format_utc(ts, "%Y-%m-%dT%H:%M:%SZ")
+
+    fn iso_offset(ts: i64) -> str:
+        # 2026-09-13T14:03:22+08:00 —— RFC 3339，能直接给别的语言/接口吃
+        let base = Time.format(ts, "%Y-%m-%dT%H:%M:%S")
+        let off = Time.tz_offset(ts)
+        let sign = "+"
+        let mut m = off / 60
+        if m < 0:
+            sign = "-"
+            m = -m
+        let hh = m / 60
+        let mm = m - hh * 60
+        return base + sign + two(hh) + ":" + two(mm)
+
+    fn date(ts: i64) -> str:
+        return Time.format(ts, "%Y-%m-%d")
+
+    fn clock(ts: i64) -> str:
+        return Time.format(ts, "%H:%M:%S")
+
+    fn datetime(ts: i64) -> str:
+        return Time.format(ts, "%Y-%m-%d %H:%M:%S")
+
+    fn stamp_file(ts: i64) -> str:
+        # 拿来当文件名的一部分：20260913_140322
+        return Time.format(ts, "%Y%m%d_%H%M%S")
+
+    # ---------------------------------------------------------- 拆开看
+    fn parts(ts: i64) -> TimeParts:
+        return time_parts_of(ts, false)
+
+    fn utc_parts(ts: i64) -> TimeParts:
+        return time_parts_of(ts, true)
+
+    fn year(ts: i64) -> i64:
+        return Time.parts(ts).year
+
+    fn month(ts: i64) -> i64:
+        return Time.parts(ts).month
+
+    fn day(ts: i64) -> i64:
+        return Time.parts(ts).day
+
+    fn hour(ts: i64) -> i64:
+        return Time.parts(ts).hour
+
+    fn minute(ts: i64) -> i64:
+        return Time.parts(ts).min
+
+    fn second(ts: i64) -> i64:
+        return Time.parts(ts).sec
+
+    fn weekday(ts: i64) -> i64:
+        # 0=周日 ... 6=周六
+        return Time.parts(ts).weekday
+
+    fn is_weekend(ts: i64) -> bool:
+        let w = Time.weekday(ts)
+        return w == 0 or w == 6
+
+    fn weekday_name(ts: i64) -> str:
+        return Time.format(ts, "%A")           # Sunday / Monday ...
+
+    fn weekday_cn(ts: i64) -> str:
+        let w = Time.weekday(ts)
+        if w == 0:
+            return "星期日"
+        if w == 1:
+            return "星期一"
+        if w == 2:
+            return "星期二"
+        if w == 3:
+            return "星期三"
+        if w == 4:
+            return "星期四"
+        if w == 5:
+            return "星期五"
+        return "星期六"
+
+    fn month_name(ts: i64) -> str:
+        return Time.format(ts, "%B")           # January ...
+
+    fn tz_offset(ts: i64) -> i64:
+        # 本地时区相对 UTC 的秒数，东八区是 28800
+        return Time.parts(ts).tz_offset
+
+    fn tz_name(ts: i64) -> str:
+        return Time.parts(ts).tz_name
+
+    # ---------------------------------------------------------- 拼回去
+    fn make(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> i64:
+        # 本地时区的年月日时分秒 -> Unix 秒。日期不合法（2 月 30 日）给 -1。
+        return time_make(year, month, day, hour, min, sec, false)
+
+    fn make_utc(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64) -> i64:
+        return time_make(year, month, day, hour, min, sec, true)
+
+    fn make_date(year: i64, month: i64, day: i64) -> i64:
+        return Time.make(year, month, day, 0, 0, 0)
+
+    fn parse(s: str, fmt: str) -> i64:
+        # strptime 的逆操作：Time.parse("2026-09-13 14:03", "%Y-%m-%d %H:%M")
+        # 格式串里没写到的字段按 0 算（所以只给日期就得到当天 00:00:00 本地时间）。
+        # 解析不出来给 -1。
+        let t: tm
+        t.tm_sec = 0
+        t.tm_min = 0
+        t.tm_hour = 0
+        t.tm_mday = 1
+        t.tm_mon = 0
+        t.tm_year = 70
+        t.tm_isdst = -1                     # 让 libc 自己判断夏令时
+        let rest = strptime(s, fmt, &t)
+        if rest == nil:
+            return -1                       # 没匹配上（strptime 失败就是给 NULL）
+        let r = mktime(&t)
+        if r < 0:
+            return -1
+        return r
+
+    fn parse_date(s: str) -> i64:
+        return Time.parse(s, "%Y-%m-%d")
+
+    fn parse_iso(s: str) -> i64:
+        # 2026-09-13T14:03:22 / 2026-09-13 14:03:22 都吃
+        let t = s.replace("T", " ")
+        return Time.parse(t, "%Y-%m-%d %H:%M:%S")
+
+    # ---------------------------------------------------------- 算
+    fn add_sec(ts: i64, n: i64) -> i64:
+        return ts + n
+
+    fn add_min(ts: i64, n: i64) -> i64:
+        return ts + n * 60
+
+    fn add_hours(ts: i64, n: i64) -> i64:
+        return ts + n * 3600
+
+    fn add_days(ts: i64, n: i64) -> i64:
+        return ts + n * 86400
+
+    fn add_weeks(ts: i64, n: i64) -> i64:
+        return ts + n * 604800
+
+    fn day_start(ts: i64) -> i64:
+        # 当天 00:00:00（本地时区）
+        let p = Time.parts(ts)
+        return Time.make(p.year, p.month, p.day, 0, 0, 0)
+
+    fn day_end(ts: i64) -> i64:
+        return Time.day_start(ts) + 86399
+
+    fn month_start(ts: i64) -> i64:
+        let p = Time.parts(ts)
+        return Time.make(p.year, p.month, 1, 0, 0, 0)
+
+    fn year_start(ts: i64) -> i64:
+        return Time.make(Time.year(ts), 1, 1, 0, 0, 0)
+
+    fn days_between(a: i64, b: i64) -> i64:
+        # 相差多少个**日历天**（按本地日期算，所以夏令时也不会差出一小时来）
+        let da = Time.day_start(a)
+        let db = Time.day_start(b)
+        let diff = db - da
+        if diff < 0:
+            return -((-diff + 43200) / 86400)
+        return (diff + 43200) / 86400
+
+    fn sec_between(a: i64, b: i64) -> i64:
+        return b - a
+
+    fn is_leap(year: i64) -> bool:
+        return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0
+
+    fn days_in_month(year: i64, month: i64) -> i64:
+        if month == 2:
+            if Time.is_leap(year):
+                return 29
+            return 28
+        if month == 4 or month == 6 or month == 9 or month == 11:
+            return 30
+        return 31
+
+    fn days_in_year(year: i64) -> i64:
+        if Time.is_leap(year):
+            return 366
+        return 365
+
+    # ---------------------------------------------------------- 给人看
+    fn ago(ts: i64) -> str:
+        # 「刚刚 / 5 分钟前 / 3 天前 / 2026-09-13」。将来时间给「N 之后」。
+        return time_ago(ts, Time.now())
+
+    fn ago_from(ts: i64, now: i64) -> str:
+        # 和 ago 一样，但「现在」由调用方给（测试里好用，不用等真时间走）
+        return time_ago(ts, now)
+
+    fn human(dur_sec: i64) -> str:
+        # 一段时长：3725 -> "1 小时 2 分 5 秒"
+        let mut n = dur_sec
+        let neg = n < 0
+        if neg:
+            n = -n
+        let d = n / 86400
+        n = n - d * 86400
+        let h = n / 3600
+        n = n - h * 3600
+        let m = n / 60
+        let s = n - m * 60
+        let out: Vec<str> = Vec<str>()
+        if d > 0:
+            out.push(d.to_str() + " 天")
+        if h > 0:
+            out.push(h.to_str() + " 小时")
+        if m > 0:
+            out.push(m.to_str() + " 分")
+        if s > 0 or out.len() == 0:
+            out.push(s.to_str() + " 秒")
+        let text = out.join(" ")
+        if neg:
+            return "-" + text
+        return text
+
+# ------------------------------------------------------------------ 内部实现
+# 上面这些方法要用的公共部分放在这里。FA 没有私有可见性（导进来的名字全都能用），
+# 所以内部函数一律小写、带 time_ 前缀，别去调它们。
+
+fn two(n: i64) -> str:
+    # 补成两位："07"
+    if n < 10:
+        return "0" + n.to_str()
+    return n.to_str()
+
+fn time_tm(ts: i64, utc: bool) -> tm:
+    let mut sec = ts
+    let t: tm
+    if utc:
+        gmtime_r(&sec, &t)
+    else:
+        localtime_r(&sec, &t)
+    return t
+
+fn time_format_with(ts: i64, fmt: str, utc: bool) -> str:
+    let t = time_tm(ts, utc)
+    let buf: [u8; 256]
+    let n = strftime(&buf as *u8, 256, fmt, &t)
+    if n == 0:
+        return ""
+    return cstr(&buf as *u8)
+
+fn time_parts_of(ts: i64, utc: bool) -> TimeParts:
+    let t = time_tm(ts, utc)
+    let p: TimeParts
+    p.year = t.tm_year as i64 + 1900
+    p.month = t.tm_mon as i64 + 1
+    p.day = t.tm_mday as i64
+    p.hour = t.tm_hour as i64
+    p.min = t.tm_min as i64
+    p.sec = t.tm_sec as i64
+    p.weekday = t.tm_wday as i64
+    p.yearday = t.tm_yday as i64
+    p.tz_offset = t.tm_gmtoff
+    p.tz_name = cstr(t.tm_zone)
+    p.is_utc = utc
+    return p
+
+fn time_make(year: i64, month: i64, day: i64, hour: i64, min: i64, sec: i64,
+             utc: bool) -> i64:
+    let t: tm
+    t.tm_sec = sec as i32
+    t.tm_min = min as i32
+    t.tm_hour = hour as i32
+    t.tm_mday = day as i32
+    t.tm_mon = (month - 1) as i32
+    t.tm_year = (year - 1900) as i32
+    t.tm_isdst = -1
+    if utc:
+        # mktime 只认本地时区：要 UTC 就先按本地算，再把时区差加回去
+        let r = mktime(&t)
+        if r < 0:
+            return -1
+        return r - time_parts_of(r, false).tz_offset
+    let r = mktime(&t)
+    if r < 0:
+        return -1
+    # mktime 会把非法日期「进位」（2 月 30 日 -> 3 月 2 日）。要的是报错，
+    # 所以拿结果再拆一次，对不上就是给的日期不合法。
+    let back = time_parts_of(r, false)
+    if (back.year != year or back.month != month or back.day != day
+            or back.hour != hour or back.min != min or back.sec != sec):
+        return -1
+    return r
+
+fn time_ago(ts: i64, now: i64) -> str:
+    let d = now - ts
+    let future = d < 0
+    let mut n = d
+    if future:
+        n = -d
+    let text = time_ago_span(n, ts)
+    if text == "刚刚":
+        return text                     # 「刚刚前」不像话
+    if text.starts_with(" "):
+        return text.trim()              # 一年以上给的是日期，不接「前」
+    if future:
+        return text + "之后"
+    return text + "前"
+
+fn time_ago_span(n: i64, ts: i64) -> str:
+    if n < 5:
+        return "刚刚"
+    if n < 60:
+        return n.to_str() + " 秒"
+    if n < 3600:
+        return (n / 60).to_str() + " 分钟"
+    if n < 86400:
+        return (n / 3600).to_str() + " 小时"
+    if n < 86400 * 7:
+        return (n / 86400).to_str() + " 天"
+    if n < 86400 * 30:
+        return (n / (86400 * 7)).to_str() + " 周"
+    if n < 86400 * 365:
+        return (n / (86400 * 30)).to_str() + " 个月"
+    # 一年以上就别「N 年前」了，直接给日期
+    return " " + Time.date(ts) + " "

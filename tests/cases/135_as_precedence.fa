@@ -1,0 +1,65 @@
+# `as` 的优先级：比 * / %（10）紧，比 **（12）松，比一切**一元运算松**。
+#
+# 回归：以前 `as` 挂在 parse_unary 的尾巴上，比 `&` / `*` / `-` / `!` 都紧，
+# 于是 `&m as *i64` 被读成 `&(m as *i64)` —— 拿一个 cast 表达式取地址，
+# 代码生成报「表达式不可取址」，只能多写一对括号 `(&m) as *i64`。
+# 写 C 互操作的人天天要这么取址，所以把 `as` 放到一元运算之外（见 parser 的 AS_PREC）。
+# 顺带把 `-x as T` 的读法也变了：以前是 `-(x as T)`，现在是 `(-x) as T`；
+# 对截断向零的整数转换来说两者结果一样，下面第 5 组把这些都钉住。
+
+struct P:
+    x: i64
+    y: i64
+
+fn first(v: *i64) -> i64:
+    return *v
+
+fn main() -> i64:
+    # 1) 取地址 + cast：不需要括号
+    let m: [i64; 3]
+    m[0] = 7
+    m[1] = 8
+    let p = &m as *i64
+    print("&m as *i64      =", *p, *(p + 1))
+    print("(&m) as *i64    =", *((&m) as *i64))       # 加括号也一样
+
+    # 2) 结构体取地址 + cast
+    let v: P
+    v.x = 3
+    v.y = 4
+    let r = &v as *P
+    print("&v as *P        =", r.x, r.y)
+
+    # 3) 解引用 + cast
+    let n: i64 = 42
+    let q = &n as *i64
+    print("*q as i64       =", *q as i64)
+    print("*q as f64       =", *q as f64)
+
+    # 4) as 比乘除紧（11 > 10）：a * b as f64 == a * (b as f64)；比 ** 松（11 < 12）
+    print("2 * 3 as f64    =", 2 * 3 as f64)
+    print("5 as f64 / 2    =", 5 as f64 / 2)
+    print("7 / 2 as f64    =", 7 / 2 as f64)          # as 比 / 紧：7 / (2 as f64) = 3.5
+    print("2 ** 3 as f64   =", 2 ** 3 as f64)          # as 比 ** 松：(2**3) as f64 = 8
+
+    # 5) 一元运算 + cast：现在是 (-x) as T
+    let z = 3.7
+    print("-z as i64       =", -z as i64)            # (-3.7) as i64 = -3
+    print("(-z) as i64     =", (-z) as i64)
+    print("-(z as i64)     =", -(z as i64))
+    let w: i64 = -9
+    print("-w as u64       =", -w as u64)            # (-(-9)) as u64 = 9
+
+    # 6) 连续 cast
+    print("5 as i64 as f64 =", 5 as i64 as f64)
+    print("3.9 as i64 as f64 =", 3.9 as i64 as f64)
+
+    # 7) 指针 cast 到整数、整数 cast 回指针
+    let addr = &n as i64
+    print("地址非零        =", addr != 0)
+    let back = addr as *i64
+    print("cast 回来       =", *back)
+
+    # 8) 函数调用里直接用，不需要括号
+    print("first(&m as *i64) =", first(&m as *i64))
+    return 0

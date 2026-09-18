@@ -1,0 +1,15 @@
+# expect-compile-error: 按使用处替换
+# const 是「按使用处替换初值表达式」，不是「求值一次存起来」。初值里调函数的话
+# 每用一次就调一次：print(C, C, C) 实测打出 1 2 3（tick 里的计数器一直在加）。
+# 「常量」打出三个不同的数，标准的悄悄给错答案，所以初值必须编译期算得出来。
+let n: i64 = 0
+
+fn tick() -> i64:
+    n += 1
+    return n
+
+const C: i64 = tick()
+
+fn main() -> i64:
+    print(C, C, C)
+    return 0

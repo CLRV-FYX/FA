@@ -1,0 +1,11 @@
+# Vec 的 get/set 越界和 v[i] 越界是同一套报错：长度和下标都打出来。
+# 以前这两个内建走的是另一条路，印英文 "vec index out of range"，什么数字都不给。
+# expect-exit: 1
+# expect-stderr: 下标越界 (index out of range)：长度 2，下标 9
+fn main() -> i64:
+    let v = Vec<i64>[7, 8]
+    print(v.get(0), v.get(1))
+    v.set(0, 100)
+    print(v)
+    print(v.get(9))
+    return 0

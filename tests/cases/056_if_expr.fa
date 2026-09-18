@@ -1,0 +1,72 @@
+# if / match 作为表达式：分支的值 = 块里最后一条表达式语句。
+# 结果类型由各分支统一（数值取更宽的那个；nil 分支跟随指针类型）。
+enum Color:
+    Red
+    Green(n: i64)
+
+fn classify(n: i64) -> str:
+    return match n {
+        0: "零"
+        1: "一"
+        _: "多"
+    }
+
+fn color_name(c: Color) -> str:
+    # 枚举分支全覆盖时不需要 `_`
+    return match c {
+        Color.Red: "红"
+        Color.Green(n): "绿{n}"
+    }
+
+fn first_pos(v: Vec<i64>) -> i64:
+    let i = 0
+    while i < v.len() {
+        if v[i] > 0 { return i }
+        i += 1
+    }
+    return -1
+
+fn main() -> i64:
+    let n = 2
+
+    let a = if n > 1 { 10 } else { 20 }
+    print(a)
+
+    let b = if n > 5 { 1 } else if n > 1 { 2 } else { 3 }
+    print(b)
+
+    # 分支一边是整数一边是浮点 -> 统一成 f64
+    let c = if n > 1 { 1.5 } else { 2 }
+    print(c)
+
+    let d = if n > 1 { "大" } else { "小" }
+    print(d, d.len())
+
+    # 单行花括号形式
+    let e = match n { 1: 100 _: 200 }
+    print(e)
+
+    print(if n == 2 { "是的" } else { "不是" })
+
+    # 引用计数类型：所有权交给结果变量，不重复释放也不泄漏
+    let base = Vec<i64>[7, 8]
+    let f = if n > 1 { base } else { Vec<i64>[9] }
+    print(f.len(), f[0], base.len())
+
+    # 嵌套
+    let g = if n > 1 { if n > 3 { "很大" } else { "大" } } else { "小" }
+    print(g)
+
+    # 发散的分支（return / panic）不产出值，也不参与类型统一
+    let h = if n < 0 { return 1 } else { n * 3 }
+    print(h)
+
+    let p: *i64 = if n > 1 { &a } else { nil }
+    print(*p)
+
+    print(classify(0), classify(1), classify(9))
+    print(color_name(Color.Red), color_name(Color.Green(5)))
+
+    let v = Vec<i64>[-1, 0, 4, 9]
+    print(first_pos(v))
+    return 0

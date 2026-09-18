@@ -1,0 +1,102 @@
+# sort_by：Vec<结构体> 终于能排序了。
+#
+# 以前 v.sort() 对 Vec<结构体> 是编译期拒绝的（表里存的是装箱指针，qsort 排的是
+# 堆地址 —— 不报错，但结果毫无意义），只能自己写一趟排序或者玩「键*N+下标」的
+# 编码花招。sort_by 给一个取键函数 fn(*元素) -> i64 / f64 / str，运行时先把键
+# 一个个取出来，排的是键，元素跟着键走。
+#
+# 这一例钉住：
+#   1. 三种键都能用：i64（age）、f64（score）、str（name，按 UTF-8 字节序）
+#   2. 元素跟着键走 —— 排完 name/age/score 还是同一个人的（不是只把键排了）
+#   3. 扁平元素（Vec<i64>）也能 sort_by：按绝对值排，这是 sort() 做不到的
+#   4. 取键函数返回 str 时那份字符串归运行时管，用完 rc_dec —— ASan 盯着不漏
+#   5. 方法写法 v.sort_by(k) 和全局写法 sort_by(v, k) 都通，两条路都要验键函数
+struct P:
+    name: str
+    age: i64
+    score: f64
+
+fn by_age(p: *P) -> i64:
+    return p.age
+
+fn by_score(p: *P) -> f64:
+    return p.score
+
+fn by_name(p: *P) -> str:
+    return p.name
+
+fn by_abs(x: *i64) -> i64:
+    let v = *x
+    if v < 0:
+        return -v
+    return v
+
+fn dump(v: Vec<P>, tag: str):
+    for i in 0..v.len():
+        let p = v.get(i)
+        print(tag, p.name, p.age, p.score)
+
+fn main() -> i64:
+    let v: Vec<P> = Vec<P>()
+    let a: P
+    a.name = "张三"
+    a.age = 30
+    a.score = 88.5
+    v.push(a)
+    let b: P
+    b.name = "李四"
+    b.age = 25
+    b.score = 92.0
+    v.push(b)
+    let c: P
+    c.name = "王五"
+    c.age = 35
+    c.score = 70.25
+    v.push(c)
+
+    v.sort_by(by_age)
+    dump(v, "按年龄:")
+    v.sort_by(by_score)
+    dump(v, "按分数:")
+    v.sort_by(by_name)
+    dump(v, "按名字:")
+
+    # 空表 / 单元素不该炸
+    let e: Vec<P> = Vec<P>()
+    e.sort_by(by_age)
+    print("空表:", e.len())
+    e.push(a)
+    e.sort_by(by_age)
+    print("一个:", e.len(), e.get(0).name)
+
+    # 扁平元素也能用：按绝对值排（sort() 只会按数值本身排）
+    let n: Vec<i64> = Vec<i64>[5, -3, 9, -1]
+    n.sort_by(by_abs)
+    print("按绝对值:", n.join(","))
+    n.sort()
+    print("直接 sort:", n.join(","))
+
+    # str 元素按长度排
+    let s: Vec<str> = Vec<str>["ccc", "a", "bb"]
+    s.sort_by(by_len)
+    print("按长度:", s.join(","))
+
+    # 全局写法 sort_by(v, 取键函数)，和 sort(v) / reverse(v) 一个路子
+    let g: Vec<i64> = Vec<i64>[3, -1, 2]
+    sort_by(g, by_abs)
+    print("全局写法:", g.join(","))
+
+    # 稳定性：键相同的元素保持输入顺序（qsort 自己不稳定，
+    # 运行时排的是下标数组、同键按下标 tie-break，才拿到这个保证）
+    let st: Vec<P> = Vec<P>[
+        P{name: "甲", age: 30, score: 1.0}, P{name: "乙", age: 20, score: 2.0},
+        P{name: "丙", age: 30, score: 3.0}, P{name: "丁", age: 20, score: 4.0},
+        P{name: "戊", age: 30, score: 5.0},
+    ]
+    st.sort_by(by_age)
+    for p in st:
+        print("稳定:", p.age, p.name)
+    return 0
+
+fn by_len(x: *str) -> i64:
+    return (*x).len()

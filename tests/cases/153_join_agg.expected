@@ -1,0 +1,7 @@
+P { name: 甲, age: 30 } | P { name: 乙, age: 25 }
+P { name: 甲, age: 30 },P { name: 乙, age: 25 }
+[P { name: 甲, age: 30 }, P { name: 乙, age: 25 }]
+Green(_0: 7)/Red
+甲-乙
+1,-2,3
+空表 join: []

@@ -1,0 +1,98 @@
+# `fa bind` 生成的声明直接拿来用：建目录、写文件、列目录、读大小、清理，全程只调 libc。
+# 这一例钉住四件事：
+#   1. 返回 `struct X *` 的函数（readdir）能绑出来 —— 以前 _decl_name 把
+#      `extern struct dirent *readdir(DIR *)` 的名字取成返回类型里的 tag（dirent），
+#      --only readdir 一个都匹配不上，函数被悄悄丢掉；
+#   2. 嵌套结构体（stat 里的 timespec）能拿到真布局 —— 以前探针只量目标文件里的
+#      结构体，timespec 定义在 bits/types/struct_timespec.h，量不到就连累整个
+#      struct stat 退化成 144 字节不透明数组，st_size 都读不出来；
+#   3. 定长 char 数组字段能直接当字符串读：str(&e.d_name[0])。*char 和 *u8 一样
+#      按 C 字符串处理，不再打出 0x800d2e3 这种地址；
+#   4. 撞上 FA 内建名字的 C 函数（write）自动改名 c_write 并用 = "write" 绑回真符号。
+use c "fcntl.h" lib "c":
+    fn open(file: str, oflag: i32, ...) -> i32
+use c "unistd.h" lib "c":
+    fn close(fd: i32) -> i32
+    fn c_write(fd: i32, buf: *void, n: usize) -> isize = "write"
+    fn unlink(name: str) -> i32
+    fn rmdir(path: str) -> i32
+use c "sys/stat.h" lib "c":
+    fn stat(file: str, buf: *stat) -> i32
+    fn mkdir(path: str, mode: u32) -> i32
+use c "dirent.h" lib "c":
+    fn opendir(name: str) -> *void
+    fn readdir(dirp: *void) -> *dirent
+    fn closedir(dirp: *void) -> i32
+
+struct timespec:
+    tv_sec: i64
+    tv_nsec: i64
+
+struct stat:
+    st_dev: u64
+    st_ino: u64
+    st_nlink: u64
+    st_mode: u32
+    st_uid: u32
+    st_gid: u32
+    pad0: i32
+    st_rdev: u64
+    st_size: i64
+    st_blksize: i64
+    st_blocks: i64
+    st_atim: timespec
+    st_mtim: timespec
+    st_ctim: timespec
+    glibc_reserved: [i64; 3]
+
+struct dirent:
+    d_ino: u64
+    d_off: i64
+    d_reclen: u16
+    d_type: u8
+    d_name: [char; 256]
+
+const O_WRONLY: i64 = 1
+const O_CREAT: i64 = 64
+const O_TRUNC: i64 = 512
+
+fn put_file(path: str, body: str) -> i64:
+    let fd = open(path, (O_WRONLY | O_CREAT | O_TRUNC) as i32, 420)
+    if fd < 0:
+        return -1
+    let n = c_write(fd, body.cstr() as *void, body.len() as usize)
+    close(fd)
+    return n
+
+fn main() -> i64:
+    mkdir("fa_bind_demo", 493)
+    print("写 a.txt: ", put_file("fa_bind_demo/a.txt", "hello"))
+    print("写 b.txt: ", put_file("fa_bind_demo/b.txt", "你好，FA"))
+
+    let d = opendir("fa_bind_demo")
+    if d == nil:
+        print("打不开 fa_bind_demo")
+        return 1
+    let names: Vec<str> = Vec<str>()
+    while true:
+        let e = readdir(d)
+        if e == nil:
+            break
+        let nm = str(&e.d_name[0])
+        if nm != "." and nm != "..":
+            names.push(nm)
+    closedir(d)
+    names.sort()
+
+    let total: i64 = 0
+    for nm in names:
+        let st: stat
+        if stat("fa_bind_demo/" + nm, &st) == 0:
+            total += st.st_size
+            print(nm, "  ", st.st_size, " 字节")
+    print("合计 ", total, " 字节")
+
+    unlink("fa_bind_demo/a.txt")
+    unlink("fa_bind_demo/b.txt")
+    rmdir("fa_bind_demo")
+    return 0

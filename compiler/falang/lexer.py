@@ -217,6 +217,8 @@ def tokenize(src: str) -> List[Token]:
                                 hx += src[i]; adv()
                         buf.append(chr(int(hx, 16)) if hx else "")
                         continue
+                    if e in "{}":
+                        buf.append(e * 2); adv(); continue    # 同上：字面花括号
                     buf.append(ESCAPES.get(e, e)); adv(); continue
                 buf.append(src[i]); adv()
             adv(3)
@@ -225,12 +227,47 @@ def tokenize(src: str) -> List[Token]:
         if ch == '"':
             adv()
             buf = []
+            idepth = 0                    # 插值表达式 {...} 的嵌套深度
             while True:
                 if i >= n or src[i] == "\n":
+                    if idepth > 0:
+                        raise FaSyntaxError(
+                            "字符串里的插值 { 没有配对的 }（要打印一个真的花括号，"
+                            "写 {{ 和 }}）", l, c)
                     raise FaSyntaxError("字符串未闭合", l, c)
-                if src[i] == '"':
+                if src[i] == '"' and idepth == 0:
                     adv(); break
-                if src[i] == "\\":
+                if idepth and src[i] in "\"'":
+                    # 插值表达式里的字符串/字符字面量，例如 "{m["x"]}"：
+                    # 整体吞进 buf。以前它的引号会提前结束外层字符串，
+                    # 于是 `print("map: {m["x"]}")` 报「字符串插值 { 未闭合」。
+                    q = src[i]
+                    buf.append(q); adv()
+                    while i < n and src[i] != q:
+                        if src[i] == "\\" and i + 1 < n:
+                            buf.append(src[i]); adv()
+                        buf.append(src[i]); adv()
+                    if i >= n or src[i] == "\n":
+                        raise FaSyntaxError(
+                            "字符串里的插值 { 没有配对的 }（要打印一个真的花括号，"
+                            "写 {{ 和 }}）", l, c)
+                    buf.append(q); adv()
+                    continue
+                # `{{` / `}}` 是**字面量**花括号（Python / Rust / C# 都是这个规矩）。
+                # 以前只写了「`{{` 不开插值」，可它只跳过第一个 `{`，第二个照样开插值 ——
+                # `"{{a}}"` 于是去解析标识符 a，报一句莫名其妙的「未定义的标识符 'a'」，
+                # 位置还指到文件头。而没有配对 `}` 的 `"P{a="` 会把后面的引号当成
+                # 插值里的字符串一路吞到行尾，报「字符串未闭合」。
+                # 原文照抄进 buf，由 split_interpolation 统一还原成一个花括号。
+                if idepth == 0 and src.startswith("{{", i):
+                    buf.append("{{"); adv(2); continue
+                if idepth == 0 and src.startswith("}}", i):
+                    buf.append("}}"); adv(2); continue
+                if src[i] == "{":
+                    idepth += 1; buf.append("{"); adv(); continue
+                if src[i] == "}" and idepth > 0:
+                    idepth -= 1; buf.append("}"); adv(); continue
+                if src[i] == "\\" and idepth == 0:
                     adv()
                     if i >= n:
                         raise FaSyntaxError("转义符后缺少字符", l, c)
@@ -250,10 +287,25 @@ def tokenize(src: str) -> List[Token]:
                             adv(); hx = ""
                             while i < n and src[i] != "}":
                                 hx += src[i]; adv()
+                            if i >= n:
+                                raise FaSyntaxError("\\u{...} 未闭合", l, c)
                             adv()
                             buf.append(chr(int(hx, 16)))
                             continue
-                        raise FaSyntaxError("\\u 需要 {....}", l, c)
+                        # 文档里写的是 \u4F60（4 位十六进制），以前只认 \u{4F60}
+                        hx = ""
+                        while len(hx) < 4 and i < n and src[i] in HEXD:
+                            hx += src[i]; adv()
+                        if len(hx) != 4:
+                            raise FaSyntaxError("\\u 需要 4 位十六进制（\\u4F60）"
+                                                "或花括号形式（\\u{4F60}）", l, c)
+                        buf.append(chr(int(hx, 16)))
+                        continue
+                    if e in "{}":
+                        # \{ \} 也是字面花括号：先写成 {{ }}，split_interpolation
+                        # 再还原成一个。转义是在**词法层**做的，而插值是在字符串值上
+                        # 二次切分的，所以不能直接放一个 { 进去（那会被当成插值的开头）。
+                        buf.append(e * 2); adv(); continue
                     if e in ESCAPES:
                         buf.append(ESCAPES[e]); adv(); continue
                     raise FaSyntaxError(f"未知转义序列 \\{e}", l, c)
@@ -269,9 +321,40 @@ def tokenize(src: str) -> List[Token]:
             if src[i] == "\\":
                 adv()
                 e = src[i]; adv()
-                chv = ESCAPES.get(e)
-                if chv is None:
-                    raise FaSyntaxError(f"未知转义 \\{e}", l, c)
+                if e == "x":
+                    hx = ""
+                    while len(hx) < 2 and i < n and src[i] in HEXD:
+                        hx += src[i]; adv()
+                    if len(hx) != 2:
+                        raise FaSyntaxError("\\x 需要两位十六进制数字", l, c)
+                    chv = chr(int(hx, 16))
+                elif e == "u":
+                    if i < n and src[i] == "{":
+                        adv(); hx = ""
+                        while i < n and src[i] != "}":
+                            hx += src[i]; adv()
+                        if i >= n:
+                            raise FaSyntaxError("\\u{...} 未闭合", l, c)
+                        adv()
+                    else:
+                        hx = ""
+                        while len(hx) < 4 and i < n and src[i] in HEXD:
+                            hx += src[i]; adv()
+                        if len(hx) != 4:
+                            raise FaSyntaxError("\\u 需要 4 位十六进制（\\u4F60）"
+                                                "或花括号形式（\\u{4F60}）", l, c)
+                    cp = int(hx, 16)
+                    if cp > 0xFF:
+                        raise FaSyntaxError(
+                            f"char 是单字节（u8），装不下 U+{cp:04X}；"
+                            f"多字节字符请写成字符串 \"\\u{cp:04X}\"", l, c)
+                    chv = chr(cp)
+                else:
+                    chv = ESCAPES.get(e)
+                    if chv is None:
+                        raise FaSyntaxError(
+                            f"未知转义 \\{e}（可用：\\n \\t \\r \\\\ \\' \\0 "
+                            f"\\xNN \\uNNNN \\u{{...}}）", l, c)
             else:
                 chv = src[i]; adv()
             if i >= n or src[i] != "'":
@@ -302,7 +385,12 @@ def tokenize(src: str) -> List[Token]:
             else:
                 while i < n and (src[i] in DIGITS or src[i] == "_"):
                     adv()
-                if i < n and src[i] == "." and not (i + 1 < n and src[i + 1] == "."):
+                # 小数点后面必须真的跟数字，才算浮点字面量。
+                # 否则 `42.to_str()` 会被当成「42. 加后缀 to_str」，报一条
+                # 「非法数字字面量」的错 —— 而用户想写的是整数 42 调方法。
+                if (i < n and src[i] == "." and i + 1 < n
+                        and (src[i + 1] in DIGITS or src[i + 1] == "_")
+                        and src[i + 1] != "."):
                     isfloat = True
                     adv()
                     while i < n and (src[i] in DIGITS or src[i] == "_"):
@@ -389,12 +477,19 @@ def tokenize(src: str) -> List[Token]:
 
 def split_interpolation(raw: str):
     """把 `a = {x}, b = {y.z}` 切成 [('lit', str) | ('expr', str)] 片段。
-    支持插值表达式里的嵌套大括号（如 {f({1:2})}）。"""
+
+    支持插值表达式里的嵌套大括号（如 {f({1:2})}）；表达式**外面**的 `{{` / `}}`
+    是字面量花括号，各还原成一个（想打印 JSON 或者 `P {{ x: 1 }}` 这种文本就靠它）。
+    """
     parts, buf, depth = [], [], 0
     i = 0
     while i < len(raw):
         ch = raw[i]
-        if ch == "{" and i + 1 < len(raw) and raw[i + 1] != "{":
+        if depth == 0 and raw.startswith("{{", i):
+            buf.append("{"); i += 2; continue        # {{ -> 字面量 {
+        if depth == 0 and raw.startswith("}}", i):
+            buf.append("}"); i += 2; continue        # }} -> 字面量 }
+        if ch == "{":
             if depth == 0:
                 if buf:
                     parts.append(("lit", "".join(buf))); buf = []

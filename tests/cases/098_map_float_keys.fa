@@ -1,0 +1,42 @@
+# Map 的浮点键，以及 contains 作为 has 的别名。
+#
+# 两个回归：
+#   1) 浮点键在表里存的是**位模式**（emit_map_set 那边 bitcast 过），但 has/del
+#      没 bitcast —— f64 放在 xmm 里传过去、整数参数寄存器里是垃圾，于是
+#      Map<f64, V>.has(k) **永远 false**（get 是对的，它转了；set 也是对的），
+#      del 则永远删不掉。实测 has(0.5) 在明明有 0.5 的表上返回 false。
+#   2) contains(m, k) 全局写法一路走到后端才报「未实现的内建方法 .contains」，
+#      方法写法 m.contains(k) 被 sema 拒（Vec 那边两种写法都有）。现在都落到
+#      fa_map_has。
+fn main() -> i64:
+    let f = Map<f64, str>()
+    f.set(0.5, "半")
+    f.set(1.0, "一")
+    f.set(-2.5, "负")
+    print("has:", f.has(0.5), f.has(1.0), f.has(-2.5), f.has(9.9))
+    print("get:", f.get(0.5), f.get(-2.5))
+    f.del(1.0)
+    print("del 之后:", f.to_str(), f.len(), f.has(1.0))
+
+    # IEEE754：0.1 + 0.2 不等于 0.3，当键就要按算出来的那个值查
+    let k = 0.1 + 0.2
+    f.set(k, "甲")
+    print("算出来的键:", f.has(k), f.has(0.1 + 0.2), f.has(0.3))
+
+    # f32 键
+    let g = Map<f32, i64>()
+    g.set(1.5, 7)
+    print("f32 键:", g.has(1.5), g.get(1.5), g.len())
+
+    # 浮点值：keys()/values()/遍历都要还原成浮点
+    let h = Map<f64, f64>()
+    h.set(0.5, 1.25)
+    h.set(-2.0, 3.5)
+    print("keys:", h.keys().to_str(), "values:", h.values().to_str(), h.values().sum())
+    for kk in h { print("  遍历:", kk, "->", h.get(kk)) }
+
+    # contains 是 has 的别名：方法写法、全局写法都通
+    let m = Map<str, i64>()
+    m.set("a", 1)
+    print("contains:", m.contains("a"), m.contains("z"), contains(m, "a"), m.has("a"))
+    return 0

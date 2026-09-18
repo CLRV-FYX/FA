@@ -11,7 +11,27 @@ UNSIGNED = {"u8", "u16", "u32", "u64", "usize"}
 
 # 引用计数 kind 编号（与 runtime/fa_runtime.c 保持一致）
 K_NONE, K_STR, K_VEC, K_MAP, K_PY, K_JOBJ = 0, 1, 2, 3, 4, 5
-K_STRUCT_DESC_BASE = 1000
+K_BOX = 6                       # 装箱的纯数据结构体（无内部引用）：释放时直接 free
+K_STRUCT_DESC_BASE = 1000       # +desc_id：内联/嵌套结构体，释放字段但不 free
+K_BOXED_STRUCT = 2000           # +desc_id：容器里装箱的结构体，释放字段 + free
+
+# 元素「显示类型」编号（与 runtime/fa_runtime.h 的 FA_TY_* 一一对应）。
+# kind 只决定怎么释放引用，分不清 i64/u64/f64/bool/char，
+# 容器因此额外带一个类型码，to_str / join / print 才能格式化正确。
+TY_INT, TY_FLOAT, TY_BOOL, TY_CHAR, TY_STR, TY_VEC, TY_MAP, TY_STRUCT, \
+    TY_PYOBJ, TY_JOBJ, TY_PTR, TY_ENUM, TY_ARR, TY_ANY = range(14)
+
+
+def ty_code(t: "Type") -> int:
+    """FA 类型 -> 运行时元素类型码"""
+    if t is None:
+        return TY_ANY
+    return {
+        "int": TY_INT, "float": TY_FLOAT, "bool": TY_BOOL, "char": TY_CHAR,
+        "str": TY_STR, "vec": TY_VEC, "map": TY_MAP, "struct": TY_STRUCT,
+        "enum": TY_ENUM, "arr": TY_ARR, "ptr": TY_PTR, "fn": TY_PTR,
+        "pyobj": TY_PYOBJ, "jobj": TY_JOBJ, "any": TY_ANY, "void": TY_ANY,
+    }.get(t.kind, TY_ANY)
 
 
 class Type:
@@ -71,6 +91,10 @@ class Type:
             return any(t_is_refcounted(f[1]) for f in self.fields)
         if self.kind == "arr":
             return t_is_refcounted(self.elem)
+        if self.kind == "enum":
+            # 带载荷的变体：只要有一个变体的某个字段需要计数，整个枚举就需要
+            return any(t_is_refcounted(f[1])
+                       for (_vn, fl, _i) in (self.variants or []) for f in (fl or []))
         return False
 
     @property
@@ -79,7 +103,8 @@ class Type:
                 "pyobj": K_PY, "jobj": K_JOBJ}.get(self.kind, K_NONE)
 
     def needs_rc_desc(self) -> bool:
-        return self.kind == "struct" and self.is_refcounted
+        # 枚举也一样：有载荷字段要释放，就得有描述符 + drop/retain 函数
+        return self.kind in ("struct", "enum") and self.is_refcounted
 
     @property
     def is_aggregate(self) -> bool:
@@ -129,6 +154,9 @@ def t_is_refcounted(t: Type) -> bool:
         return any(t_is_refcounted(f[1]) for f in (t.fields or []))
     if t.kind == "arr":
         return t_is_refcounted(t.elem)
+    if t.kind == "enum":
+        return any(t_is_refcounted(f[1])
+                   for (_vn, fl, _i) in (t.variants or []) for f in (fl or []))
     return False
 
 

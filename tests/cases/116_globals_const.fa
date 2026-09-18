@@ -1,0 +1,53 @@
+# 全局变量与 const：谁能改、谁盖住谁、初始化顺序、const 能当数组长度。
+#
+# 回归：局部变量会被**同名常量**顶掉。sema 解析标识符的顺序是
+# 局部 -> 全局 -> 函数 -> 类型 -> 常量（局部优先，没错），可代码生成
+# gen_nameref 先查了 sema.consts 再找变量，于是
+#     const K: i64 = 5
+#     fn main(): let K = 99; print(K)
+# 打出的是 5 —— 局部那份根本没被读过，编译器一声不响。现在常量替换
+# 排在「这个名字在本作用域里是不是变量」之后。
+const K: i64 = 5
+const NAME: str = "甲"
+const RATIO: f64 = 1.5
+const DERIVED: i64 = K * 2 + 1
+const NO_TYPE = 7
+
+let counter: i64 = 0
+let gname: str = "初始"
+let list: Vec<i64> = Vec<i64>[1, 2]
+let table: Map<str, i64> = Map<str, i64>()
+let buf: [i64; K] = [0, 0, 0, 0, 0]
+let later: i64 = counter + 100
+let inferred = 42
+let noinit: str
+
+fn bump() -> i64:
+    counter += 1
+    return counter
+
+fn touch():
+    list.push(9)
+    table.set("k", counter)
+    gname = "改过了"
+
+fn main() -> i64:
+    print(K, NAME, RATIO, DERIVED, NO_TYPE)
+    print(counter, gname, list.to_str(), table.len(), buf.len(), later, inferred,
+          "[" + noinit + "]")
+
+    print(bump(), bump())
+    touch()
+    print(counter, gname, list.to_str(), table.to_str())
+
+    buf[0] = 7
+    print(buf.to_str())
+
+    # 局部盖住常量（以前这里打出的是 5）
+    let K = 99
+    print(K, NAME)
+
+    # 局部盖住全局：函数里的 bump 改的还是全局那个
+    let counter = 1000
+    print(counter, bump())
+    return 0

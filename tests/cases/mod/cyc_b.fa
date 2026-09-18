@@ -1,0 +1,5 @@
+# 循环导入的另一半。
+use "cyc_a.fa"
+
+fn from_b() -> i64:
+    return from_a() + 1

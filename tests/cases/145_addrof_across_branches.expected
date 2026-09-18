@@ -1,0 +1,12 @@
+if 分支: 11
+else 分支: 12
+结构体 if: 6 60
+结构体 else: 5 50
+两个调用 if: 8
+两个调用 else: 7
+循环里: 10
+while if: 606
+while else: 6
+形参 if: 8 8
+形参 else: 14 14
+三层分支: 10

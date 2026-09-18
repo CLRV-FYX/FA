@@ -1,0 +1,141 @@
+# 标准库 std.json：解析、构造、序列化、错误处理。
+# 注意源码里 JSON 的花括号都写成 {{ }}：字符串里单个 { 是插值的开头。
+use std.json
+use std.fs
+
+fn rt(text: str) -> str:
+    return Json.dump(Json.parse(text))
+
+fn main() -> i64:
+    # ---- 标量：解析完再紧凑输出，看往返保不保真
+    print("null:", rt("null"))
+    print("true:", rt("true"), "false:", rt("false"))
+    print("整数:", rt("42"), "负数:", rt("-7"))
+    print("小数:", rt("3.5"), "指数原文:", rt("1e3"), "尾零原文:", rt("0.10"))
+    print("大整数:", rt("1234567890123"))
+    print("字符串:", rt("\"hi\""), "空串:", "[" + rt("\"\"") + "]")
+
+    # ---- 转义与 UTF-8
+    print("引号:", rt("\"a\\\"b\""))
+    print("反斜杠:", rt("\"a\\\\b\""))
+    print("斜杠:", rt("\"a/b\""))
+    print("换行:", rt("\"a\\nb\""), "制表:", rt("\"a\\tb\""))
+    print("\\u0041:", Json.parse("\"\\u0041\"").text())
+    print("\\u4e2d:", Json.parse("\"\\u4e2d\"").text(),
+          "字节数:", Json.parse("\"\\u4e2d\"").text().len())
+    print("代理对:", Json.parse("\"\\uD83D\\uDE00\"").text(),
+          "字节数:", Json.parse("\"\\uD83D\\uDE00\"").text().len())
+    print("控制字符输出:", Json.dump(Json.string(chr(1))))
+    print("中文往返:", rt("\"中文\""), Json.parse(rt("\"中文\"")).text())
+
+    # ---- 容器
+    print("空数组:", rt("[]"), "空对象:", rt("{{}}"))
+    print("数组:", rt("[1,2,3]"), "带空格:", rt(" [ 1 , 2 ] "))
+    print("嵌套数组:", rt("[[1],[2,[3]]]"))
+    print("混合:", rt("[1,\"a\",true,null,2.5]"))
+    print("对象:", rt("{{\"a\":1}}"))
+    print("键序保留:", rt("{{\"z\":1,\"a\":2,\"m\":3}}"))
+    print("嵌套对象:", rt("{{\"a\":{{\"b\":{{\"c\":[1,2]}}}}}}"))
+    print("重复键后者胜:", Json.parse("{{\"a\":1,\"a\":2}}").get("a").int())
+
+    # ---- 取值
+    let doc = Json.parse("{{\"name\":\"FA\",\"ver\":1,\"pi\":3.14,\"ok\":true,\"tags\":[\"a\",\"b\"],\"meta\":{{\"nested\":{{\"deep\":[10,20,30]}}}},\"nil\":null}}")
+    print("解析成功:", not doc.is_err())
+    print("取字符串:", doc.get("name").text())
+    print("取整数:", doc.get("ver").int(), "取浮点:", doc.get("pi").num())
+    print("取布尔:", doc.get("ok").boolean(), "取 null:", doc.get("nil").is_null())
+    print("数组下标:", doc.get("tags").at(1).text(), "越界:", doc.get("tags").at(9).is_null())
+    print("数组长度:", doc.get("tags").len(), "对象长度:", doc.len())
+    print("keys 顺序:", doc.keys().join(","))
+    print("has:", doc.has("ver"), doc.has("没有"))
+    print("没有的键给 null:", doc.get("没有").is_null())
+    print("path 深层:", doc.path("meta.nested.deep.1").int())
+    print("path 走空:", doc.path("meta.没有.deep").is_null())
+    print("默认值:", doc.get("没有").num_or(9.0), doc.get("ver").text_or("默认"),
+          doc.get("没有").int_or(-1), doc.get("没有").bool_or(true))
+    print("kind_name:", doc.kind_name(), doc.get("tags").kind_name())
+    print("values/items:", doc.values().len(), doc.get("tags").items().len())
+
+    # ---- 构造
+    let out = Json.object()
+    out.set("ok", Json.boolean(true))
+    out.set("n", Json.integer(42))
+    out.set("x", Json.number(2.5))
+    out.set("s", Json.string("带\"引号\""))
+    out.set("list", Json.from_vec_str(Vec<str>["x", "y"]))
+    out.set("nums", Json.from_vec_i64(Vec<i64>[1, 2, 3]))
+    out.set("fl", Json.from_vec_f64(Vec<f64>[1.5]))
+    out.set("nul", Json.nul())
+    print("构造:", Json.dump(out))
+    out.set("n", Json.integer(43))
+    print("替换键序不变:", Json.dump(out).slice(0, 18))
+    print("del:", out.del("nul"), out.len(), "删没有的:", out.del("没有"))
+    let arr = Json.array()
+    arr.push(Json.integer(1))
+    arr.push(Json.string("二"))
+    print("构造数组:", Json.dump(arr))
+    print("array_of:", Json.dump(Json.array_of(Vec<JVal>[Json.integer(7)])))
+    print("整数不带小数点:", Json.dump(Json.integer(42)),
+          "浮点整值也短写:", Json.dump(Json.number(42.0)))
+    print("NaN 变 null:", Json.dump(Json.number(0.0 / 0.0)))
+
+    # ---- 浅拷贝共享容器，clone 才是独立的一份
+    let d1 = Json.parse("{{\"a\":[1,2]}}")
+    let d2 = d1
+    d2.get("a").push(Json.integer(3))
+    print("赋值是浅的:", Json.dump(d1))
+    let d3 = Json.clone(Json.parse("{{\"a\":[1,2]}}"))
+    let d4 = Json.clone(d3)
+    d4.get("a").push(Json.integer(9))
+    print("clone 是深的:", Json.dump(d3), "|", Json.dump(d4))
+    print("clone 保住键序:", Json.clone(doc).keys().join(","))
+
+    # ---- pretty
+    let small = Json.parse("{{\"a\":[1,2],\"b\":{{}}}}")
+    print("pretty:")
+    print(Json.pretty(small))
+    print("四空格前 10 字节:", "[" + Json.pretty_indent(small, 4).slice(0, 10) + "]")
+    print("紧凑:", Json.dump(small))
+    print("pretty 完还能解析:", Json.dump(Json.parse(Json.pretty(doc))) == Json.dump(doc))
+    print("空容器 pretty:", "[" + Json.pretty(Json.array()) + "]",
+          "[" + Json.pretty(Json.object()) + "]")
+
+    # ---- 空白宽容
+    print("换行缩进:", rt("\n{{\n  \"a\" : [\n 1,\n 2 ]\n}}\n"))
+    print("CRLF:", rt("{{\r\n\"a\":1\r\n}}"))
+
+    # ---- 错误：不 panic，给 kind == J_ERR 的值 + 原因
+    print("空输入:", Json.parse("").is_err())
+    print("只有左括号:", Json.parse("{{").is_err())
+    print("少右括号:", Json.parse("[1,2").is_err())
+    print("尾随逗号:", Json.parse("[1,]").is_err())
+    print("键没引号:", Json.parse("{{a:1}}").is_err())
+    print("单引号:", Json.parse("'a'").is_err())
+    print("多余内容:", Json.parse("1 2").is_err())
+    print("前导零:", Json.parse("012").is_err())
+    print("字符串没闭合:", Json.parse("\"abc").is_err())
+    print("坏转义:", Json.parse("\"\\q\"").is_err())
+    print("裸换行:", Json.parse("\"a\nb\"").is_err())
+    print("NaN 字面量:", Json.parse("NaN").is_err())
+    print("只有负号:", Json.parse("-").is_err())
+    print("小数点后空:", Json.parse("1.").is_err())
+    print("指数后空:", Json.parse("1e").is_err())
+    print("\\u 不够四位:", Json.parse("\"\\u12\"").is_err())
+    print("ok():", Json.ok("[1]"), Json.ok("[1"))
+    print("err_of 没错给空:", "[" + Json.err_of("[1]") + "]")
+    print("错误信息带位置:", Json.err_of("{{\"a\" 1}}"))
+    print("错误信息带位置2:", Json.err_of("[1,]"))
+    print("错误值输出成 null:", Json.dump(Json.parse("{{")))
+
+    # ---- 文件往返
+    let path = "/tmp/fa_case_140.json"
+    print("write_file:", Json.write_file(path, out))
+    print("parse_file 往返一致:", Json.dump(Json.parse_file(path)) == Json.dump(out))
+    print("文件末尾有换行:", Fs.read(path).ends_with("\n"))
+    print("读不到的文件:", Json.parse_file("/tmp/fa_case_140_没有.json").is_err())
+    Fs.write(path, "")
+    print("空文件算错误:", Json.parse_file(path).is_err())
+    Fs.write(path, "[1,2,3]")
+    print("手写文件能读:", Json.parse_file(path).at(2).int())
+    Fs.remove(path)
+    return 0

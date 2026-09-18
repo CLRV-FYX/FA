@@ -1,0 +1,12 @@
+// Vec<i64> 负数的运行时格式化（join/to_str）曾经打成无符号大数
+fn main() {
+    let n: Vec<i64> = [5, -3, 9, -1]
+    print(n.to_str())            // [5, -3, 9, -1]
+    print(n.join(","))           // 5,-3,9,-1
+    n.push(-7)
+    print(n.join("|"))           // 5|-3|9|-1|-7
+    let e: Vec<i64> = []
+    print(e.to_str())            // []
+    let b: Vec<i8> = [-1, 2, -3]
+    print(b.join(","))           // -1,2,-3
+}

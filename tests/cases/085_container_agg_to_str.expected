@@ -1,0 +1,10 @@
+Vec<struct>: [Inner { a: 1, b: 一 }, Inner { a: 2, b: 二 }]
+print 路径: [Inner { a: 1, b: 一 }, Inner { a: 2, b: 二 }]
+Vec<enum>: [Nothing, One(_0: 5), Two(_0: 二, _1: 1.5)]
+Map<str,struct>: {"乙": Inner { a: 2, b: 二 }, "甲": Inner { a: 1, b: 一 }} len = 2
+Map<str,Vec>: {"k": [1, 2]}
+Vec<Vec<struct>>: [[Inner { a: 1, b: 一 }, Inner { a: 2, b: 二 }], [Inner { a: 3, b: 三 }]]
+结构体里带容器: [Outer { tag: 外, list: [7] }]
+Vec<char>: ['a', 'b']
+空的: [] {} 0 0
+2000 个: true [Inner { a: 0, b: x }, I

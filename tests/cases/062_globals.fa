@@ -1,0 +1,68 @@
+# 顶层 let：全局可变变量（以前只支持 const，README 的「已知限制」里列着这条）。
+#   * 存储在 .bss 里开一个槽，rip 相对寻址；没写初值就是零值
+#   * 初值在 main 的第一条用户语句之前按声明顺序执行一次
+#   * 引用计数类型（str / Vec / Map）赋值时「新值取一份 -> 放掉旧值 -> 存进去」，
+#     所以全局可以反复重建而不会泄漏或双重释放
+#   * 局部同名时局部优先（和 C / Python 的作用域规则一致）
+#   * &全局 能拿到 .bss 里的地址，可以直接交给 C 函数
+let counter = 0
+let ratio: f64 = 1.5
+let flag = true
+let letter: char = 'A'
+let zeros: i64                       # 只有类型标注 -> 零值
+let title = "全局标题"
+let names = Vec<str>["甲", "乙"]
+let scores = Map<str, i64>["a": 10, "b": 20]
+let table = [1, 2, 3, 4]
+let memo = Map<i64, i64>()
+
+fn bump(n: i64):
+    counter += n                     # 复合赋值也一样
+    names.push("新增{n}")
+
+fn fib(n: i64) -> i64:               # 用全局 Map 做记忆化：递归 + 跨调用共享状态
+    if n < 2 { return n }
+    if memo.has(n) { return memo[n] }
+    let v = fib(n - 1) + fib(n - 2)
+    memo[n] = v
+    return v
+
+fn rebuild():
+    names = Vec<str>["全新"]          # 覆盖引用计数的全局：旧的必须被正确释放
+    scores = Map<str, i64>()
+    scores["z"] = 99
+    title = "改过了"
+
+fn poke(p: *i64):
+    p[0] = 77                        # 通过指针写全局槽
+
+fn main() -> i64:
+    print(counter, ratio, flag, letter, zeros, title)
+    print(names.len(), names[0], scores["a"] + scores["b"], table[2])
+
+    bump(5)
+    bump(7)
+    print("counter =", counter, "names =", names.len(), names[2])
+
+    print("fib(30) =", fib(30), "memo =", memo.len())
+
+    {                                # 局部遮蔽全局；出了块又能看见全局
+        let counter = 999
+        print("块内遮蔽:", counter)
+    }
+    bump(1)
+    print("块外全局:", counter)       # 13
+
+    table[0] = 100
+    let s = 0
+    for x in table { s += x }
+    print("数组:", table[0], table[3], "求和:", s)
+
+    poke(&counter)                   # 取全局的地址交给函数
+    print("指针写全局:", counter)
+
+    rebuild()
+    let junk = Vec<str>[]
+    for i in 0..3000 { junk.push("填充{i}") }
+    print("重建后:", names.len(), names[0], scores["z"], title, junk.len())
+    return 0

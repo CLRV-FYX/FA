@@ -1,0 +1,6 @@
+# expect-compile-error: 未定义的标识符 'nope'
+# expect-compile-error: 行 5
+# 编译期错误要指出是哪一行、哪个名字（以前所有报错都是「行 0, 列 0」）
+fn main() -> i64:
+    print(nope)
+    return 0

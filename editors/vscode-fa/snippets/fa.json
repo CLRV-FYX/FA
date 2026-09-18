@@ -1,0 +1,136 @@
+{
+  "fn": {
+    "prefix": "fn",
+    "body": [
+      "fn ${1:名字}(${2:x: i64}) -> ${3:i64}:",
+      "    ${4:return 0}"
+    ],
+    "description": "函数定义"
+  },
+  "struct": {
+    "prefix": "struct",
+    "body": [
+      "struct ${1:P}:",
+      "    ${2:x: i64}",
+      "    ${3:y: str = \"\"}"
+    ],
+    "description": "结构体定义"
+  },
+  "enum": {
+    "prefix": "enum",
+    "body": [
+      "enum ${1:E}:",
+      "    ${2:Nothing}",
+      "    ${3:Just(v: i64)}"
+    ],
+    "description": "枚举定义"
+  },
+  "impl": {
+    "prefix": "impl",
+    "body": [
+      "impl ${1:P}:",
+      "    fn ${2:to_str}(self) -> str:",
+      "        return \"\""
+    ],
+    "description": "给类型加方法"
+  },
+  "main": {
+    "prefix": "main",
+    "body": [
+      "fn main() -> i64:",
+      "    ${1}",
+      "    return 0"
+    ],
+    "description": "程序入口"
+  },
+  "for": {
+    "prefix": "for",
+    "body": [
+      "for ${1:x} in ${2:v}:",
+      "    ${3}"
+    ],
+    "description": "遍历容器"
+  },
+  "fori": {
+    "prefix": "fori",
+    "body": [
+      "for i in 0..${1:n}:",
+      "    ${2}"
+    ],
+    "description": "按下标走（0..n 不含 n）"
+  },
+  "while": {
+    "prefix": "while",
+    "body": [
+      "while ${1:条件}:",
+      "    ${2}"
+    ],
+    "description": "while 循环"
+  },
+  "if": {
+    "prefix": "if",
+    "body": [
+      "if ${1:条件}:",
+      "    ${2}",
+      "else:",
+      "    ${3}"
+    ],
+    "description": "if/else"
+  },
+  "match": {
+    "prefix": "match",
+    "body": [
+      "match ${1:值}:",
+      "    ${2:变体}:",
+      "        ${3}",
+      "    _:",
+      "        ${4}"
+    ],
+    "description": "模式匹配"
+  },
+  "usec": {
+    "prefix": "usec",
+    "body": [
+      "use c \"${1:头文件.h}\" lib \"${2:m}\":",
+      "    fn ${3:名字}(${4}) -> ${5:i64}"
+    ],
+    "description": "声明 C 函数并链接"
+  },
+  "usestd": {
+    "prefix": "usestd",
+    "body": [
+      "use std.${1|fs,time,re,json,args|}"
+    ],
+    "description": "导入标准库模块"
+  },
+  "defer": {
+    "prefix": "defer",
+    "body": [
+      "defer ${1:free(p)}"
+    ],
+    "description": "作用域退出时执行"
+  },
+  "sortby": {
+    "prefix": "sortby",
+    "body": [
+      "fn ${1:by_key}(p: *${2:P}) -> i64: return p.${3:字段}",
+      "${4:v}.sort_by($1)"
+    ],
+    "description": "按字段排序（sort_by 要一个顶层取键函数）"
+  },
+  "hof": {
+    "prefix": "hof",
+    "body": [
+      "fn ${1:回调}(p: *${2:i64}) -> ${3:bool}: return ${4:p[] > 0}",
+      "${5:v}.${6|filter,map,any,all,index_where,for_each|}($1)"
+    ],
+    "description": "高阶函数：先写顶层回调，再 filter/map/any/all（FA 没有 lambda）"
+  },
+  "extern": {
+    "prefix": "externfn",
+    "body": [
+      "extern \"C\" fn ${1:strlen}(s: *char) -> ${2:usize}"
+    ],
+    "description": "声明一个 C 函数（配合 use c 头文件 lib 库名）"
+  }
+}

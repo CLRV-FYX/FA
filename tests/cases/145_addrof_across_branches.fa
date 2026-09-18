@@ -1,0 +1,112 @@
+# 在两个分支里都取同一个局部变量的地址。
+#
+# 这曾经是个段错误：`&x` 的实现是「x 溢出到栈槽，取槽的地址」，可溢出指令是在
+# **第一次遇到 &x 的那个基本块**里生成的，而变量的位置记录已经永久改成那个槽，
+# 于是另一个分支再写 &x 时直接复用了只在一个分支里赋过值的寄存器：
+#
+#     if flag:  bump(&n)      # lea r13, [rbp-112] 只生成在这里
+#     else:     bump(&n)      # mov rdi, r13 —— r13 里是上一轮的垃圾
+#
+# 定义必须支配使用，所以现在这类变量在**声明处**就落栈（形参在函数入口处落栈），
+# 地址在整个函数里都稳定。这个用例就是那道回归防线。
+fn bump(p: *i64):
+    *p = *p + 1
+
+fn twice(p: *i64):
+    *p = *p * 2
+
+struct Out:
+    x: i64
+    y: i64
+
+fn set_out(p: *Out, v: i64):
+    p.x = v
+    p.y = v * 10
+
+fn via_branch(flag: bool, start: i64) -> i64:
+    let mut n = start
+    if flag:
+        bump(&n)
+    else:
+        bump(&n)
+        bump(&n)
+    return n
+
+fn struct_in_branch(flag: bool) -> Out:
+    let o: Out
+    let mut seed: i64 = 5
+    if flag:
+        bump(&seed)
+        set_out(&o, seed)
+    else:
+        set_out(&o, seed)
+        bump(&seed)
+    return o
+
+fn two_calls_in_branch(flag: bool, v: i64) -> i64:
+    let mut n = v
+    if flag:
+        bump(&n)
+        twice(&n)
+    else:
+        twice(&n)
+        bump(&n)
+    return n
+
+fn in_loop(n: i64) -> i64:
+    let mut total: i64 = 0
+    for i in 0..n:
+        let mut v = i
+        bump(&v)
+        total += v
+    return total
+
+fn in_while(flag: bool) -> i64:
+    let mut acc: i64 = 0
+    let mut i: i64 = 0
+    while i < 6:
+        if flag:
+            bump(&acc)
+        else:
+            bump(&i)
+        i += 1
+    return acc * 100 + i
+
+# 形参也要落栈：形参的地址在两个分支里都取
+fn param_in_branch(p: *i64, flag: bool) -> i64:
+    if flag:
+        bump(p)
+    else:
+        twice(p)
+    return *p
+
+fn main() -> i64:
+    print("if 分支:", via_branch(true, 10))
+    print("else 分支:", via_branch(false, 10))
+    let a = struct_in_branch(true)
+    print("结构体 if:", a.x, a.y)
+    let b = struct_in_branch(false)
+    print("结构体 else:", b.x, b.y)
+    print("两个调用 if:", two_calls_in_branch(true, 3))
+    print("两个调用 else:", two_calls_in_branch(false, 3))
+    print("循环里:", in_loop(4))
+    print("while if:", in_while(true))
+    print("while else:", in_while(false))
+
+    let mut arg: i64 = 7
+    print("形参 if:", param_in_branch(&arg, true), arg)
+    let mut arg2: i64 = 7
+    print("形参 else:", param_in_branch(&arg2, false), arg2)
+
+    # 三层嵌套的分支里都取地址
+    let mut deep: i64 = 1
+    for i in 0..3:
+        if i == 0:
+            bump(&deep)
+        elif i == 1:
+            twice(&deep)
+        else:
+            bump(&deep)
+            twice(&deep)
+    print("三层分支:", deep)
+    return 0

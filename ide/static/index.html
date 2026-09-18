@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FA IDE</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>⚡</text></svg>">
+</head>
+<body class="dark">
+
+<header id="titlebar">
+  <div class="logo" title="FA —— 功能完全 + 极致速度">⚡ FA IDE</div>
+  <div id="filelabel" title="当前文件">untitled.fa</div>
+  <div id="dirty" class="hidden" title="有未保存的修改">●</div>
+  <div class="spacer"></div>
+  <div class="btns">
+    <button id="btn-new" title="在工作目录里新建一个 .fa">新建</button>
+    <button id="btn-open" title="按路径打开文件">打开…</button>
+    <button id="btn-save" title="Ctrl+S">保存</button>
+    <button id="btn-check" title="只检查不运行">检查</button>
+    <button id="btn-run" class="primary" title="F5 / Ctrl+Enter：编译并运行">▶ 运行</button>
+    <button id="btn-theme" title="切换深/浅色">◐</button>
+  </div>
+</header>
+
+<main>
+  <aside id="sidebar">
+    <div class="pane-head">
+      <span>文件</span>
+      <span class="pane-btns">
+        <button id="btn-newfile" title="新建文件">＋</button>
+        <button id="btn-refresh" title="刷新">⟳</button>
+      </span>
+    </div>
+    <div id="filetree" class="scroll"></div>
+    <div class="pane-head"><span>大纲</span></div>
+    <div id="outline" class="scroll"></div>
+  </aside>
+
+  <div id="splitter" title="拖动改变侧栏宽度"></div>
+
+  <section id="editor-col">
+    <div id="editor-wrap">
+      <div id="gutter" class="scroll"></div>
+      <div id="editor">
+        <pre id="hl" aria-hidden="true"></pre>
+        <textarea id="ed" spellcheck="false" autocomplete="off" autocorrect="off"
+                  autocapitalize="off" wrap="off"></textarea>
+      </div>
+      <div id="popup" class="floating hidden"></div>
+      <div id="hoverbox" class="floating hidden"></div>
+      <div id="sighelp" class="floating hidden"></div>
+    </div>
+    <div id="statusbar">
+      <span id="st-file">untitled.fa</span>
+      <span id="st-pos">行 1，列 1</span>
+      <span id="st-diags" class="ok">✓ 没有问题</span>
+      <span class="spacer"></span>
+      <span id="st-hint" title="常用快捷键">Ctrl+Space 补全 · F5 运行 · Ctrl+S 保存 · Ctrl+/ 注释</span>
+      <span id="st-time"></span>
+      <span id="st-mode">FA</span>
+    </div>
+  </section>
+</main>
+
+<footer id="panel">
+  <div id="panel-tabs">
+    <button data-tab="problems" class="on">问题 <span id="cnt-problems" class="badge">0</span></button>
+    <button data-tab="output">输出</button>
+    <button data-tab="cheat">速查</button>
+    <span class="spacer"></span>
+    <button id="btn-runargs" title="设置运行参数和超时">运行设置…</button>
+    <button id="panel-toggle" title="收起/展开面板">▾</button>
+  </div>
+  <div id="tab-problems" class="tabbody scroll"></div>
+  <div id="tab-output" class="tabbody scroll hidden"><pre id="output"></pre></div>
+  <div id="tab-cheat" class="tabbody scroll hidden"></div>
+</footer>
+
+<div id="modal" class="hidden">
+  <div id="modal-box">
+    <div id="modal-title"></div>
+    <div id="modal-body"></div>
+    <div id="modal-btns"></div>
+  </div>
+</div>
+
+<script src="/static/tokens.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

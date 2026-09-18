@@ -1,0 +1,13 @@
+# 再导入 shared.fa：use 是可以嵌套的（A 用 B，B 用 C，A 就同时拿到 B 和 C 的声明）。
+use "shared.fa"
+
+fn describe(p: Pt) -> str:
+    return "Pt 和={p.sum()} 放大={SCALE}倍 调用过{hits}次"
+
+fn level(l: Level) -> str:
+    match l:
+        Level.Low:
+            return "low"
+        Level.High(n):
+            return "high {n}"
+    return "?"

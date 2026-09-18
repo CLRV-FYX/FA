@@ -116,6 +116,20 @@ class Index(Expr):
 
 
 @dataclass
+class Slice(Expr):
+    """a[lo:hi] —— str 和 Vec 的切片。
+
+    lo / hi 都可以省（a[1:] / a[:3] / a[:]），省掉的那头由运行时按长度夹边，
+    和 str.slice(a, b) 是同一套规矩：负的夹到 0、超过长度的夹到长度、
+    反了给空结果。返回**新的** str / Vec，原来那个不动（str 本来就不可变，
+    Vec 也只有一份数据，共享会让引用计数算不清）。
+    """
+    obj: Expr
+    start: Optional[Expr] = None
+    end: Optional[Expr] = None
+
+
+@dataclass
 class Field(Expr):
     obj: Expr
     name: str
@@ -194,6 +208,9 @@ class Stmt(Node):
 class Block(Stmt):
     stmts: List[Stmt]
     flat: bool = False      # True：不新建作用域（用于元组解构这类语法糖展开）
+    # True：这个分支以 return / break / continue / panic 结尾，永远不会产出值。
+    # if / match 当表达式用时由语义分析填好，后端据此跳过「把尾表达式写进结果」。
+    diverges: bool = False
 
 
 @dataclass
@@ -324,6 +341,10 @@ class StructDef(Decl):
     pub: bool = False
     packed: bool = False
     sym: Any = None
+    # 字段默认值：{字段名: 初值表达式}。写了默认值的字段，在结构体字面量里
+    # 可以省略（`P { y: 4 }` 会用默认值补上 x）。fields 仍是 (name, Type)
+    # 二元组，不动它的形状 —— 消费方太多，多塞一个元素容易漏改。
+    defaults: Any = field(default_factory=dict)
 
 
 @dataclass
@@ -357,5 +378,40 @@ class Const(Decl):
 
 
 @dataclass
+class Global(Decl):
+    """顶层 `let`：全局可变变量。
+
+    与 `const` 的区别：const 是编译期常量（每次用到就重新求值一遍初值表达式），
+    全局变量有**唯一一份存储**（.bss 里的一个槽），可以被任何函数读写。
+    初值在 main 的第一条用户语句之前执行一次（没有初值就是零值）。
+    """
+    name: str
+    ty: Optional[Type]
+    init: Optional[Expr]
+    mutable: bool = True
+    gty: Any = None          # sema 解析出的实际类型
+    sym: Any = None          # VarSym(is_global=True)
+
+
+@dataclass
 class Module(Node):
     decls: List[Decl]
+
+
+# -------------------------------------------------------------- 位置信息
+def stamp_positions(n, pline: int = 0, pcol: int = 0) -> None:
+    """自顶向下补全缺失的行/列。
+
+    解析器只在少数节点上记了位置，于是绝大多数报错都打印「行 0, 列 0」，
+    等于没有定位。这里把父节点的位置继承给还没位置的子节点，
+    保证任何诊断至少能指到它所在的那条语句/声明。
+    """
+    if isinstance(n, Node):
+        if not getattr(n, "line", 0):
+            n.line, n.col = pline, pcol
+        pline, pcol = n.line, n.col
+        for v in list(vars(n).values()):
+            stamp_positions(v, pline, pcol)
+    elif isinstance(n, (list, tuple)):
+        for v in n:
+            stamp_positions(v, pline, pcol)

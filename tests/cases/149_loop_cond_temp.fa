@@ -1,0 +1,32 @@
+# 循环条件里新建的临时引用，每一轮都要释放。
+#
+# `while n > 1 and p.slice(n - 1, n) == "/"` 每轮都 slice 出一个新的 FaStr，
+# 可 flush_owned 是**语句收尾**时才做的，循环条件不在任何语句的收尾上 ——
+# 一个都没人放。更坏的是 mark_owned 按 Temp.id 去重，第二轮拿到的还是同一个
+# 虚拟寄存器，登记不进去，于是最后只释放了末一轮那个对象，前面每轮都漏。
+# ASan 抓到的现场：18 byte(s) leaked in 1 allocation(s)（std.fs 的 trim_slash）。
+# C 风格的 for (init; cond; step) 一样，条件也是每轮重新求值。
+#
+# 这个用例跑 50 轮，输出本身看不出问题（引用计数的 bug 大多不改变输出），
+# 它的价值在 tests/run_asan.py 底下：泄漏会当场报出来。
+fn trimmer(p: str) -> str:
+    let mut n = p.len()
+    while n > 1 and p.slice(n - 1, n) == "/":
+        n -= 1
+    return p.slice(0, n)
+
+fn cstyle(p: str) -> i64:
+    let mut total: i64 = 0
+    for (let mut i: i64 = 0; i < p.len() and p.slice(i, i + 1) != "/"; i += 1):
+        total += p.slice(i, i + 1).len()
+    return total
+
+fn main() -> i64:
+    print(trimmer("abcdef//////"))
+    print(cstyle("abc/def"))
+    for k in 0..50:
+        let t = trimmer("x" + k.to_str() + "///")
+        if t.len() == 0:
+            print("不该发生")
+    print("循环 50 次之后还正常")
+    return 0

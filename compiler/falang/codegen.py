@@ -9,12 +9,14 @@
 """
 
 from __future__ import annotations
+import struct
 from typing import List, Optional, Tuple, Any
 from .ast import *
 from . import types as T
 from .types import (Type, TYPES, VOID, BOOL, CHAR, STR, ANY, PYOBJ, JOBJ,
                     ptr_to, vec_of, map_of, arr_of, K_STR, K_VEC, K_MAP,
-                    K_PY, K_JOBJ, K_NONE)
+                    K_PY, K_JOBJ, K_NONE, K_BOX, K_BOXED_STRUCT,
+                    K_STRUCT_DESC_BASE)
 from .ir import Temp, Const, Sym, StrConst, Label, Instr, IRFunc, IRModule
 from .sema import Sema, VarSym, FnSym, BUILTIN_FNS
 
@@ -24,7 +26,18 @@ U8 = TYPES["u8"]
 
 
 class FaCodegenError(Exception):
-    pass
+    def __init__(self, msg: str, line: int = 0, col: int = 0):
+        super().__init__(msg)
+        self.msg, self.line, self.col = msg, line, col
+
+    def pretty(self, src: str = "") -> str:
+        head = f"代码生成错误 (行 {self.line}, 列 {self.col}): {self.msg}"
+        if src:
+            lines = src.split("\n")
+            if 1 <= self.line <= len(lines):
+                head += "\n    " + lines[self.line - 1]
+                head += "\n    " + " " * max(0, self.col - 1) + "^"
+        return head
 
 
 class VarLoc:
@@ -85,11 +98,16 @@ def elem_kind(ty: Type, sema) -> int:
     if ty.kind == "jobj":
         return K_JOBJ
     if ty.kind == "struct":
+        # 容器里的结构体元素**一律装箱**（存的是 malloc 出来的副本地址）：
+        # 以前 size<=8 的结构体被按值塞进 8 字节槽里，运行时却按
+        # 「指向结构体的指针」去 retain/release，于是把字符串指针当成结构体头用。
         if ty.desc_id >= 0:
-            return 1000 + ty.desc_id
-        if ty.size <= 8:
-            return K_NONE
-        return 6                      # 装箱的纯数据结构体（无内部引用）
+            return K_BOXED_STRUCT + ty.desc_id
+        return K_BOX                  # 装箱的纯数据结构体（无内部引用）
+    if ty.kind == "enum":
+        if ty.desc_id >= 0:
+            return K_BOXED_STRUCT + ty.desc_id
+        return K_BOX
     return K_NONE
 
 
@@ -101,7 +119,14 @@ class FnGen:
         self.fnsym = fnsym
         self.body = body
         self.params = params
-        self.self_type = self_type
+        # impl 里**不带 self** 的方法（`P.make(1.0, 2.0)` 这种「静态」方法）没有
+        # self 指针可传。可调用方是按「这是 P 的方法」把 self_type 递进来的，
+        # 于是这里会平白多占一个整数寄存器（sret 时是 rsi），而形参落地那段又按
+        # 「AST 形参第 0 个是 self」对位 —— `fn make(x: f64, y: f64)` 里 x 拿到的是
+        # 那个幽灵 self 的寄存器（rsi），y 拿到 x 的（xmm0），汇编器直接报
+        # `movsd` 操作数类型不匹配；就算类型凑巧对得上，值也是错位的。
+        has_self = any(getattr(p, "name", "") == "self" for p in (params or []))
+        self.self_type = self_type if has_self else None
         self.ir: List[Instr] = []
         self.ntemp = 0
         self.nlabel = 0
@@ -109,7 +134,15 @@ class FnGen:
         self.scope: Optional[ScopeCtx] = None
         self.owned: List[Tuple[Temp, Type]] = []     # 语句内产生的 owned 临时引用
         self.owned_ids: set = set()
-        self.loop_stack: List[Tuple[str, str]] = []  # (continue_label, break_label)
+        # 语句内新建的「聚合临时值」（结构体/数组字面量、返回聚合的调用结果）。
+        # 它们的存储是栈上的 alloca，语句结束时若没被谁接管就必须就地释放字段。
+        self.agg_owned: List[Tuple[Temp, Type]] = []
+        self.agg_owned_ids: set = set()
+        # (continue 标签, break 标签, continue 要收尾到哪个作用域为止,
+        #  break 要收尾到哪个作用域为止)。后两个是「停在这层之外」的意思：
+        #  break / continue 会跳出若干层块，被跳过的那些块里的 defer 与引用
+        #  释放必须在跳转之前就地补一份（与 return 的 unwind_scopes 同理）。
+        self.loop_stack: List[Tuple[str, str, object, object]] = []
         self.temp_tys: dict = {}
         # 目标驱动代码生成：调用方（赋值/let）可以把「结果该写到哪个 Temp」作为提示传进来，
         # 让 x = x + 1 直接生成 add 而不是「算到临时寄存器再搬回去」。
@@ -118,8 +151,7 @@ class FnGen:
 
     # ------------------------------------------------------------ 基础设施
     def err(self, msg, node=None):
-        line = getattr(node, "line", 0)
-        raise FaCodegenError(f"行 {line}: {msg}")
+        raise FaCodegenError(msg, getattr(node, "line", 0), getattr(node, "col", 0))
 
     def new_temp(self, ty: Type = None) -> Temp:
         self.ntemp += 1
@@ -169,7 +201,7 @@ class FnGen:
         sc = self.scope
         # defer 先执行（后进先出）
         for d in reversed(sc.defers):
-            self.gen_expr(d)
+            self.gen_deferred(d)
         # 再释放本作用域拥有的引用
         for loc, ty in reversed(sc.drops):
             self.emit_drop(loc, ty)
@@ -195,10 +227,15 @@ class FnGen:
         for i, pty in enumerate(self.fnsym.params):
             t = self.new_temp(pty)
             ptemps.append(t)
-        # 前 6 个整数参数寄存器
+        # 前 6 个整数参数寄存器：sret 指针占 rdi，self 再占下一个。
+        # 两者**同时**存在时（方法返回结构体）要各让一个位置——
+        # 以前只让了一个，于是 `fn clone(self, k: i64) -> P` 里的 k
+        # 和 self 都被分到 rsi，k 实际收到的是 sret 指针（一个栈地址）。
         ireg = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
-        if sret or self_temp is not None:
-            ireg = ["rsi", "rdx", "rcx", "r8", "r9"]
+        if sret:
+            ireg = ireg[1:]
+        if self_temp is not None:
+            ireg = ireg[1:]
         # 按 SysV 规则逐个形参分配：整数用 ireg，浮点用 xmm0-xmm7，
         # 放不下的按原顺序进栈槽（槽号从 0 开始，即 [rbp+16+8*slot]）
         nint = nfp = nstack = 0
@@ -225,6 +262,7 @@ class FnGen:
 
         sc = self.push_scope()
         # self / 形参落地
+        self.addr_taken_names = self._addr_taken_roots(self.body)
         off = 0
         if self.self_type is not None:
             st = self.sema.structs.get(self.self_type) or self.sema.enums.get(self.self_type)
@@ -236,9 +274,16 @@ class FnGen:
             if p.name == "self":
                 continue                       # self 已在上面绑定
             pty = self.fnsym.params[i if off == 0 else i - 1]
-            src = ptemps[i + off + (1 if sret else 0)]
+            # ptemps 的排布是 [sret?] + [self?] + 其余形参，而 i 是**AST 形参**
+            # 的下标（方法里含 self），所以偏移正好是「有 sret 就 +1」——
+            # 以前这里多加了一个 off，凡是带参数的方法（self 之外还有形参）
+            # 都会越界，直接 IndexError 崩掉编译器：
+            #     impl P: fn add(self, k: i64) -> i64   # docs/02 里的标准写法
+            src = ptemps[i + (1 if sret else 0)]
             sym = VarSym(p.name, pty, mutable=True, is_param=True)
-            if is_agg(pty) or sym.addr_taken:
+            # 这里的 sym 是新建的，addr_taken 永远是 False，所以要看函数体里
+            # 到底有没有人取过这个形参的地址（见 _addr_taken_roots 的说明）。
+            if is_agg(pty) or p.name in self.addr_taken_names:
                 slot = self.emit_alloca(pty.size)
                 self.emit_copy(slot, src if is_agg(pty) else src, pty)
                 loc = VarLoc("mem", slot, pty, borrowed=True, sym=sym)
@@ -246,24 +291,420 @@ class FnGen:
                 loc = VarLoc("temp", src, pty, borrowed=True, sym=sym)
             sc.vars[p.name] = loc
 
+        if self.fnsym.name == "main" and getattr(self.sema, "global_decls", None):
+            # 顶层 let 的初值：语义上「在 main 之前执行」，实现上放在 main 最前面
+            self.gen_global_inits()
         self.gen_block(self.body)
 
         # 函数体结尾兜底 return
         if not self.ir or self.ir[-1].op != "RET":
-            if ret.kind == "void":
-                self.emit("RET")
-            else:
-                z = self.const_zero(ret)
-                self.emit("RET", args=[z])
+            self.gen_tail_return(ret)
         self.pop_scope()
         self.fn.instrs = self.ir
         return self.fn
+
+    def gen_tail_return(self, ret: Type):
+        """掉到函数体末尾时的兜底返回：给一个**定义良好**的零值，并把该收的尾收了。
+
+        以前这里是 `RET Const(0)`，三个毛病：
+        - Vec/Map/str 拿到的是空指针，调用方一用就段错误（`fv().len()` 实测崩）；
+        - struct/enum 是 sret 约定，压根没往调用方给的缓冲里写，调用方读的是栈上垃圾；
+        - 没有 flush_owned / unwind_scopes —— defer 不执行，局部引用全泄漏。
+        """
+        if ret.kind == "void":
+            self.flush_owned()
+            self.unwind_scopes()
+            self.emit("RET")
+            return
+        if is_agg(ret):
+            # sret：把调用方给的缓冲清零就是「这个类型的零值」
+            self.emit("ZERO", args=[self.fn.params[0]], extra=ret.size)
+            self.flush_owned()
+            self.unwind_scopes()
+            self.emit("RET", args=[self.fn.params[0]])
+            return
+        v = self.tail_zero_value(ret)
+        if T.t_is_refcounted(ret):
+            self.emit_rcinc(v, ret)        # 所有权交给调用方，和 gen_return 一致
+        self.flush_owned()
+        self.unwind_scopes()
+        self.emit("RET", args=[v], ty=ret)
+
+    def tail_zero_value(self, ty: Type):
+        """引用计数类型的零值必须是**真的空对象**，不能是空指针。"""
+        if ty.kind == "str":
+            return self.make_str("")
+        if ty.kind == "vec":
+            et = ty.elem
+            v = self.new_temp(ty)
+            self.emit("CALL", v, [Sym("fa_vec_new"), self.const(elem_kind(et, self.sema)),
+                                  self.const(vec_esz(et)),
+                                  self.const(1 if (et.kind == "int" and et.is_signed) else 0),
+                                  self.const(T.ty_code(et))], ty=ty)
+            self.mark_owned(v, ty)
+            return v
+        if ty.kind == "map":
+            kt, vt = ty.key, ty.val
+            m = self.new_temp(ty)
+            self.emit("CALL", m, [Sym("fa_map_new"),
+                                  self.const(elem_kind(kt, self.sema)),
+                                  self.const(elem_kind(vt, self.sema)),
+                                  self.const(T.ty_code(kt)),
+                                  self.const(T.ty_code(vt))], ty=ty)
+            self.mark_owned(m, ty)
+            return m
+        return self.const_zero(ty)
+
+    def emit_zero_agg(self, slot, ty: Type):
+        """聚合值不给初值时，把每个引用计数槽位都建成**真的空对象**。
+
+        ZERO 只是 memset 0，于是 `let v: [Vec<i64>; 2]` 的两个槽位是 NULL：
+        `v[0].push(1)` 要么静默失效、要么当场段错误（实测 `[Vec<i64>; 1]` 上 push 就崩），
+        而 `to_str()` 打出来还是 `[[], []]`。`let p: P` 的 str / 容器字段同理。
+        结构体字段有声明时写的默认值就用默认值（和 `P{}` 省略字段一个规矩）。
+        """
+        if ty is None:
+            return
+        if ty.kind == "arr":
+            esz = max(ty.elem.size, 1)
+            for i in range(getattr(ty, "count", 0) or 0):
+                self.emit_zero_at(slot, i * esz, ty.elem)
+        elif ty.kind == "struct":
+            defaults = getattr(self.sema.struct_decls.get(ty.name), "defaults",
+                               None) or {}
+            for fname, fty, off in (ty.fields or []):
+                expr = defaults.get(fname)
+                if expr is not None:
+                    v = self.gen_expr(expr)
+                    if is_agg(fty):
+                        d = self.new_temp(ptr_to(fty))
+                        self.emit("LEA", d, [slot], extra=off)
+                        self.emit_init_agg(d, v, fty)
+                    else:
+                        self.emit("STORE", args=[slot, self.coerce(v, expr.ty, fty)],
+                                  extra=off, ty=fty)
+                        if T.t_is_refcounted(fty):
+                            self.emit_rcinc(v, expr.ty)
+                else:
+                    self.emit_zero_at(slot, off, fty)
+        elif ty.kind == "enum":
+            # tag 已经被 ZERO 清成 0，只要把第 0 个变体的载荷建出来（8 = tag 宽度）
+            for vname, vfields, vi in (getattr(ty, "variants", None) or []):
+                if vi == 0:
+                    for fname, fty, off in (vfields or []):
+                        self.emit_zero_at(slot, 8 + off, fty)
+                    break
+
+    def emit_zero_at(self, base, off, ty: Type):
+        """在 base+off 上放一个 ty 的真零值。标量已经被 ZERO 清成 0，不用管。"""
+        if ty is None:
+            return
+        if ty.kind in ("str", "vec", "map"):
+            v = self.tail_zero_value(ty)
+            self.emit("STORE", args=[base, v], extra=off, ty=ty)
+            self.take_owned(v, ty)      # 归变量所有；静态空串本来就没登记
+        elif is_agg(ty):
+            d = self.new_temp(ptr_to(ty))
+            self.emit("LEA", d, [base], extra=off)
+            self.emit_zero_agg(d, ty)
 
     # ------------------------------------------------------------ 内存辅助
     def emit_alloca(self, size: int, align: int = 8) -> Temp:
         d = self.new_temp(ptr_to(U8))
         self.emit("ALLOCA", d, extra=(max(size, 1), align))
         return d
+
+    def add_offs(self, a, b):
+        """两个偏移相加，两边都可能是常量也可能是 Temp。
+
+        嵌套数组 `grid[i][j]` 就是这种：外层下标给出一个运行时才算得出的偏移，
+        内层再给一个，两个都得加上去。
+        """
+        if isinstance(a, int) and isinstance(b, int):
+            return a + b
+        if isinstance(a, int) and a == 0:
+            return b
+        if isinstance(b, int) and b == 0:
+            return a
+        # 常量偏移必须包成 Const 再进 IR：直接塞一个 Python int 进去，
+        # 汇编生成器认不出来，抛「bad operand 16」把编译器崩掉。
+        # 触发条件很平常 —— 结构体里有个数组字段，而它**不是第一个**字段：
+        #     struct S:
+        #         n: i64 = 0
+        #         a: [i64; 3] = [0, 0, 0]
+        #     s.a[1] = 7          # 数组字段偏移 8，下标偏移是运行时算的
+        # 外层偏移是常量 8、内层是 Temp，两边一相加就撞上这条路。
+        # 偏移为 0（数组正好是第一个字段）时上面几个分支会短路，所以看着像好的。
+        r = self.new_temp(I64)
+        self.emit("BIN", r,
+                  [self.const(a) if isinstance(a, int) else a,
+                   self.const(b) if isinstance(b, int) else b],
+                  extra="+", ty=I64)
+        return r
+
+    def add_off(self, off, delta: int):
+        """把常量偏移叠加到「可能是 Temp 的偏移」上。
+
+        `a[0].id` 这类嵌套取址会得到一个运行时才算得出来的偏移（Temp），
+        以前直接 `off0 + fo` -> Python 层 TypeError（Temp + int），编译器当场崩掉。
+        """
+        if not delta:
+            return off
+        if isinstance(off, int):
+            return off + delta
+        r = self.new_temp(I64)
+        self.emit("BIN", r, [off, self.const(delta)], extra="+", ty=I64)
+        return r
+
+    def emit_map_set(self, m, kexpr, vexpr, kt: Type, vt: Type):
+        """`m.set(k, v)` 与 Map 字面量初值共用的一条路径。
+
+        fa_map_set 内部完成「新键值 inc + 旧键值 dec」，所以这里不再动引用计数；
+        键值都按容器的 uint64_t ABI 传：浮点转位模式，结构体/枚举先装箱
+        （否则存进去的是栈地址，函数一返回就成了野指针）。
+        """
+        k = self.gen_expr(kexpr)
+        v = self.gen_expr(vexpr)
+        kk = self.coerce(k, kexpr.ty, kt)
+        if kt.is_float:
+            kk = self.bitcast(kk, I64)
+        if vt.kind in ("struct", "enum"):
+            vv = self.box_agg(v, vt)
+        else:
+            vv = self.coerce(v, vexpr.ty, vt)
+            if vt.is_float:
+                vv = self.bitcast(vv, I64)
+        self.emit("CALL", None, [Sym("fa_map_set"), m, kk, vv])
+
+    def map_miss_default(self, raw, vt: Type, kk, kt: Type, ot: Type):
+        """键不存在时 fa_map_get 返回 0，而 0 对各个值类型的意思完全不同。
+
+        数值 / bool / char / 指针：0 就是零值 —— `m.get(词) + 1` 这个计数惯用法
+            靠的正是它，原样返回。
+        str：换成静态空串。NULL 在多数地方被运行时容错成空串（len 是 0、拼接是 ""），
+            但走 `.chars()` / `.split()` 这类要读对象头的路就不一定了；静态串
+            rc = -1 永生，不涉及所有权，两条路都安全。
+        Vec / Map / struct / enum：造不出一个能用的零值，直接 panic 把键打出来。
+            NULL 表**一用就段错误**（实测 Map<str, Vec<i64>> 上 m.get("nope").to_str()
+            当场崩，.len() 是 0 而往里 push 静默失效，因为 fa_vec_push 对 NULL
+            直接 return）；结构体更是连「默认的 P」都不存在（字段没写默认值时
+            P{} 本身就编译不过）。
+            为什么不像 str 那样在分支里造一份新的空表交出去：那份表的**所有权**
+            和命中路径不一样（命中的值是借来的、不能释放，新建的那份必须有人释放），
+            而释放是登记在语句末尾做的 —— 走命中路径时那个临时寄存器里装的是
+            无关的值，实测退出时 glibc 报 free(): invalid pointer。这正是
+            if/match 表达式和 gen_enum_to_str 踩过的同一个坑：分支里新建的引用
+            必须在分支内了结，不能拖到合流之后。
+
+        panic 分支里的中间引用（键的文本、拼接结果）用 release_new_refs 在**分支内**
+        注销并释放，理由同上。
+        """
+        if vt is None or vt.kind in ("int", "float", "bool", "char", "ptr",
+                                     "any", "pyobj", "jobj"):
+            return raw
+        isnull = self.new_temp(BOOL)
+        self.emit("CMP", isnull, [raw, self.const(0)], extra="==", ty=I64)
+        l_fix = self.new_label("mmiss")
+        l_end = self.new_label("mmissd")
+        slot = self.emit_alloca(8)
+        self.emit("STORE", args=[slot, raw], extra=0, ty=I64)
+        self.emit("BR", args=[isnull], extra=(l_fix, l_end))
+        self.emit("LABEL", extra=l_fix)
+        ref_before = set(self.owned_ids)
+        agg_before = set(self.agg_owned_ids)
+        if vt.kind == "str":
+            self.emit("STORE", args=[slot, self.make_str("")], extra=0, ty=STR)
+        else:
+            ks = self.gen_to_str(kk, kt)
+            if vt.kind in ("vec", "map"):
+                tail = (f"：{vt} 的值给不出一个能用的零值（空指针一用就段错误）。"
+                        f"先用 m.has(k) 判断；要「没有就建一张空表」，写 "
+                        f"if not m.has(k) {{ m.set(k, {vt}()) }}")
+            else:
+                tail = (f"：{vt} 的值造不出「零值」（字段没写默认值时连 {vt}{{}} 都"
+                        f"编译不过）。先用 m.has(k) 判断键在不在")
+            msg = self.concat_str(self.make_str(f"Map<{kt}, {vt}> 里没有键 "), ks)
+            msg = self.concat_str(msg, self.make_str(tail))
+            self.emit("CALL", None, [Sym("fa_panic"), msg])
+        self.release_new_refs(None, ref_before, agg_before)
+        self.emit("LABEL", extra=l_end)
+        # 按 I64 取回来：槽里存的就是那 8 个字节的把手/盒子地址，和 fa_map_get
+        # 原来的返回值一个形状。按 vt 去 LOAD 的话，结构体值会被当成「从槽里
+        # 拷 sizeof(P) 字节」—— 8 字节的栈格子读出十几字节垃圾，实测命中路径
+        # 直接段错误。
+        out = self.new_temp(I64)
+        self.emit("LOAD", out, [slot], extra=0, ty=I64)
+        return out
+
+    def gen_zero_value(self, ty: Type):
+        """新建一份 ty 的空值：str 是空串，Vec / Map 是**一张新的空表**。
+
+        和 const_zero 的区别就在这儿：const_zero 给的是常量 0，对引用计数类型
+        等于空指针。空指针塞进表里，str 还能被运行时当空串容错，Vec / Map 就
+        **静默失效**（fa_vec_push(NULL, x) 直接 return：格子看着在，什么都存不进去）。
+        返回的引用不登记 owned：调用方把它交给容器（push 会加一次引用，随后
+        自己把创建时那次还掉），或者自己负责释放。
+        """
+        if ty is None:
+            return self.const(0, I64)
+        if ty.kind == "str":
+            return self.make_str("")
+        if ty.kind == "vec":
+            et = ty.elem
+            v = self.new_temp(ty)
+            self.emit("CALL", v, [Sym("fa_vec_new"), self.const(elem_kind(et, self.sema)),
+                                  self.const(vec_esz(et)),
+                                  self.const(1 if (et.kind == "int" and et.is_signed) else 0),
+                                  self.const(T.ty_code(et))], ty=ty)
+            return v
+        if ty.kind == "map":
+            kt, vt = ty.key, ty.val
+            m = self.new_temp(ty)
+            self.emit("CALL", m, [Sym("fa_map_new"),
+                                  self.const(elem_kind(kt, self.sema)),
+                                  self.const(elem_kind(vt, self.sema)),
+                                  self.const(T.ty_code(kt)),
+                                  self.const(T.ty_code(vt))], ty=ty)
+            return m
+        return self.const_zero(ty)
+
+    def emit_vec_resize_ref(self, obj, et: Type, n, fill):
+        """元素是 str / Vec / Map / 结构体 / 枚举时的 `v.resize(n[, 填充值])`。
+
+        以前不管什么元素都走 `fa_vec_resize(v, n, val)` —— 它把**同一个** val
+        push n 次，于是：
+
+          * 不给填充值时 val 是 const_zero，也就是空指针。实测
+            `Vec<Vec<i64>>().resize(2)` 之后 `c[0].push(1)` 什么都不发生
+            （打出来还是 `[[], []]`，因为 fa_vec_push 对 NULL 直接 return）；
+            `Vec<P>().resize(2)` 更是当场段错误 —— box_agg 拿常量 0 当结构体值
+            装箱，连 `d.len()` 都崩；
+          * 给了填充值时 n 格共享同一个对象：改一格全表跟着变，装箱的结构体
+            还会被释放 n 次（double free）。
+
+        所以这里自己发循环，**每格新建一份**：
+
+            变短： while len > n: pop()          fa_vec_pop 按元素 kind 正确释放
+            变长： while len < n: push(新的一份)
+
+        填充值只求值一次（`resize(3, mk())` 不会调三回 mk）；装箱元素每格
+        alloc + memcpy 一份新盒子（盒子里的引用计数字段由 fa_vec_push 的 retain
+        补上，和 box_agg + push 一条路）；Vec / Map 的填充值每格 clone 一份
+        （浅拷，和 copy() 一个规矩）；str 不可变，共享同一份就行。
+        """
+        # 装箱元素不给填充值：截断是合法的（编译期不知道 n 和长度谁大），
+        # 真要变长时在循环里 panic 一句人话 —— 以前这里是拿常量 0 装箱，当场段错误
+        no_fill_boxed = fill is None and et.kind in ("struct", "enum")
+        if no_fill_boxed:
+            first = (getattr(et, "variants", None) or [("Empty", None, 0)])[0][0] \
+                if et.kind == "enum" else ""
+            how = (f"写 v.resize(n, {et.name}.{first})" if et.kind == "enum"
+                   else f"写 v.resize(n, {et}{{字段: 值, ...}})")
+            panic_msg = (f"Vec<{et}>.resize(n) 要变长就得给填充值：每一格都要一份新的 {et}，"
+                         f"FA 不猜「默认的 {et} 长什么样」。{how}（截断不用给）")
+        # n 和填充值都要放栈槽：循环体里有 CALL，寄存器里的值会被冲掉
+        nslot = self.emit_alloca(8)
+        self.emit("STORE", args=[nslot, n], extra=0, ty=I64)
+        src = None
+        if fill is not None:
+            src = self.gen_expr(fill)                     # 只求值这一次
+            if et.kind != "str":
+                s = self.emit_alloca(8)
+                self.emit("STORE", args=[s, src], extra=0, ty=ptr_to(et))
+                src = s
+
+        # ---- 变短：一格一格弹
+        top, body, end = (self.new_label("rzt"), self.new_label("rzb"),
+                          self.new_label("rze"))
+        self.emit("LABEL", extra=top)
+        ln = self.new_temp(I64)
+        self.emit("LOAD", ln, [obj], extra=8, ty=I64)
+        nn = self.new_temp(I64)
+        self.emit("LOAD", nn, [nslot], extra=0, ty=I64)
+        c = self.new_temp(BOOL)
+        self.emit("CMP", c, [ln, nn], extra=">", ty=I64)
+        self.emit("BR", args=[c], extra=(body, end))
+        self.emit("LABEL", extra=body)
+        # fa_vec_pop 把值**交给调用方**、自己不释放（`v.pop()` 的返回值归用户）。
+        # 截断时没人接这个值，必须当场还掉，否则被删掉的元素永远漏在堆上
+        # （ASan 实测：Vec<Vec<i64>> 截断漏 header + data 各 64 字节）。
+        popped = self.new_temp(et)
+        self.emit("CALL", popped, [Sym("fa_vec_pop"), obj], ty=et)
+        # 释放要按**容器元素**的 kind 来：装箱的结构体/枚举是 K_BOXED_STRUCT+desc
+        # （要先 drop 字段再 free 盒子），而 ty.rc_kind 对它们是 K_NONE ——
+        # 那个只适用于内联的结构体值。走 elem_kind 才和 fa_vec_clear 一个规矩。
+        self.emit("RCDEC", args=[popped], extra=elem_kind(et, self.sema))
+        self.emit("JMP", extra=top)
+        self.emit("LABEL", extra=end)
+
+        # ---- 变长：每轮新建一份再 push
+        top2, body2, end2 = (self.new_label("rzgt"), self.new_label("rzgb"),
+                             self.new_label("rzge"))
+        self.emit("LABEL", extra=top2)
+        ln2 = self.new_temp(I64)
+        self.emit("LOAD", ln2, [obj], extra=8, ty=I64)
+        nn2 = self.new_temp(I64)
+        self.emit("LOAD", nn2, [nslot], extra=0, ty=I64)
+        c2 = self.new_temp(BOOL)
+        self.emit("CMP", c2, [ln2, nn2], extra="<", ty=I64)
+        self.emit("BR", args=[c2], extra=(body2, end2))
+        self.emit("LABEL", extra=body2)
+        made_new = True
+        if no_fill_boxed:
+            self.emit("CALL", None, [Sym("fa_panic"), self.make_str(panic_msg)])
+            self.emit("JMP", extra=top2)
+            self.emit("LABEL", extra=end2)
+            return
+        if src is None:
+            val = self.gen_zero_value(et)
+        elif et.kind in ("struct", "enum"):
+            p = self.new_temp(ptr_to(et))
+            self.emit("LOAD", p, [src], extra=0, ty=ptr_to(et))
+            val = self.new_temp(ptr_to(et))
+            self.emit("CALL", val, [Sym("fa_alloc"), self.const(max(et.size, 8))],
+                      ty=ptr_to(et))
+            self.emit("MEMCPY", args=[val, p], extra=et.size, ty=et)
+            made_new = False                 # 盒子不带引用计数，push 的 retain 就够
+        elif et.kind == "vec":
+            inner = et.elem
+            box = (max(inner.size, 8)
+                   if inner is not None and inner.kind in ("struct", "enum") else 0)
+            p = self.new_temp(et)
+            self.emit("LOAD", p, [src], extra=0, ty=et)
+            val = self.new_temp(et)
+            self.emit("CALL", val, [Sym("fa_vec_clone"), p, self.const(box)], ty=et)
+        elif et.kind == "map":
+            kt, vt = et.key, et.val
+            kbox = (max(kt.size, 8)
+                    if kt is not None and kt.kind in ("struct", "enum") else 0)
+            vbox = (max(vt.size, 8)
+                    if vt is not None and vt.kind in ("struct", "enum") else 0)
+            p = self.new_temp(et)
+            self.emit("LOAD", p, [src], extra=0, ty=et)
+            val = self.new_temp(et)
+            self.emit("CALL", val, [Sym("fa_map_clone"), p,
+                                    self.const(kbox), self.const(vbox)], ty=et)
+        else:                                # str：不可变，n 格共享同一份
+            val, made_new = src, False
+        self.emit("CALL", None, [Sym("fa_vec_push"), obj, val])
+        if made_new:
+            # push 已经加过一次引用，创建时那一次要还掉
+            # （静态空串的 rc 是 -1，减引用是空操作，一起走这条路没问题）
+            self.emit_rcdec_val(val, et)
+        self.emit("JMP", extra=top2)
+        self.emit("LABEL", extra=end2)
+
+    def box_agg(self, v, ty: Type):
+        """为容器元素在堆上装一份箱。
+
+        **不在这里 retain**：fa_vec_push / fa_map_set 会按元素 kind 调用
+        __fa_retain_<T> 给容器加引用；源若是本语句的临时值，语句结束时释放。
+        """
+        box = self.new_temp(ptr_to(ty))
+        self.emit("CALL", box, [Sym("fa_alloc"), self.const(max(ty.size, 8))],
+                  ty=ptr_to(ty))
+        self.emit("MEMCPY", args=[box, v], extra=ty.size, ty=ty)
+        return box
 
     def const(self, v, ty: Type = None) -> Const:
         return Const(v, ty or I64)
@@ -295,13 +736,19 @@ class FnGen:
         return False
 
     def emit_rcinc(self, v, ty: Type):
+        """给一个值加一次引用。
+
+        结构体没有引用计数头，加引用 = 调用编译器为它生成的 __fa_retain_<T>
+        （逐字段各加一次）。以前这里调用的是 __fa_drop_inc_<T> —— 一个
+        **从未被生成**的符号，于是 `r1 = r2` 这种结构体赋值直接链接失败。
+        """
         k = ty.rc_kind
         if k != K_NONE:
             self.emit("RCINC", args=[v], extra=k)
-        elif ty.kind == "struct" and ty.is_refcounted:
-            self.emit("CALL", None, [Sym(f"__fa_drop_inc_{ty.name}"), v])
+        elif ty.kind in ("struct", "enum") and ty.is_refcounted:
+            self.emit("CALL", None, [Sym(f"__fa_retain_{ty.name}"), v])
         elif ty.kind == "arr" and T.t_is_refcounted(ty.elem):
-            self.emit_drop_array(v, ty)
+            self.emit_array_rc(v, ty, retain=True)
 
     def emit_drop(self, loc: VarLoc, ty: Type):
         if not T.t_is_refcounted(ty):
@@ -323,41 +770,140 @@ class FnGen:
         elif ty.kind == "struct":
             self.emit("CALL", None, [Sym(f"__fa_drop_{ty.name}"), v])
         elif ty.kind == "arr":
-            self.emit_drop_array(v, ty)
-        elif ty.kind == "enum":
+            self.emit_array_rc(v, ty, retain=False)
+        elif ty.kind == "enum" and ty.is_refcounted:
             self.emit("CALL", None, [Sym(f"__fa_drop_{ty.name}"), v])
 
-    def emit_drop_array(self, ptr: Temp, ty: Type):
-        """释放数组中每个引用元素"""
-        ek = elem_kind(ty.elem, self.sema)
-        if ek == K_NONE and not T.t_is_refcounted(ty.elem):
+    def emit_array_rc(self, ptr: Temp, ty: Type, retain: bool):
+        """定长数组的批量增减引用。
+
+        元素是**内联**存放的，所以结构体元素要对「元素地址」调用
+        __fa_drop_/__fa_retain_<T>，而不是像以前那样先 LOAD 8 字节再处理
+        （那对 16 字节以上的结构体元素完全是错的）。统一交给运行时
+        fa_drop_arr / fa_retain_arr 循环，省得在 IR 里手写循环。
+        """
+        et = ty.elem
+        if not T.t_is_refcounted(et):
             return
-        i = self.new_temp(I64)
-        self.emit("MOV", i, [self.const(0)], ty=I64)
-        top = self.new_label("arrdrop")
-        end = self.new_label("arrdropE")
-        self.emit("LABEL", extra=top)
-        c = self.new_temp(BOOL)
-        self.emit("CMP", c, [i, self.const(ty.count)], extra="<", ty=I64)
-        self.emit("BR", args=[c], extra=(top + "_body", end))
-        self.emit("LABEL", extra=top + "_body")
-        scale = max(ty.elem.size, 8) if ty.elem.kind == "struct" else ty.elem.size
-        if ty.elem.kind == "struct" and ty.elem.size > 8:
-            scale = 8
-        off = self.new_temp(I64)
-        self.emit("BIN", off, [i, self.const(scale)], extra="*", ty=I64)
-        a = self.new_temp(ty.elem)
-        self.emit("LOAD", a, [ptr], extra=off, ty=ty.elem)
-        self.emit_rcdec_val(a, ty.elem)
-        self.emit("BIN", i, [i, self.const(1)], extra="+", ty=I64)
-        self.emit("JMP", extra=top)
-        self.emit("LABEL", extra=end)
+        nested = et.kind in ("struct", "enum") and et.is_refcounted
+        if nested:
+            fn = self.new_temp(ptr_to(VOID))
+            self.emit("LEA_SYM", fn,
+                      extra=f"__fa_{'retain' if retain else 'drop'}_{et.name}")
+        else:
+            fn = self.const(0)
+        sym = "fa_retain_arr" if retain else "fa_drop_arr"
+        self.emit("CALL", None, [Sym(sym), ptr, self.const(ty.count),
+                                 self.const(max(et.size, 1)),
+                                 self.const(0 if nested else et.rc_kind), fn])
+
+    # ------------------------------------------------- 聚合值的所有权
+    def mark_agg_owned(self, slot, ty: Type):
+        """登记一个本语句新建的聚合临时值（结构体/数组字面量、返回聚合的调用）"""
+        if isinstance(slot, Temp) and is_agg(ty) and T.t_is_refcounted(ty):
+            if slot.id not in self.agg_owned_ids:
+                self.agg_owned_ids.add(slot.id)
+                self.agg_owned.append((slot, ty))
+
+    def take_agg_owned(self, slot) -> bool:
+        """若 slot 是本语句新建的临时值，接管它（源不再释放，所有权直接转移）"""
+        if isinstance(slot, Temp) and slot.id in self.agg_owned_ids:
+            self.agg_owned = [x for x in self.agg_owned if x[0].id != slot.id]
+            self.agg_owned_ids.discard(slot.id)
+            return True
+        return False
+
+    def emit_init_agg(self, dst, src, ty: Type):
+        """把聚合值放进一个**新的**归属地（变量槽 / sret 缓冲 / 结构体字段）。
+
+        拷贝语义：逐字段各自加一次引用，两份值才能独立释放。
+        源若是本语句刚创建的临时值，所有权直接转移（不再多加一次）。
+        """
+        self.emit("MEMCPY", args=[dst, src], extra=ty.size, ty=ty)
+        if not self.take_agg_owned(src) and T.t_is_refcounted(ty):
+            self.emit_rcinc(dst, ty)
+
+    def emit_assign_agg(self, dst, src, ty: Type):
+        """覆盖一个**已经拥有值**的归属地：先给新值加引用，再释放旧值，最后拷贝。
+        （顺序很重要：`r.tag = r.tag` 这类自赋值、以及新旧值共享子对象时才不会误删。）"""
+        fresh = self.take_agg_owned(src)
+        if not fresh and T.t_is_refcounted(ty):
+            self.emit_rcinc(src, ty)
+        if T.t_is_refcounted(ty):
+            self.emit_rcdec_val(dst, ty)
+        self.emit("MEMCPY", args=[dst, src], extra=ty.size, ty=ty)
 
     def flush_owned(self):
         for v, ty in self.owned:
             self.emit_rcdec_val(v, ty)
         self.owned.clear()
         self.owned_ids.clear()
+        # 聚合临时值：没被 let / 赋值 / return 接管的，就在这里释放
+        # （例如 `print(mk(3).id)` 里那个用完就扔的结构体）
+        for slot, ty in self.agg_owned:
+            self.emit_rcdec_val(slot, ty)
+        self.agg_owned.clear()
+        self.agg_owned_ids.clear()
+
+    def flush_owned_since(self, ref_before: set, agg_before: set):
+        """释放「快照之后」新登记的 owned 临时引用。
+
+        defer 的实参（插值出来的字符串、方法调用的结果……）在 defer 真正执行时
+        才求值，而那时已经不在任何语句的收尾流程里，没人替它释放 —— 循环里写
+        `defer write("x{i} ")` 每轮就漏两个 FaStr（str(i) 与拼接结果）。
+        只释放快照之后新增的部分：快照里那些可能还被外层表达式拿着。
+        """
+        for v, ty in list(self.owned):
+            if v.id not in ref_before:
+                self.emit_rcdec_val(v, ty)
+        self.owned = [x for x in self.owned if x[0].id in ref_before]
+        self.owned_ids = {x[0].id for x in self.owned}
+        for slot, ty in list(self.agg_owned):
+            if slot.id not in agg_before:
+                self.emit_rcdec_val(slot, ty)
+        self.agg_owned = [x for x in self.agg_owned if x[0].id in agg_before]
+        self.agg_owned_ids = {x[0].id for x in self.agg_owned}
+
+    def gen_deferred(self, d):
+        """执行一条 defer：求值 -> 释放它自己产生的临时引用"""
+        ref_before = set(self.owned_ids)
+        agg_before = set(self.agg_owned_ids)
+        self.gen_expr(d)
+        self.flush_owned_since(ref_before, agg_before)
+
+    def unwind_to(self, stop_scope):
+        """把 stop_scope **之内**的作用域按 defer + 引用释放收尾（不清空登记表）。
+
+        break / continue 会直接跳走，被跳过的那些块里的 `defer` 和局部引用
+        就永远不会执行/释放了：`for i in 0..3 { defer write("d") ; break }`
+        的 defer 不跑，`while ... { let s = "a"+"b"; break }` 每轮漏一个 FaStr。
+        这里就地补一份清理指令再跳转 —— 和 return 走的 unwind_scopes 是同一套
+        道理；正常路径那份清理代码仍在原地，两条路径各自只执行一次。
+        """
+        sc = self.scope
+        while sc is not None and sc is not stop_scope:
+            for d in reversed(sc.defers):
+                self.gen_deferred(d)
+            for loc, ty in reversed(sc.drops):
+                self.emit_drop(loc, ty)
+            sc = sc.parent
+
+    def unwind_scopes(self):
+        """`return` 之前，把当前仍然打开的所有作用域的 defer 与引用释放补上。
+
+        以前 return 直接发 RET，导致：
+          * `defer` 只在「函数体自然结束」时执行，写了 return 就永远不执行；
+          * 局部引用（str / Vec / 含引用字段的结构体）一个都不释放 -> 每次调用都泄漏。
+        这里**不清空**作用域列表：正常路径仍由 pop_scope 收尾，
+        而 return 路径已经离开函数，两处代码不会同时执行。
+        """
+        sc = self.scope
+        while sc is not None:
+            for d in reversed(sc.defers):
+                self.gen_deferred(d)
+            for loc, ty in reversed(sc.drops):
+                self.emit_drop(loc, ty)
+            sc = sc.parent
 
     # ------------------------------------------------------------ 语句
     def gen_block(self, b: Block):
@@ -367,7 +913,9 @@ class FnGen:
         self.pop_scope()
 
     def gen_stmt(self, s: Stmt):
-        self.owned = []
+        # 注意：**不要**在这里重置 self.owned。
+        # 复合语句（if/while/for）会先求值条件再递归进入子语句，
+        # 子语句开头的重置会把条件里产生的临时引用直接丢掉（既不释放也不转移）。
         if isinstance(s, Block):
             if getattr(s, "flat", False):
                 for x in s.stmts:
@@ -393,13 +941,17 @@ class FnGen:
         elif isinstance(s, Break):
             if not self.loop_stack:
                 self.err("break 不在循环内", s)
+            self.unwind_to(self.loop_stack[-1][3])
             self.emit("JMP", extra=self.loop_stack[-1][1])
         elif isinstance(s, Continue):
             if not self.loop_stack:
                 self.err("continue 不在循环内", s)
+            self.unwind_to(self.loop_stack[-1][2])
             self.emit("JMP", extra=self.loop_stack[-1][0])
         elif isinstance(s, Defer):
             self.scope.defers.append(s.call)
+        elif isinstance(s, FnDef):
+            pass                    # 嵌套函数已被提升，由 generate() 单独生成
         elif isinstance(s, ExprStmt):
             self.gen_expr(s.expr)
         elif isinstance(s, Match):
@@ -410,13 +962,111 @@ class FnGen:
             self.err(f"未支持语句 {type(s).__name__}", s)
         self.flush_owned()
 
+    # ------------------------------------------------- 顶层 let（全局可变变量）
+    def is_global_name(self, name: str) -> bool:
+        """这个名字此刻指的是全局变量吗？（局部/形参同名时局部优先）"""
+        return name in self.sema.globals and self.scope.lookup(name) is None
+
+    def global_addr(self, name: str) -> Temp:
+        """取全局槽的地址（rip 相对），地位相当于局部变量的 alloca 槽。"""
+        g = self.sema.globals[name]
+        t = self.new_temp(ptr_to(g.ty))
+        self.emit("LEA_SYM", t, extra=g.label)
+        return t
+
+    def gen_global_read(self, name: str):
+        """读全局：和读局部变量一样给出**借用**引用（需要自己一份的调用方
+        ——`let s = g` / `v.push(g)`—— 会各自 inc，规则完全一致）。"""
+        gt = self.sema.globals[name].ty
+        addr = self.global_addr(name)
+        if is_agg(gt):
+            return addr                      # 数组：值就是那块存储本身
+        t = self.new_temp(gt)
+        self.emit("LOAD", t, [addr], extra=0, ty=gt)
+        return t
+
+    def gen_global_write(self, name: str, vexpr):
+        """写全局：引用计数类型要「新值取得一份 -> 放掉旧值 -> 存进去」。"""
+        gt = self.sema.globals[name].ty
+        raw = self.gen_expr(vexpr)
+        addr = self.global_addr(name)
+        if is_agg(gt):
+            self.emit_assign_agg(addr, raw, gt)
+            return
+        v = self.coerce(raw, vexpr.ty, gt)
+        if T.t_is_refcounted(gt):
+            if not self.take_owned(v, vexpr.ty):
+                self.emit_rcinc(v, gt)       # 全局取得自己的一份（活到进程结束）
+            old = self.new_temp(gt)
+            self.emit("LOAD", old, [addr], extra=0, ty=gt)
+            self.emit_rcdec_val(old, gt)     # 放掉被覆盖的旧值
+        self.emit("STORE", args=[addr, v], extra=0, ty=gt)
+
+    def gen_global_inits(self):
+        """main 的第一条用户语句之前，把每个顶层 let 的初值算一遍。
+
+        没有初值的标量（`let n: i64`）不用管：槽在 .bss 里，天然就是零值。
+        引用计数类型不行 —— .bss 的零就是 NULL：`let gv: Vec<i64>` 之后
+        `gv.push(1)` 静默失效（fa_vec_push 对 NULL 直接返回）、`gv.to_str()` 段错误，
+        结构体/数组全局里的 str 与容器字段同理。这些也在这里建出真的空对象
+        （全局活到进程结束，引用交给 .bss 里那个槽拿着，LSan 认它是根，不算泄漏）。
+        """
+        for d in getattr(self.sema, "global_decls", []):
+            if d.init is None:
+                # 类型要拿**解析过的**那份：d.ty 在写了类型名的声明上是 AST 的 TName
+                # （`let gv: Vec<i64>`），读 .kind 直接 AttributeError 把编译器打崩。
+                gt = self.sema.globals[d.name].ty
+                addr = self.global_addr(d.name)
+                if is_agg(gt):
+                    self.emit_zero_agg(addr, gt)
+                elif gt is not None and gt.kind in ("str", "vec", "map"):
+                    v = self.tail_zero_value(gt)
+                    self.take_owned(v, gt)
+                    self.emit("STORE", args=[addr, v], extra=0, ty=gt)
+                continue
+            self.gen_global_write(d.name, d.init)
+
     def gen_let(self, s: Let):
         ty = s.sym.ty
+        if not is_agg(ty) and (getattr(s.sym, "addr_taken", False)
+                               or s.name in getattr(self, "addr_taken_names", ())):
+            # 见 _addr_taken_roots：地址必须在声明处就确定下来，不能等到
+            # 某个分支里第一次写 &x 才溢出，否则另一个分支拿到的是死寄存器。
+            slot = self.emit_alloca(max(ty.size, 1))
+            if s.init is None:
+                if T.t_is_refcounted(ty):
+                    z = self.tail_zero_value(ty)
+                    self.take_owned(z, ty)
+                    self.emit("STORE", args=[slot, z], extra=0, ty=ty)
+                else:
+                    self.emit("STORE", args=[slot, self.const_zero(ty)],
+                              extra=0, ty=ty)
+            else:
+                v = self.gen_expr(s.init)
+                cv = self.coerce(v, s.init.ty, ty)
+                self.emit("STORE", args=[slot, cv], extra=0, ty=ty)
+                if T.t_is_refcounted(ty):
+                    if not self.take_owned(v, s.init.ty):
+                        self.emit_rcinc(v, s.init.ty)
+            loc = VarLoc("mem", slot, ty, sym=s.sym)
+            self.scope.vars[s.name] = loc
+            self.scope.drops.append((loc, ty))
+            return
         if s.init is None:
             if is_agg(ty):
                 slot = self.emit_alloca(ty.size)
                 self.emit("ZERO", args=[slot], extra=ty.size)
+                # memset 0 只够标量：引用计数的槽位得放**真的空对象**（见 emit_zero_agg）
+                self.emit_zero_agg(slot, ty)
                 loc = VarLoc("mem", slot, ty, sym=s.sym)
+            elif ty.kind in ("str", "vec", "map"):
+                # `let v: Vec<i64>` 以前拿到的是 const_zero，也就是 NULL：
+                # `v.to_str()` 当场段错误，`v.push(1)` / `m.set(k, v)` 静默失效
+                # （fa_vec_push / fa_map_set 对 NULL 直接返回），而 to_str 打出来
+                # 还是 `[]` / `{}`，看着像空表其实什么都没有。
+                t = self.tail_zero_value(ty)
+                self.take_owned(t, ty)        # 所有权归这个变量，语句末尾别再放一次
+                loc = VarLoc("temp", t, ty, sym=s.sym)
             else:
                 t = self.new_temp(ty)
                 self.emit("MOV", t, [self.const_zero(ty)], ty=ty)
@@ -427,7 +1077,7 @@ class FnGen:
         if is_agg(ty):
             v = self.gen_expr(s.init)
             slot = self.emit_alloca(ty.size)
-            self.emit("MEMCPY", args=[slot, v], extra=ty.size, ty=ty)
+            self.emit_init_agg(slot, v, ty)
             loc = VarLoc("mem", slot, ty, sym=s.sym)
         else:
             t = self.new_temp(ty)
@@ -456,6 +1106,9 @@ class FnGen:
     def gen_assign(self, s: Assign):
         tgt = s.target
         vty = s.value.ty
+        if isinstance(tgt, NameRef) and self.is_global_name(tgt.name):
+            self.gen_global_write(tgt.name, s.value)
+            return
         if isinstance(tgt, NameRef):
             loc = self.scope.lookup(tgt.name)
             if loc is None:
@@ -472,6 +1125,11 @@ class FnGen:
                 if raw is not loc.val:
                     self.emit("MOV", loc.val, [raw], ty=loc.ty)
                 return
+            if is_agg(loc.ty) and loc.kind == "mem":
+                # 结构体/数组变量赋值：必须「加新值引用 -> 放旧值 -> 拷贝」，
+                # 少了第一步就是双重释放（实测 free(): double free detected）。
+                self.emit_assign_agg(loc.val, raw, loc.ty)
+                return
             v = self.coerce(raw, vty, loc.ty)
             if T.t_is_refcounted(loc.ty):
                 self.emit_rcinc(v, loc.ty)
@@ -484,44 +1142,54 @@ class FnGen:
             if loc.kind == "temp":
                 self.emit("MOV", loc.val, [v], ty=loc.ty)
             else:
-                if is_agg(loc.ty):
-                    self.emit("MEMCPY", args=[loc.val, v], extra=loc.ty.size, ty=loc.ty)
-                else:
-                    self.emit("STORE", args=[loc.val, v], extra=0, ty=loc.ty)
+                self.emit("STORE", args=[loc.val, v], extra=0, ty=loc.ty)
             return
         # 复合左值：字段 / 下标 / 解引用
+        if isinstance(tgt, Slice):
+            self.err("切片不能当赋值目标：a[1:3] 给的是一份新值，不是原表的一段视图。"
+                     "要改原表就逐个下标赋值，或者整段替换掉", s)
+        if isinstance(tgt, Index) and tgt.obj.ty is not None \
+                and tgt.obj.ty.kind in ("vec", "map"):
+            # v[i] = x / m[k] = v：走运行时（要维护引用计数），不能当普通内存写
+            self.gen_subscript_write(tgt, s.value)
+            return
         ptr, off, fty = self.gen_addr(tgt)
         v = self.coerce(self.gen_expr(s.value), vty, fty)
+        if is_agg(fty):
+            base = self.new_temp(ptr_to(fty))
+            self.emit("LEA", base, [ptr], extra=off)
+            self.emit_assign_agg(base, v, fty)
+            return
         if T.t_is_refcounted(fty):
             self.emit_rcinc(v, fty)
             old = self.new_temp(fty)
             self.emit("LOAD", old, [ptr], extra=off, ty=fty)
             self.emit_rcdec_val(old, fty)
-        if is_agg(fty):
-            base = self.new_temp(ptr_to(fty))
-            self.emit("LEA", base, [ptr], extra=off)
-            self.emit("MEMCPY", args=[base, v], extra=fty.size, ty=fty)
-        else:
-            self.emit("STORE", args=[ptr, v], extra=off, ty=fty)
+        self.emit("STORE", args=[ptr, v], extra=off, ty=fty)
 
     def gen_return(self, s: Return):
         ret = self.fnsym.ret
         if s.value is None:
             self.flush_owned()
+            self.unwind_scopes()
             self.emit("RET")
             return
         v = self.gen_expr(s.value)
         if is_agg(ret):
-            dstp = self.fn.params[0]
-            self.emit("MEMCPY", args=[dstp, v], extra=ret.size, ty=ret)
-        else:
-            v = self.coerce(v, s.value.ty, ret)
-            if T.t_is_refcounted(ret):
-                self.emit_rcinc(v, s.value.ty)     # 返回值 owned 转移给调用方
-            self.emit("RET", args=[v], ty=ret)
-        self.flush_owned()
-        if is_agg(ret):
+            # 写进调用方给的 sret 缓冲；调用方从此独立拥有这份值
+            self.emit_init_agg(self.fn.params[0], v, ret)
+            self.flush_owned()
+            self.unwind_scopes()
             self.emit("RET", args=[self.fn.params[0]])
+            return
+        v = self.coerce(v, s.value.ty, ret)
+        if T.t_is_refcounted(ret):
+            self.emit_rcinc(v, s.value.ty)     # 返回值 owned 转移给调用方
+        # 顺序：先给调用方加好引用 -> 释放本语句临时值 -> 执行 defer 与局部释放 -> 返回。
+        # （以前 RET 之后才发这些指令，等于全是死代码：defer 不执行、局部引用全泄漏。）
+        self.flush_owned()
+        self.unwind_scopes()
+        self.emit("RET", args=[v], ty=ret)
         return
 
     def gen_if(self, s: If):
@@ -529,19 +1197,113 @@ class FnGen:
         end = self.new_label("ifend")
         self.gen_if_chain(pairs, s.orelse, end)
 
-    def gen_if_chain(self, pairs, orelse, end):
+    def gen_if_chain(self, pairs, orelse, end, dst=None):
+        """dst 不为空时是「if 作为表达式」：每个分支把尾表达式的值写进 dst。"""
         for i, (cond, body) in enumerate(pairs):
             c = self.gen_cond(cond)
             cur = self.new_label("ifbody")
             nxt = self.new_label("elif")
             self.emit("BR", args=[c], extra=(cur, nxt))
             self.emit("LABEL", extra=cur)
-            self.gen_block(body)
+            self.gen_block_value(body, dst) if dst is not None else self.gen_block(body)
             self.emit("JMP", extra=end)
             self.emit("LABEL", extra=nxt)
         if orelse is not None:
-            self.gen_block(orelse)
+            self.gen_block_value(orelse, dst) if dst is not None \
+                else self.gen_block(orelse)
         self.emit("LABEL", extra=end)
+
+    def _value_slot(self, ty: Type):
+        """if / match 表达式的结果归属地：标量用寄存器临时值，聚合用栈槽。"""
+        hint = self.take_hint()
+        if is_agg(ty):
+            slot = self.emit_alloca(ty.size)
+            self.mark_agg_owned(slot, ty)
+            return slot
+        return self.hint_or_new(hint, ty)
+
+    def gen_if_value(self, e: If):
+        """`let x = if c { a } else { b }` —— 结果统一放进一个临时变量/栈槽。"""
+        r = self._value_slot(e.ty)
+        end = self.new_label("ifend")
+        self.gen_if_chain([(e.cond, e.body)] + list(e.elifs), e.orelse, end, dst=r)
+        return r
+
+    def gen_block_value(self, b: Block, dst):
+        """执行分支里的语句，把最后一条表达式语句的值放进 dst。
+
+        引用计数类型的所有权照 `gen_let` 的规则处理：分支里新建的临时引用直接
+        交给 dst（`take_owned`），来自变量/字面量的则 rc_inc 一份 —— 这样
+        `let s = if c { "a" } else { other }` 既不会漏放也不会双放。
+        """
+        if getattr(b, "diverges", False):
+            self.gen_block(b)          # return / break / panic：不产出值
+            return
+        # 进分支前先记下「已经存在的」临时引用：它们由外层语句负责释放
+        # （条件表达式产生的引用两条分支都可能用到，不能在分支里放掉）
+        ref_before = set(self.owned_ids)
+        agg_before = set(self.agg_owned_ids)
+        self.push_scope()
+        # 三条产出路径（值就是 dst / 聚合 / 标量）都要在**分支内**收尾，
+        # 所以用 try...finally：漏掉任何一条，分支里的中间引用就会跑到分支外
+        # 才释放，另一条分支执行时那些寄存器装的是无关的值。
+        try:
+            stmts = [x for x in b.stmts if x is not None]
+            for st in stmts[:-1]:
+                self.gen_stmt(st)
+            tail = stmts[-1]
+            if isinstance(tail, ExprStmt):
+                v, sty = self.gen_expr(tail.expr), tail.expr.ty
+            else:
+                # 嵌套的 if / match 表达式：尽量让它直接算进 dst
+                self.hint = dst
+                v = self.gen_expr(tail)
+                self.hint = None
+                sty = tail.ty
+            if v is dst:
+                return
+            if is_agg(sty):
+                # 聚合结果：分支里新建的值直接把所有权移交给 dst（emit_init_agg
+                # 内部会 take_agg_owned），来自变量的则拷一份并逐字段加引用。
+                # 判定用的是**尾表达式的类型**：dst 是 emit_alloca 出来的槽，
+                # 它自己的 .ty 是 *u8（指向槽的指针），不是聚合类型。
+                self.emit_init_agg(dst, v, sty)
+                return
+            if sty != dst.ty:
+                v = self.coerce(v, sty, dst.ty)   # 只可能是数值提升（sema 已统一过）
+            if T.t_is_refcounted(dst.ty):
+                if not self.take_owned(v, sty):
+                    self.emit_rcinc(v, sty)
+                self.mark_owned(dst, dst.ty)
+            self.emit("MOV", dst, [v], ty=dst.ty)
+        finally:
+            self.pop_scope()
+            self.release_new_refs(dst, ref_before, agg_before)
+
+    def release_new_refs(self, keep, ref_before, agg_before):
+        """在**分支内部**释放这个分支自己新建的临时引用（`keep` 除外）。
+
+        `self.owned` / `self.agg_owned` 是**语句级**的：if / match 当表达式用时，
+        分支里产生的中间引用（例如 `"n{i}"` 插值过程中的 `str(i)` 与 concat 结果）
+        要是留到语句末尾才释放，那时已经在分支外面了 —— 走另一条分支的执行路径上，
+        那些寄存器里装的是完全无关的值。实测
+        `let t = if i % 2 == 0 { mk(i) } else { P { x: i, name: "n{i}" } }`
+        会把循环下标当成对象指针做 rc_dec，直接段错误。
+
+        之前就存在的引用（条件表达式产生的）不动，仍由外层语句释放：
+        它们的活跃区间横跨整个 if，寄存器分配器不会在分支里复用。
+        """
+        for v, ty in list(self.owned):
+            if v.id not in ref_before and v is not keep:
+                self.emit_rcdec_val(v, ty)
+        self.owned = [x for x in self.owned if x[0].id in ref_before or x[0] is keep]
+        self.owned_ids = {x[0].id for x in self.owned}
+        for slot, ty in list(self.agg_owned):
+            if slot.id not in agg_before and slot is not keep:
+                self.emit_rcdec_val(slot, ty)
+        self.agg_owned = [x for x in self.agg_owned
+                          if x[0].id in agg_before or x[0] is keep]
+        self.agg_owned_ids = {x[0].id for x in self.agg_owned}
 
     def gen_for_c(self, s):
         """for (init; cond; step) { body } —— 展开为
@@ -559,7 +1321,9 @@ class FnGen:
         end_lbl = self.new_label("fend")
         self.emit("JMP", extra=cond_lbl)
         self.emit("LABEL", extra=body_lbl)
-        self.loop_stack.append((cont_lbl, end_lbl))   # (continue, break)
+        # 这层作用域（装 `let i = 0`）在 end_lbl 之后才 pop，break / continue
+        # 都会经过那里，所以清理只做到这层为止，不重复释放
+        self.loop_stack.append((cont_lbl, end_lbl, self.scope, self.scope))
         self.gen_block(s.body)
         self.loop_stack.pop()
         self.emit("LABEL", extra=cont_lbl)
@@ -568,6 +1332,8 @@ class FnGen:
         self.emit("LABEL", extra=cond_lbl)
         if s.cond is not None:
             c = self.gen_cond(s.cond)
+            # 同 gen_while：C 风格 for 的条件也是每轮重新求值，临时引用要每轮放
+            self.flush_owned()
             self.emit("BR", args=[c], extra=(body_lbl, end_lbl))
         else:
             self.emit("JMP", extra=body_lbl)
@@ -580,9 +1346,18 @@ class FnGen:
         end = self.new_label("wend")
         self.emit("LABEL", extra=top)
         c = self.gen_cond(s.cond)
+        # 循环条件里新建的临时引用必须**每一轮**释放。
+        # flush_owned 是语句收尾时做的，而循环条件不属于任何一条语句的收尾：
+        # `while n > 1 and p.slice(n - 1, n) == "/"` 每轮都 slice 出一个新 FaStr，
+        # 一个都没人放。更坏的是 mark_owned 按 Temp.id 去重，第二轮拿到的还是
+        # 同一个虚拟寄存器，登记不进去 —— 最后只释放了末一轮那个对象，
+        # 前面每轮都漏（ASan: 18 byte(s) leaked in 1 allocation(s)）。
+        # 放在 BR 之前，跳去 body 还是跳去 end 都已经清干净了。
+        self.flush_owned()
         self.emit("BR", args=[c], extra=(body, end))
         self.emit("LABEL", extra=body)
-        self.loop_stack.append((top, end))
+        outer = self.scope
+        self.loop_stack.append((top, end, outer, outer))
         self.gen_block(s.body)
         self.loop_stack.pop()
         self.emit("JMP", extra=top)
@@ -592,7 +1367,8 @@ class FnGen:
         top = self.new_label("loop")
         end = self.new_label("loopE")
         self.emit("LABEL", extra=top)
-        self.loop_stack.append((top, end))
+        outer = self.scope
+        self.loop_stack.append((top, end, outer, outer))
         self.gen_block(s.body)
         self.loop_stack.pop()
         self.emit("JMP", extra=top)
@@ -604,9 +1380,20 @@ class FnGen:
         top = self.new_label("for")
         body = self.new_label("fbody")
         end = self.new_label("fend")
+        # step 提前建好：Map 是按槽位遍历的，循环体开头就要能跳到「自增那一步」
+        # （标签只是个名字，真正 LABEL 出来的位置没变）
+        step = self.new_label("fstep")
         idx = self.new_temp(I64)
         limit = self.new_temp(I64)
         vloc = None
+        # 可迭代对象只求值**一次**，并在整个循环期间持有它。
+        # 以前循环体里会再 gen_expr 一遍：对变量只是浪费，对**函数调用**
+        # （`for k in m.keys()`）却是每轮都新建一个容器，而它那条 RCDEC 被
+        # 语句级的 flush 放进了循环体 —— 于是每轮都放一次，第二轮就把还在用的
+        # 对象释放掉了（实测 malloc(): unaligned tcache chunk detected）。
+        obj = None
+        arr_ptr = arr_off = None
+        held = False
         if isinstance(it, Range) or ity.kind == "range":
             if isinstance(it, Range):
                 se, ee = it.start, it.end
@@ -623,7 +1410,12 @@ class FnGen:
             self.emit("MOV", idx, [self.coerce(start, I64, I64)], ty=I64)
             self.emit("MOV", limit, [self.coerce(stop, I64, I64)], ty=I64)
         else:
-            obj = self.gen_expr(it)
+            if ity.kind == "arr":
+                arr_ptr, arr_off, _ = self.gen_addr(it)
+            else:
+                obj = self.gen_expr(it)
+                # 从语句级所有权表里摘出来，循环结束后由本函数自己释放一次
+                held = self.take_owned(obj, ity)
             n = self.new_temp(I64)
             if ity.kind == "vec":
                 self.emit("CALL", n, [Sym("fa_vec_len"), obj], ty=I64)
@@ -632,7 +1424,9 @@ class FnGen:
             elif ity.kind == "arr":
                 n = self.const(ity.count)
             elif ity.kind == "map":
-                self.emit("CALL", n, [Sym("fa_map_len"), obj], ty=I64)
+                # 按**槽位**数遍历，不是按键数：fa_map_key_at(obj, idx) 那种
+                # 「第 idx 个占用槽」每调一次都从头扫，`for k in m` 就成了 O(n·cap)。
+                self.emit("CALL", n, [Sym("fa_map_cap"), obj], ty=I64)
             else:
                 self.err(f"暂不支持遍历 {ity}", s)
             self.emit("MOV", idx, [self.const(0)], ty=I64)
@@ -644,52 +1438,127 @@ class FnGen:
         self.emit("LABEL", extra=body)
         sc = self.push_scope()
         vty = s.sym.ty
-        vt = self.new_temp(vty)
+        vt = None
+        vloc = None
         if isinstance(it, Range) or ity.kind == "range":
+            vt = self.new_temp(vty)
             self.emit("MOV", vt, [idx], ty=vty)
         elif ity.kind == "vec":
-            obj = self.gen_expr(it)
-            r = self.new_temp(vty)
-            self.emit("CALL", r, [Sym("fa_vec_get"), obj, idx], ty=vty)
-            # fa_vec_get 返回借用引用（未 inc），不能登记为 owned
-            self.emit("MOV", vt, [self.coerce(r, vty, vty)], ty=vty)
+            et = ity.elem
+            if is_agg(et):
+                # 结构体/枚举元素在槽里存的是**装箱指针**，所以循环变量要绑成
+                # 「指向该对象的指针」（与 v[i] 一致）。以前绑成一个值类型的临时量，
+                # 里面装的其实是指针，`for s in v: print(s.a)` 打出来是地址。
+                r = self.new_temp(ptr_to(et))
+                self.emit("CALL", r, [Sym("fa_vec_get"), obj, idx], ty=ptr_to(et))
+                # fa_vec_get 返回借用引用（未 inc），不能登记为 owned
+                vloc = VarLoc("temp", r, et, borrowed=True, is_ptr=True)
+            else:
+                vt = self.new_temp(vty)
+                if et.is_float:
+                    # fa_vec_get 返回 uint64_t 位模式（在 rax 里）。以前把 CALL 的
+                    # 目标类型直接标成 f64，asmgen 就去读 xmm0 —— `for x in Vec<f64>`
+                    # 拿到的全是垃圾（实测 4.94e-324）。
+                    raw = self.new_temp(I64)
+                    self.emit("CALL", raw, [Sym("fa_vec_get"), obj, idx], ty=I64)
+                    self.emit("MOV", vt, [self.bitcast(raw, et)], ty=et)
+                else:
+                    r = self.new_temp(vty)
+                    self.emit("CALL", r, [Sym("fa_vec_get"), obj, idx], ty=vty)
+                    self.emit("MOV", vt, [self.coerce(r, vty, vty)], ty=vty)
         elif ity.kind == "str":
-            obj = self.gen_expr(it)
-            r = self.new_temp(vty)
+            vt = self.new_temp(vty)
+            r = self.new_temp(I64)
             self.emit("CALL", r, [Sym("fa_str_byte"), obj, idx], ty=I64)
             self.emit("MOV", vt, [self.coerce(r, I64, vty)], ty=vty)
         elif ity.kind == "map":
-            obj = self.gen_expr(it)
-            r = self.new_temp(vty)
-            self.emit("CALL", r, [Sym("fa_map_key_at"), obj, idx], ty=vty)
-            self.emit("MOV", vt, [self.coerce(r, vty, vty)], ty=vty)
+            # 空槽（state 0）与墓碑（state -1，del 留下的）直接跳到自增。
+            # 作用域已经 push 过了，而 step 那边会 pop，所以配平。
+            used = self.new_temp(I64)
+            self.emit("CALL", used, [Sym("fa_map_slot_used"), obj, idx], ty=I64)
+            unused = self.new_temp(BOOL)
+            self.emit("CMP", unused, [used, self.const(0)], extra="==", ty=I64)
+            proceed = self.new_label("mapslot")
+            self.emit("BR", args=[unused], extra=(step, proceed))
+            self.emit("LABEL", extra=proceed)
+            vt = self.new_temp(vty)
+            kt = ity.key
+            if kt is not None and kt.is_float:
+                raw = self.new_temp(I64)
+                self.emit("CALL", raw, [Sym("fa_map_slot_key"), obj, idx], ty=I64)
+                self.emit("MOV", vt, [self.bitcast(raw, kt)], ty=kt)
+            else:
+                r = self.new_temp(vty)
+                self.emit("CALL", r, [Sym("fa_map_slot_key"), obj, idx], ty=vty)
+                self.emit("MOV", vt, [self.coerce(r, vty, vty)], ty=vty)
         elif ity.kind == "arr":
-            ptr, off, _ = self.gen_addr(it)
+            ptr, off = arr_ptr, arr_off
             i8 = self.new_temp(I64)
             self.emit("BIN", i8, [idx, self.const(max(ity.elem.size, 1))], extra="*", ty=I64)
             t2 = self.new_temp(I64)
             self.emit("BIN", t2,
                       [i8, self.const(off if isinstance(off, int) else 0)],
                       extra="+", ty=I64)
-            r = self.new_temp(vty)
-            self.emit("LOAD", r, [ptr], extra=t2, ty=vty)
-            self.emit("MOV", vt, [r], ty=vty)
-        sc.vars[s.var] = VarLoc("temp", vt, vty)
-        self.loop_stack.append((top, end))
+            if is_agg(vty):
+                # 元素是结构体/枚举：拷一份到本次迭代的栈槽（引用计数 +1，
+                # 作用域退出时照常释放）。以前直接 LOAD 一个 16 字节的「值」，
+                # asmgen 的宽度表里只有 1/2/4/8，编译期就 KeyError: 16。
+                base = self.new_temp(ptr_to(vty))
+                self.emit("LEA", base, [ptr], extra=t2)
+                slot = self.emit_alloca(vty.size)
+                self.emit_init_agg(slot, base, vty)
+                self.mark_agg_owned(slot, vty)
+                vloc = VarLoc("mem", slot, vty)
+            else:
+                vt = self.new_temp(vty)
+                self.emit("LOAD", vt, [ptr], extra=t2, ty=vty)
+        if vloc is None:
+            vloc = VarLoc("temp", vt, vty)
+        sc.vars[s.var] = vloc
+        # continue 必须跳到「自增之前」，不能跳到循环头：下标自增是在循环体
+        # 之后发的，跳到 top 就等于永远不自增 —— `for k in 0..5 { if k == 2 {
+        # continue } }` 会**死循环挂住**（while / C 风格 for / loop 各自都对，
+        # 只有 for-in 这条把 continue 目标写成了 top）。
+        # 标签放在 pop_scope 之前，这样 continue 与正常走完一轮一样，
+        # 都会执行本次迭代的作用域清理（defer / 块内引用）再自增。
+        self.loop_stack.append((step, end, sc, sc.parent))
         self.gen_block(s.body)
         self.loop_stack.pop()
+        self.emit("LABEL", extra=step)
         self.pop_scope()
         self.emit("BIN", idx, [idx, self.const(1)], extra="+", ty=I64)
         self.emit("JMP", extra=top)
         self.emit("LABEL", extra=end)
+        if held:
+            # 循环之后释放一次（break 也跳到 end，所以每条路径都覆盖到）
+            self.emit_rcdec_val(obj, ity)
 
-    def gen_match(self, s: Match):
+    def bind_variant_payload(self, subj, pat):
+        """把当前变体的载荷绑定成局部变量（每个绑定都拥有自己的一份引用）"""
+        for name, off, fty in (getattr(pat, "bindings", None) or []):
+            sp = self.new_temp(ptr_to(fty))
+            self.emit("LEA", sp, [subj], extra=8 + off)     # 8 = tag 宽度
+            if is_agg(fty):
+                slot = self.emit_alloca(fty.size)
+                self.emit_init_agg(slot, sp, fty)
+                loc = VarLoc("mem", slot, fty)
+            else:
+                t = self.new_temp(fty)
+                self.emit("LOAD", t, [sp], extra=0, ty=fty)
+                if T.t_is_refcounted(fty):
+                    self.emit_rcinc(t, fty)
+                loc = VarLoc("temp", t, fty)
+            self.scope.vars[name] = loc
+            self.scope.drops.append((loc, fty))
+
+    def gen_match(self, s: Match, dst=None):
         subj = self.gen_expr(s.subject)
         sty = s.subject.ty
         end = self.new_label("matchend")
         for arm in s.arms:
             body_lbl = self.new_label("arm")
             skip_lbl = self.new_label("armskip")
+            self.push_scope()                       # 载荷绑定只在本分支可见
             if isinstance(arm.pattern, str):        # 通配 _
                 pass
             else:
@@ -700,6 +1569,9 @@ class FnGen:
                     self.emit("CMP", c,
                               [tag, self.const(arm.pattern.variant_index)],
                               extra="==", ty=I64)
+                    self.emit("BR", args=[c], extra=(body_lbl, skip_lbl))
+                    self.emit("LABEL", extra=body_lbl)
+                    self.bind_variant_payload(subj, arm.pattern)
                 else:
                     pv = self.gen_expr(arm.pattern)
                     c = self.new_temp(BOOL)
@@ -712,12 +1584,22 @@ class FnGen:
                                   [self.coerce(subj, sty, I64),
                                    self.coerce(pv, arm.pattern.ty, I64)],
                                   extra="==", ty=I64)
-                self.emit("BR", args=[c], extra=(body_lbl, skip_lbl))
-                self.emit("LABEL", extra=body_lbl)
-            self.gen_block(arm.body)
+                    self.emit("BR", args=[c], extra=(body_lbl, skip_lbl))
+                    self.emit("LABEL", extra=body_lbl)
+            if dst is not None:
+                self.gen_block_value(arm.body, dst)
+            else:
+                self.gen_block(arm.body)
+            self.pop_scope()
             self.emit("JMP", extra=end)
             self.emit("LABEL", extra=skip_lbl)      # 不匹配 -> 试下一个分支
         self.emit("LABEL", extra=end)
+
+    def gen_match_value(self, s: Match):
+        """`let x = match v { ... }` —— 每个分支把尾表达式的值写进同一个归属地。"""
+        r = self._value_slot(s.ty)
+        self.gen_match(s, dst=r)
+        return r
 
     # ------------------------------------------------------------ 条件
     def gen_cond(self, e: Expr) -> Temp:
@@ -762,6 +1644,10 @@ class FnGen:
             return self.gen_binary(e)
         if isinstance(e, Unary):
             return self.gen_unary(e)
+        if isinstance(e, If):
+            return self.gen_if_value(e)
+        if isinstance(e, Match):
+            return self.gen_match_value(e)
         if isinstance(e, Cast):
             return self.gen_cast(e)
         if isinstance(e, Call):
@@ -770,6 +1656,8 @@ class FnGen:
             return self.gen_method(e)
         if isinstance(e, Index):
             return self.gen_index(e)
+        if isinstance(e, Slice):
+            return self.gen_slice(e)
         if isinstance(e, Field):
             return self.gen_field(e)
         if isinstance(e, ArrayLit):
@@ -801,12 +1689,15 @@ class FnGen:
         return loc
 
     def gen_nameref(self, e: NameRef):
-        if e.name in self.sema.globals:
-            g = self.sema.globals[e.name]
-            t = self.new_temp(g.ty)
-            self.emit("LOAD", t, [Sym(g.name)], extra=0, ty=g.ty)
-            return t
-        if e.name in self.sema.consts:
+        if self.is_global_name(e.name):
+            return self.gen_global_read(e.name)
+        # 常量替换必须排在「这名字在本作用域里是不是个变量」之后：sema 解析
+        # 标识符的顺序是 局部 -> 全局 -> 函数 -> 类型 -> 常量，所以
+        #     const K: i64 = 5
+        #     fn main(): let K = 99; print(K)
+        # 里的 K 是那个局部变量。这里却先查了 sema.consts，于是 print(K)
+        # 悄悄打出 5 —— 局部那份根本没被读过，编译器也不吭声。
+        if e.name in self.sema.consts and not isinstance(e.resolved, VarSym):
             return self.gen_expr(self.sema.consts[e.name])
         if e.resolved == "ns":
             return Const(0, I64)
@@ -853,6 +1744,22 @@ class FnGen:
         self.emit("STRCONST", t, extra=idx, ty=STR)
         return t
 
+    def _is_cstr_ptr(self, ty: Type) -> bool:
+        """`*u8` / `*char` —— C 互操作里的 `char *`。
+
+        绑 C 头文件时，结构体字段经常是定长 char 数组（struct dirent 的 d_name
+        是 char[256]），`&x.d_name[0]` 拿到的是 *char。按 C 的规矩这种指针就是
+        字符串，print / str() 该打**内容**而不是地址。以前只认 *u8，于是
+        `print(str(&e.d_name[0]))` 打出来是 0x800d2e3，非得先手动 `as *u8`
+        （或者改用 cstr()）才行 —— 绑库的时候十次有九次会踩。
+        """
+        inner = getattr(ty, "inner", None)
+        if ty is None or ty.kind != "ptr" or not isinstance(inner, Type):
+            return False
+        if inner.kind == "char":
+            return True
+        return inner.kind == "int" and inner.name == "u8"
+
     def gen_to_str(self, v, ty: Type) -> Temp:
         r = self.new_temp(STR)
         if ty == STR:
@@ -867,18 +1774,517 @@ class FnGen:
         elif ty == CHAR:
             self.emit("CALL", r, [Sym("fa_str_of_char"), v], ty=STR)
         elif ty.kind == "ptr":
-            self.emit("CALL", r, [Sym("fa_str_of_ptr"), v], ty=STR)
+            # *u8 就是 C 的 char*：按 NUL 结尾字符串取内容，而不是打印地址
+            # （C 函数返回 const char* 时，这是把文本拿回 FA 的唯一途径）
+            if self._is_cstr_ptr(ty):
+                self.emit("CALL", r, [Sym("fa_str_from_cstr"), v], ty=STR)
+            else:
+                self.emit("CALL", r, [Sym("fa_str_of_ptr"), v], ty=STR)
         elif ty.kind == "vec" or ty.kind == "map":
+            if self._container_has_agg(ty):
+                # 元素里有结构体/枚举：运行时只会打 `{...}`，这一种在编译期自己拼
+                return self.gen_container_to_str_agg(v, ty)
             self.emit("CALL", r, [Sym("fa_container_to_str"), v,
                                   self.const(1 if ty.kind == "vec" else 2)], ty=STR)
         elif ty.kind == "pyobj":
             self.emit("CALL", r, [Sym("fa_py_to_str"), v], ty=STR)
         elif ty.kind == "jobj":
             self.emit("CALL", r, [Sym("fa_jvm_to_str"), v], ty=STR)
-        elif ty.kind == "struct" or ty.kind == "arr" or ty.kind == "enum":
-            self.emit("CALL", r, [Sym("fa_str_of_ptr"), v], ty=STR)
+        elif ty.kind == "struct":
+            u = self.user_to_str(ty)
+            if u is not None:
+                return self.call_user_to_str(u, v)
+            return self.gen_struct_to_str(v, ty)
+        elif ty.kind == "enum":
+            u = self.user_to_str(ty)
+            if u is not None:
+                return self.call_user_to_str(u, v)
+            return self.gen_enum_to_str(v, ty)
+        elif ty.kind == "arr":
+            return self.gen_arr_to_str(v, ty)
         else:
             self.emit("CALL", r, [Sym("fa_str_of_ptr"), v], ty=STR)
+        self.mark_owned(r, STR)
+        return r
+
+    # ------------------------------------------- 容器里装着结构体 / 枚举时的 to_str
+    def _container_has_agg(self, ty: Type) -> bool:
+        """容器里（含嵌套几层）有没有结构体 / 枚举 / 数组元素。
+
+        运行时的 fa_container_to_str 只认元素 kind，结构体/枚举一律打成 `{...}`
+        —— 可 `print(v[0])` 明明是 `P { x: 1, y: 甲 }`。字段名只有编译器知道，
+        所以这种情况在编译期展开一个循环，逐元素调用 struct/enum 的 to_str。
+        """
+        if ty is None:
+            return False
+        if ty.kind == "vec":
+            return self._ty_has_agg(ty.elem)
+        if ty.kind == "map":
+            return self._ty_has_agg(ty.key) or self._ty_has_agg(ty.val)
+        return False
+
+    def _ty_has_agg(self, t) -> bool:
+        if t is None:
+            return False
+        # 数组元素也算：运行时同样只认 kind，`Vec<[i64; 3]>.to_str()` 打出来是
+        # [{...}, {...}]，可 `print(v[0])` 明明是 [1, 2, 3]。编译期知道长度和元素类型，
+        # 交给 gen_arr_to_str 展开就行（元素在槽里也是装箱的，取值路径和结构体一致）。
+        if t.kind in ("struct", "enum", "arr"):
+            return True
+        if t.kind in ("vec", "map"):
+            return self._container_has_agg(t)
+        return False
+
+    def _vec_elem_at(self, obj, i, et: Type):
+        """取 Vec 的第 i 个元素（和 gen_for 里同一套取值规则）。"""
+        if is_agg(et):
+            # 结构体/枚举在槽里存的是**装箱指针**；fa_vec_get 返回借用引用
+            p = self.new_temp(ptr_to(et))
+            self.emit("CALL", p, [Sym("fa_vec_get"), obj, i], ty=ptr_to(et))
+            return p
+        if et.is_float:
+            raw = self.new_temp(I64)
+            self.emit("CALL", raw, [Sym("fa_vec_get"), obj, i], ty=I64)
+            return self.bitcast(raw, et)
+        r = self.new_temp(et)
+        self.emit("CALL", r, [Sym("fa_vec_get"), obj, i], ty=et)
+        return r
+
+    def _map_slot_at(self, obj, i, t: Type, is_key: bool):
+        """取 Map **第 i 个槽位**上的键 / 值（调用方自己跳过未占用的槽）。
+
+        以前这里调 fa_map_key_at(m, i)，那是「第 i 个**占用**槽」—— 每调一次都要
+        从头扫一遍表，于是 Map 的 to_str 是 O(n·cap)：一万个键的表打一次要几秒。
+        """
+        fn = "fa_map_slot_key" if is_key else "fa_map_slot_val"
+        if t is not None and is_agg(t):
+            p = self.new_temp(ptr_to(t))
+            self.emit("CALL", p, [Sym(fn), obj, i], ty=ptr_to(t))
+            return p
+        if t is not None and t.is_float:
+            raw = self.new_temp(I64)
+            self.emit("CALL", raw, [Sym(fn), obj, i], ty=I64)
+            return self.bitcast(raw, t)
+        r = self.new_temp(t or I64)
+        self.emit("CALL", r, [Sym(fn), obj, i], ty=t or I64)
+        return r
+
+    def _elem_to_str(self, v, ty: Type) -> Temp:
+        """容器元素的文本：str 加双引号、char 加单引号。
+
+        运行时的 fa_container_to_str 就是这么打的（`["a", "b"]`、`{'a'}`），
+        编译器自己拼的时候必须逐字对齐，否则同一个 Vec 因为元素类型不同
+        就有两种样子。
+        """
+        sv = self.gen_to_str(v, ty)
+        q = '"' if ty == STR else ("'" if ty == CHAR else "")
+        if not q:
+            return sv
+        return self.concat_str(self.concat_str(self.make_str(q), sv), self.make_str(q))
+
+    # 回调式（高阶）方法：全部在编译期展开成循环，不走运行时泛型函数
+    VEC_CALLBACKS = ("map", "filter", "any", "all", "index_where", "for_each")
+
+    def gen_vec_callback(self, name: str, obj, et: Type, e: MethodCall):
+        """`v.map(f)` / `v.filter(p)` / `v.any(p)` / `v.all(p)` /
+        `v.index_where(p)` / `v.for_each(f)`。
+
+        为什么在编译期展开而不是写一个运行时函数：元素类型、结果表类型、回调签名
+        在 sema 那里已经全部钉死，这里按静态类型直接生成代码，不用在运行时做
+        类型分发，也不用给回调结果装箱再拆箱。
+
+        回调收到的是 **\*元素**（`fa_vec_elem_addr` 给的地址：装箱元素是盒子地址，
+        扁平元素是槽自己的地址，窄元素按真实槽宽算）。FA 没有 lambda、回调也不能
+        捕获局部变量，所以「带状态」的回调只能靠全局变量 —— 这一点和 C 的
+        qsort 回调一样。
+
+        循环上界在进循环前取一次：回调里改这张表（push/clear）是未定义行为，
+        和 sort_by 同一条规矩。
+        """
+        cb = e.args[0]
+        rt = cb.ty.ret
+        ptr = self.gen_expr(cb)                       # 函数名 -> LEA_SYM，代码地址
+        boxed = 1 if et.kind in ("struct", "enum") else 0
+
+        out = None
+        if name in ("map", "filter"):
+            out_et = rt if name == "map" else et
+            out = self.new_temp(vec_of(out_et))
+            self.emit("CALL", out,
+                      [Sym("fa_vec_new"), self.const(elem_kind(out_et, self.sema)),
+                       self.const(vec_esz(out_et)),
+                       self.const(1 if (out_et.kind == "int" and out_et.is_signed)
+                                  else 0),
+                       self.const(T.ty_code(out_et))], ty=vec_of(out_et))
+            self.mark_owned(out, vec_of(out_et))
+
+        res = None
+        if name in ("any", "all"):
+            res = self.new_temp(BOOL)
+            # 空表：any() 是 false，all() 是 true（和数学上的「存在/任意」一致）
+            self.emit("MOV", res, [self.const(1 if name == "all" else 0, BOOL)],
+                      ty=BOOL)
+        elif name == "index_where":
+            res = self.new_temp(I64)
+            self.emit("MOV", res, [self.const(-1)], ty=I64)
+
+        n = self.new_temp(I64)
+        self.emit("LOAD", n, [obj], extra=8, ty=I64)
+        i = self.new_temp(I64)
+        self.emit("MOV", i, [self.const(0)], ty=I64)
+
+        top = self.new_label("cb")
+        body = self.new_label("cbb")
+        step = self.new_label("cbs")
+        end = self.new_label("cbe")
+        self.emit("LABEL", extra=top)
+        c = self.new_temp(BOOL)
+        self.emit("CMP", c, [i, n], extra="<", ty=I64)
+        self.emit("BR", args=[c], extra=(body, end))
+        self.emit("LABEL", extra=body)
+
+        addr = self.new_temp(ptr_to(et))
+        self.emit("CALL", addr, [Sym("fa_vec_elem_addr"), obj, i,
+                                 self.const(boxed, I64)], ty=ptr_to(et))
+
+        if name == "for_each":
+            self.emit("CALLPTR", None, [ptr, addr])
+        elif name == "map":
+            ref_before = set(self.owned_ids)
+            agg_before = set(self.agg_owned_ids)
+            r = self.new_temp(rt)
+            self.emit("CALLPTR", r, [ptr, addr], ty=rt)
+            if T.t_is_refcounted(rt):
+                # 回调返回的这份归我们；push 自己会再加一次引用，
+                # 所以本轮末尾把回调那份放掉正好
+                self.mark_owned(r, rt)
+            rv = self.bitcast(r, I64) if rt.is_float else r
+            self.emit("CALL", None, [Sym("fa_vec_push"), out, rv])
+            self.release_new_refs(None, ref_before, agg_before)
+        elif name == "filter":
+            r = self.new_temp(BOOL)
+            self.emit("CALLPTR", r, [ptr, addr], ty=BOOL)
+            hit = self.new_label("cbf")
+            self.emit("BR", args=[r], extra=(hit, step))
+            self.emit("LABEL", extra=hit)
+            if boxed:
+                # 结构体/枚举元素要**装一份新箱**再进新表，不能把原箱地址直接塞进去：
+                # 纯数据箱（kind == FA_K_BOX，即结构体里没有 str/Vec/Map 这类
+                # 引用计数字段）根本没有引用计数，fa_agg_inc 对它是空操作 ——
+                # 两张表都以为自己独占那个箱子，释放时就是 double free（实测
+                # glibc 报 "free(): double free detected in tcache 2"）。
+                # 走 box_agg 和 push 方法一条路：拷一份，push 再按 kind retain
+                # 里面的引用计数字段。这也正好是 FA 结构体的值语义（v[i] 取出来
+                # 也是拷一份）。
+                self.emit("CALL", None,
+                          [Sym("fa_vec_push"), out, self.box_agg(addr, et)])
+            else:
+                val = self._vec_elem_at(obj, i, et)
+                vv = self.bitcast(val, I64) if et.is_float else val
+                self.emit("CALL", None, [Sym("fa_vec_push"), out, vv])
+        else:                                   # any / all / index_where
+            r = self.new_temp(BOOL)
+            self.emit("CALLPTR", r, [ptr, addr], ty=BOOL)
+            hit = self.new_label("cbh")
+            # any / index_where：命中（真）就收工；all：落空（假）就收工
+            self.emit("BR", args=[r], extra=(step, hit) if name == "all"
+                      else (hit, step))
+            self.emit("LABEL", extra=hit)
+            if name == "any":
+                self.emit("MOV", res, [self.const(1, BOOL)], ty=BOOL)
+            elif name == "all":
+                self.emit("MOV", res, [self.const(0, BOOL)], ty=BOOL)
+            else:
+                self.emit("MOV", res, [i], ty=I64)
+            self.emit("JMP", extra=end)
+
+        self.emit("LABEL", extra=step)
+        self.emit("BIN", i, [i, self.const(1)], extra="+", ty=I64)
+        self.emit("JMP", extra=top)
+        self.emit("LABEL", extra=end)
+
+        if out is not None:
+            return out
+        if res is not None:
+            return res
+        return self.const(0, VOID)
+
+    def gen_vec_join_agg(self, v, et: Type, sep) -> Temp:
+        """`Vec<结构体/枚举>.join(sep)`：在编译期逐元素取文本再拼。
+
+        运行时的 fa_vec_join 只认元素 kind，结构体/枚举一律打成 `{...}`。
+        `to_str()` 早就为这种情况走了编译期展开（gen_container_to_str_agg），
+        join 却没走 —— 于是 `Vec<P>.to_str()` 是 `[P { x: 1 }, P { x: 2 }]`，
+        `Vec<P>.join(",")` 却是 `{...},{...}`：同一张表两种样子，而后者根本没信息。
+        这里补上同一条路，只有两点不同：分隔符用调用方给的，
+        而且**不加方括号、str/char 元素也不加引号**（join 的语义，
+        和运行时 fa_vec_join 的 quote_str=0 对齐）。
+        """
+        entry_refs = set(self.owned_ids)
+        entry_aggs = set(self.agg_owned_ids)
+
+        pieces = self.new_temp(vec_of(STR))
+        self.emit("CALL", pieces,
+                  [Sym("fa_vec_new"), self.const(elem_kind(STR, self.sema)),
+                   self.const(vec_esz(STR)), self.const(0),
+                   self.const(T.ty_code(STR))], ty=vec_of(STR))
+        self.mark_owned(pieces, vec_of(STR))
+
+        n = self.new_temp(I64)
+        self.emit("LOAD", n, [v], extra=8, ty=I64)
+        i = self.new_temp(I64)
+        self.emit("MOV", i, [self.const(0)], ty=I64)
+
+        top = self.new_label("vja")
+        body = self.new_label("vjab")
+        step = self.new_label("vjas")
+        end = self.new_label("vjae")
+        self.emit("LABEL", extra=top)
+        c = self.new_temp(BOOL)
+        self.emit("CMP", c, [i, n], extra="<", ty=I64)
+        self.emit("BR", args=[c], extra=(body, end))
+        self.emit("LABEL", extra=body)
+
+        # 每轮新建的中间引用要在本轮内放掉（和 gen_container_to_str_agg 同理：
+        # 它们是语句级登记的，留到语句末尾就已经在循环外面了）
+        ref_before = set(self.owned_ids)
+        agg_before = set(self.agg_owned_ids)
+        piece = self.gen_to_str(self._vec_elem_at(v, i, et), et)
+        # fa_vec_push 自己会加一次引用，所以这一份在本轮末尾放掉正好
+        self.emit("CALL", None, [Sym("fa_vec_push"), pieces, piece])
+        self.release_new_refs(None, ref_before, agg_before)
+
+        self.emit("LABEL", extra=step)
+        self.emit("BIN", i, [i, self.const(1)], extra="+", ty=I64)
+        self.emit("JMP", extra=top)
+        self.emit("LABEL", extra=end)
+
+        out = self.new_temp(STR)
+        self.emit("CALL", out, [Sym("fa_vec_join"), pieces, sep], ty=STR)
+        self.mark_owned(out, STR)
+        # pieces 在这里放掉；out 留在语句级所有权表里交给调用方释放
+        self.release_new_refs(out, entry_refs, entry_aggs)
+        return out
+
+    def gen_container_to_str_agg(self, v, ty: Type) -> Temp:
+        """`[P { x: 1 }, P { x: 2 }]` / `{"甲": P { x: 1 }}`。
+
+        元素文本一项项收进一个 Vec<str>，最后 `fa_vec_join` 一次拼起来。
+        第一版是「累积串 + 每轮 concat」：concat 每轮都要把已经拼好的整串重拷一遍，
+        一万个结构体元素就是 3.6 亿字节 memcpy（实测 563 毫秒），十万个元素直接
+        分钟级 —— 典型的静默 O(n²)。join 内部用可增长构造器，是 O(总长度)。
+
+        还有两件必须照着 gen_enum_to_str 的做法来的事：
+
+        1) 每轮新建的中间引用（字段名、字段值、拼接结果）要**在本轮内**释放
+           （release_new_refs）。它们是语句级登记的，留到语句末尾就已经在循环外面了，
+           那时寄存器里装的是完全无关的值 —— if/match 表达式踩过同一个坑。
+           顺带也把峰值内存压下来：打印一千个元素不会同时活着几千个 FaStr。
+        2) Map 按**槽位**扫（fa_map_cap + fa_map_slot_used），跳过空槽与墓碑。
+           以前调 fa_map_key_at(m, i) 取「第 i 个占用槽」，那函数每调一次都从头扫，
+           整个 to_str 是 O(n·cap)。
+        """
+        is_vec = ty.kind == "vec"
+        et = ty.elem if is_vec else None
+        kt, vt = (ty.key, ty.val) if not is_vec else (None, None)
+        entry_refs = set(self.owned_ids)
+        entry_aggs = set(self.agg_owned_ids)
+
+        # 装元素文本的 Vec<str>
+        pieces = self.new_temp(vec_of(STR))
+        self.emit("CALL", pieces,
+                  [Sym("fa_vec_new"), self.const(elem_kind(STR, self.sema)),
+                   self.const(vec_esz(STR)), self.const(0),
+                   self.const(T.ty_code(STR))], ty=vec_of(STR))
+        self.mark_owned(pieces, vec_of(STR))
+
+        n = self.new_temp(I64)
+        if is_vec:
+            self.emit("LOAD", n, [v], extra=8, ty=I64)
+        else:
+            self.emit("CALL", n, [Sym("fa_map_cap"), v], ty=I64)
+        i = self.new_temp(I64)
+        self.emit("MOV", i, [self.const(0)], ty=I64)
+
+        top = self.new_label("cts")
+        body = self.new_label("ctsb")
+        step = self.new_label("ctsstep")
+        end = self.new_label("ctse")
+        self.emit("LABEL", extra=top)
+        c = self.new_temp(BOOL)
+        self.emit("CMP", c, [i, n], extra="<", ty=I64)
+        self.emit("BR", args=[c], extra=(body, end))
+        self.emit("LABEL", extra=body)
+
+        if not is_vec:
+            # 空槽（state 0）与墓碑（state -1，del 留下的）跳过
+            used = self.new_temp(I64)
+            self.emit("CALL", used, [Sym("fa_map_slot_used"), v, i], ty=I64)
+            unused = self.new_temp(BOOL)
+            self.emit("CMP", unused, [used, self.const(0)], extra="==", ty=I64)
+            l_used = self.new_label("ctsused")
+            self.emit("BR", args=[unused], extra=(step, l_used))
+            self.emit("LABEL", extra=l_used)
+
+        # ---- 这一轮的元素文本（结构体/枚举由编译器展开字段，其余类型照常）
+        ref_before = set(self.owned_ids)
+        agg_before = set(self.agg_owned_ids)
+        if is_vec:
+            piece = self._elem_to_str(self._vec_elem_at(v, i, et), et)
+        else:
+            ks = self._elem_to_str(self._map_slot_at(v, i, kt, True), kt)
+            piece = self.concat_str(ks, self.make_str(": "))
+            piece = self.concat_str(
+                piece, self._elem_to_str(self._map_slot_at(v, i, vt, False), vt))
+        # fa_vec_push 自己会加一次引用，所以这一份在本轮末尾放掉正好
+        self.emit("CALL", None, [Sym("fa_vec_push"), pieces, piece])
+        self.release_new_refs(None, ref_before, agg_before)
+
+        self.emit("LABEL", extra=step)
+        self.emit("BIN", i, [i, self.const(1)], extra="+", ty=I64)
+        self.emit("JMP", extra=top)
+        self.emit("LABEL", extra=end)
+
+        joined = self.new_temp(STR)
+        self.emit("CALL", joined, [Sym("fa_vec_join"), pieces, self.make_str(", ")],
+                  ty=STR)
+        self.mark_owned(joined, STR)
+        out = self.concat_str(self.make_str("[" if is_vec else "{"), joined)
+        out = self.concat_str(out, self.make_str("]" if is_vec else "}"))
+        # 中间那些（pieces / joined / 第一次 concat 的结果）在这里放掉；
+        # **最后这份 out 必须留在语句级所有权表里**交给调用方的语句末尾释放
+        # （concat_str 的约定就是这样）。第一版写成 take_owned(out) 把它摘走了，
+        # 于是没人释放它 —— ASan 实测每次 print 一个容器漏一份结果串
+        # （`Vec<Inner>` 两个元素漏 65 字节，正是那串文本加对象头的大小）。
+        self.release_new_refs(out, entry_refs, entry_aggs)
+        return out
+
+    def concat_str(self, a, b) -> Temp:
+        """两个 str 拼起来，返回一份**新的拥有**引用（fa_str_concat 的约定）。"""
+        r = self.new_temp(STR)
+        self.emit("CALL", r, [Sym("fa_str_concat"), a, b], ty=STR)
+        self.mark_owned(r, STR)
+        return r
+
+    def load_field_value(self, base, fty: Type, off: int):
+        """取某个偏移上的值：标量 LOAD 出来，聚合（结构体/枚举/数组）取它的地址。"""
+        if is_agg(fty):
+            t = self.new_temp(ptr_to(fty))
+            self.emit("LEA", t, [base], extra=off)
+            return t
+        t = self.new_temp(fty)
+        self.emit("LOAD", t, [base], extra=off, ty=fty)
+        return t
+
+    def user_to_str(self, ty: Type):
+        """这个类型自己写了 `fn to_str(self) -> str` 吗？写了就用他的。
+
+        以前不管你有没有写，`print(p)` / `str(p)` / 容器里印元素一律走内建的
+        字段展开（`Task { name: 甲, prio: 3 }`），你写的 to_str 只有显式
+        `p.to_str()` 才用得上 —— 而「我给它写了 to_str，print 却不理我」
+        正是每个人都会踩的一脚。
+        """
+        if getattr(ty, "kind", None) not in ("struct", "enum"):
+            return None
+        fs = (self.sema.methods or {}).get((ty.name, "to_str"))
+        if fs is None or fs is self.fnsym:
+            # 正在生成 to_str 自己的函数体：走内建展开，否则
+            # `fn to_str(self) -> str: return str(self)` 会无限递归到爆栈。
+            return None
+        if getattr(fs, "extern", False):
+            return None
+        return fs
+
+    def call_user_to_str(self, fs, v) -> Temp:
+        r = self.new_temp(STR)
+        self.emit("CALL", r, [Sym(fs.symbol), v], extra=fs, ty=STR)
+        self.mark_owned(r, STR)
+        return r
+
+    def gen_struct_to_str(self, v, ty: Type) -> Temp:
+        """`P { x: 1, y: "甲" }`。
+
+        以前结构体/枚举/数组一律走 fa_str_of_ptr —— `print(p)` 打出来是个栈地址
+        （0x7ffd…）。初学者写的第一件事往往就是 print 一个结构体，看到地址只会懵，
+        而字段名、类型、偏移在编译期全都是已知的，直接展开成字符串拼接就行，
+        运行时一行都不用改（嵌套结构体/数组/容器字段会递归下去）。
+        """
+        cur = self.make_str(f"{ty.name} {{ ")
+        for i, (fname, fty, off) in enumerate(ty.fields or []):
+            if i:
+                cur = self.concat_str(cur, self.make_str(", "))
+            cur = self.concat_str(cur, self.make_str(f"{fname}: "))
+            cur = self.concat_str(cur, self.gen_to_str(
+                self.load_field_value(v, fty, off), fty))
+        return self.concat_str(cur, self.make_str(" }"))
+
+    def gen_arr_to_str(self, v, ty: Type) -> Temp:
+        """`[1, 2, 3]` —— 格式与运行时的 Vec 打印**逐字对齐**：
+        str 元素加双引号、char 元素加单引号，其余原样。
+        （不对齐就会出现 `print(Vec<str>["甲"])` 是 `["甲"]`、
+        `print(["甲"])` 却是 `[甲]` 这种同一种东西两种样子的尴尬。）"""
+        et = ty.elem
+        quote = '"' if et == STR else ("'" if et == CHAR else "")
+        cur = self.make_str("[")
+        for i in range(getattr(ty, "count", 0) or 0):
+            if i:
+                cur = self.concat_str(cur, self.make_str(", "))
+            if quote:
+                cur = self.concat_str(cur, self.make_str(quote))
+            cur = self.concat_str(cur, self.gen_to_str(
+                self.load_field_value(v, et, i * max(et.size, 1)), et))
+            if quote:
+                cur = self.concat_str(cur, self.make_str(quote))
+        return self.concat_str(cur, self.make_str("]"))
+
+    def gen_enum_to_str(self, v, ty: Type) -> Temp:
+        """`Circle(r: 2)` / `Dot` —— 按 tag 分支，各变体拼各自的载荷。
+
+        每个分支的中间引用必须**在分支内**释放（release_new_refs）：它们是语句级
+        登记的，留到语句末尾就已经在分支外面了，走别的变体那条路径上寄存器里装的
+        是完全无关的值（这正是 if/match 表达式踩过的那个坑）。
+        """
+        variants = getattr(ty, "variants", None) or []
+        if not variants:
+            r = self.new_temp(STR)
+            self.emit("CALL", r, [Sym("fa_str_of_ptr"), v], ty=STR)
+            self.mark_owned(r, STR)
+            return r
+        tag = self.new_temp(I64)
+        self.emit("LOAD", tag, [v], extra=0, ty=I64)
+        slot = self.emit_alloca(8)
+        # 兜底：tag 不在任何变体里（不该发生）就打个类型名，别去解引用 0
+        self.emit("STORE", args=[slot, self.make_str(ty.name)], extra=0, ty=STR)
+        end = self.new_label("etosend")
+        for vname, vfields, vi in variants:
+            build = self.new_label("etosv")
+            nxt = self.new_label("etosn")
+            c = self.new_temp(BOOL)
+            self.emit("CMP", c, [tag, self.const(vi)], extra="==", ty=I64)
+            self.emit("BR", args=[c], extra=(build, nxt))
+            self.emit("LABEL", extra=build)
+            ref_before = set(self.owned_ids)
+            agg_before = set(self.agg_owned_ids)
+            cur = self.make_str(vname)
+            if vfields:
+                cur = self.concat_str(cur, self.make_str("("))
+                for j, (fname, fty, off) in enumerate(vfields):
+                    if j:
+                        cur = self.concat_str(cur, self.make_str(", "))
+                    if fname:
+                        cur = self.concat_str(cur, self.make_str(f"{fname}: "))
+                    # 载荷区从第 8 字节开始（前 8 字节是 tag）
+                    cur = self.concat_str(cur, self.gen_to_str(
+                        self.load_field_value(v, fty, 8 + off), fty))
+                cur = self.concat_str(cur, self.make_str(")"))
+            self.take_owned(cur, STR)          # 结果交给槽，别在下面被放掉
+            self.emit("STORE", args=[slot, cur], extra=0, ty=STR)
+            self.release_new_refs(None, ref_before, agg_before)
+            self.emit("JMP", extra=end)
+            self.emit("LABEL", extra=nxt)
+        self.emit("LABEL", extra=end)
+        r = self.new_temp(STR)
+        self.emit("LOAD", r, [slot], extra=0, ty=STR)
         self.mark_owned(r, STR)
         return r
 
@@ -920,8 +2326,26 @@ class FnGen:
                 self.emit("CMP", c, [rr, self.const(1)], extra="==", ty=I64)
             else:
                 self.emit("CMP", c, [rr, self.const(0)], extra=op, ty=I64)
-            self.mark_owned(a, lt)
-            self.mark_owned(b, rt)
+            # 这里**不能**把 a / b 登记成本语句拥有的引用：
+            # 它们是操作数（多半是变量里借来的值），不是比较产生的新对象。
+            # 以前登记了，语句末尾就多减一次引用计数 —— 堆上的字符串
+            # （`"he"+"llo"`、`v.join("-")` 这种）会被提前释放，函数收尾再减一次
+            # 就是 use-after-free。小字符串 glibc 一般不吭声，长字符串直接
+            # “corrupted size vs. prev_size while consolidating”。
+            # 操作数如果本身是新临时值（比如 `("a"+"b") == c` 的左边），
+            # 拼接那边已经登记过了，这里不用管。
+            return c
+        # 枚举（不带载荷）：两边的值都是「tag + 载荷」那块存储的地址，
+        # tag 在偏移 0，直接读出来比。sema 已经保证带载荷的枚举走不到这里。
+        if lt.kind == "enum" and rt.kind == "enum" and op in ("==", "!="):
+            a = self.gen_expr(e.left)
+            b = self.gen_expr(e.right)
+            ta = self.new_temp(I64)
+            self.emit("LOAD", ta, [a], extra=0, ty=I64)
+            tb = self.new_temp(I64)
+            self.emit("LOAD", tb, [b], extra=0, ty=I64)
+            c = self.new_temp(BOOL)
+            self.emit("CMP", c, [ta, tb], extra=op, ty=I64)
             return c
         # 指针算术
         if lt.kind == "ptr" and rt.kind == "int" and op in ("+", "-"):
@@ -1026,11 +2450,52 @@ class FnGen:
         v = self.gen_expr(e.operand)
         return self.coerce(v, e.operand.ty, e.ty)
 
+    def _addr_taken_roots(self, node, out=None):
+        """扫一遍函数体，收集所有被 `&` 取过地址的变量名。
+
+        为什么非得**提前**扫：`&x` 的实现是「x 住在栈槽里，取那个槽的地址」。
+        以前的做法是等到生成 `&x` 的那一刻，才把 x 从寄存器溢出到栈槽 ——
+        溢出指令（lea + store）落在**当时所在的那个基本块**里，而变量的位置记录
+        已经被永久改写成那个槽了，于是别的分支再写 `&x` 时直接复用了那个只在
+        一个分支里赋过值的寄存器：
+
+            fn helper(ts: i64, utc: bool) -> tm:
+                let mut sec = ts
+                let t: tm
+                if utc:
+                    gmtime_r(&sec, &t)        # lea r13, [rbp-112] 只生成在这里
+                else:
+                    localtime_r(&sec, &t)     # mov rdi, r13 —— r13 里是垃圾
+
+        localtime_r 拿到野指针，段错误。定义必须支配使用，所以这类变量在
+        **声明处**（形参是函数入口处）就安排到栈槽里，地址全函数稳定。
+        """
+        if out is None:
+            out = set()
+        if isinstance(node, AddrOf):
+            n = node.operand
+            while isinstance(n, (Field, Index)):
+                n = getattr(n, "obj", None)      # &p.field / &a[i] 的根
+                if n is None:
+                    break
+            if isinstance(n, NameRef):
+                out.add(n.name)
+        for v in list(vars(node).values()):
+            if isinstance(v, Node):
+                self._addr_taken_roots(v, out)
+            elif isinstance(v, (list, tuple)):
+                for it in v:
+                    if isinstance(it, Node):
+                        self._addr_taken_roots(it, out)
+        return out
+
     def gen_addrof(self, e: AddrOf):
         return self.gen_addrof1(e.operand)
 
     def gen_addrof1(self, operand: Expr) -> Temp:
         if isinstance(operand, NameRef):
+            if self.is_global_name(operand.name):
+                return self.global_addr(operand.name)   # &全局：拿到 .bss 里的地址
             loc = self.var_loc(operand.name, operand)
             if loc.kind == "mem":
                 return loc.val
@@ -1051,6 +2516,9 @@ class FnGen:
     def gen_addr(self, e: Expr) -> Tuple[Temp, Any, Type]:
         """返回 (基址指针 Temp, 偏移(常量或Temp), 类型)"""
         if isinstance(e, NameRef):
+            if self.is_global_name(e.name):
+                g = self.sema.globals[e.name]
+                return self.global_addr(e.name), 0, g.ty
             loc = self.var_loc(e.name, e)
             if loc.kind == "mem":
                 return loc.val, 0, loc.ty
@@ -1063,14 +2531,23 @@ class FnGen:
             return slot, 0, loc.ty
         if isinstance(e, Field):
             ot = e.obj.ty
+            if getattr(e, "auto_deref", False):
+                # p.field：对象表达式的值**就是**指针，直接当基址用
+                st = ot.inner
+                base = self.gen_expr(e.obj)
+                fo = st.fields[e.index][2]
+                if st.kind == "enum":
+                    fo += 8
+                return base, fo, st.fields[e.index][1]
             if ot.kind in ("struct", "enum"):
                 base, off0, _ = self.gen_addr(e.obj)
                 fo = ot.fields[e.index][2]
                 if ot.kind == "enum":
                     fo += 8
-                off = off0 + fo
-                return base, off, ot.fields[e.index][1]
+                return base, self.add_off(off0, fo), ot.fields[e.index][1]
             self.err(f"类型 {ot} 不支持字段取址", e)
+        if isinstance(e, Slice):
+            self.err("切片没有地址可取（它是新值，不是原数据的一段视图）", e)
         if isinstance(e, Index):
             ot = e.obj.ty
             if ot.kind == "arr":
@@ -1080,11 +2557,15 @@ class FnGen:
                 sc = max(ot.elem.size, 1)
                 o = self.new_temp(I64)
                 self.emit("BIN", o, [idx, self.const(sc)], extra="*", ty=I64)
-                if isinstance(off0, int) and off0:
-                    o2 = self.new_temp(I64)
-                    self.emit("BIN", o2, [o, self.const(off0)], extra="+", ty=I64)
-                    return base, o2, ot.elem
-                return base, o, ot.elem
+                # 以前这行写成
+                #   return base, self.add_off(o, off0 if isinstance(off0, int) else 0), ot.elem \
+                #       if isinstance(off0, int) else (base, self.add_off(o, 0), ot.elem)
+                # Python 把 `x if c else y` 只当成**元组最后一个元素**，于是 off0 是 Temp 时
+                # 返回的「类型」变成了那个三元组本身 —— `grid[1][2]` 直接
+                # AttributeError: 'tuple' object has no attribute 'kind'（编译器崩在 is_agg 里）。
+                # 而且那条 else 分支还把 off0 丢掉了：就算不崩，算出来的地址也是错的
+                # （少加外层下标的偏移，读到的是第 0 行）。两个偏移必须都加上。
+                return base, self.add_offs(off0, o), ot.elem
             if ot.kind == "ptr":
                 p = self.gen_expr(e.obj)
                 idx = self.coerce(self.gen_expr(e.index), e.index.ty, I64)
@@ -1092,6 +2573,14 @@ class FnGen:
                 o = self.new_temp(I64)
                 self.emit("BIN", o, [idx, self.const(sc)], extra="*", ty=I64)
                 return p, o, ot.inner
+            if ot.kind in ("vec", "map", "str"):
+                # `v[i].field` / `m[k].field`：先按下标把元素取出来
+                # （结构体元素在槽里存的是装箱指针），再走函数末尾
+                # 「值本身就是指向聚合对象的指针」那条兜底路径。
+                v = self.gen_expr(e)                  # -> gen_subscript
+                if is_agg(e.ty):
+                    return v, 0, e.ty
+                self.err(f"{ot} 的下标结果是标量 {e.ty}，不可取址", e)
             self.err(f"类型 {ot} 不支持下标取址", e)
         if isinstance(e, Deref):
             p = self.gen_expr(e.operand)
@@ -1099,6 +2588,13 @@ class FnGen:
         if isinstance(e, Unary) and e.op == "*":
             p = self.gen_expr(e.operand)
             return p, 0, e.ty
+        # 兜底：值本身就是「指向聚合对象的指针」的表达式 ——
+        #   * 返回结构体的函数调用：mk(3).id
+        #   * Vec.get(i) 取出的装箱结构体元素：v.get(0).id
+        #   * 结构体字段里的内联子对象：o.inner.x（走 Field 分支）
+        # 以前这里一律报「表达式不可取址」，导致 `mk(3).id` 这种最常见的写法编译不过。
+        if getattr(e, "ty", None) is not None and is_agg(e.ty):
+            return self.gen_expr(e), 0, e.ty
         self.err(f"表达式不可取址", e)
 
     def bounds_check(self, idx: Temp, limit, node):
@@ -1112,31 +2608,100 @@ class FnGen:
         l_bad = self.new_label("bbad")
         self.emit("BR", args=[ok], extra=(l_ok, l_bad))
         self.emit("LABEL", extra=l_bad)
-        msg = self.make_str("下标越界 (index out of range)")
-        self.emit("CALL", None, [Sym("fa_panic"), msg])
+        lim = limit if isinstance(limit, (Temp, Const)) else self.const(limit, I64)
+        self.emit("CALL", None, [Sym("fa_bounds_error"), idx, lim])
         self.emit("LABEL", extra=l_ok)
 
     def load_ptr(self, ptr, ty: Type, off) -> Temp:
         if is_agg(ty):
-            return ptr
+            # 聚合值用「指向它的指针」表示，但偏移量不能丢：
+            # `es[1]`（枚举数组）以前返回的是数组首地址，于是 match 到的
+            # 永远是第 0 个元素的 tag。
+            if isinstance(off, int) and off == 0:
+                return ptr
+            r = self.new_temp(ptr_to(ty))
+            self.emit("LEA", r, [ptr], extra=off)
+            return r
         r = self.new_temp(ty)
         self.emit("LOAD", r, [ptr], extra=off, ty=ty)
         return r
 
     def gen_index(self, e: Index):
+        ot = e.obj.ty
+        if ot is not None and ot.kind in ("vec", "map", "str"):
+            # v[i] / m[k] / s[i] —— 以前 gen_addr 只认数组和指针，
+            # 这三种最常见的下标写法一律报「不支持下标取址」直接编译失败。
+            return self.gen_subscript(e)
         ptr, off, ty = self.gen_addr(e)
         return self.load_ptr(ptr, ty, off)
+
+    # 开放端（a[1:] / a[:hi] / a[:]）用 INT64_MAX 当上界：fa_str_slice 和
+    # fa_vec_slice 都会把越界的边界夹回长度，所以不用在这里再取一次 len，
+    # 也就不会有「为了拿长度把 obj 求值两遍」的问题。
+    SLICE_OPEN = 0x7fffffffffffffff
+
+    def gen_slice(self, e: Slice):
+        """a[lo:hi] —— str 走 fa_str_slice，Vec 走 fa_vec_slice，都返回新值。"""
+        ot = e.obj.ty
+        obj = self.gen_expr(e.obj)          # 只求值一次：f()[1:] 不能把 f 调两遍
+        lo = (self.const(0) if e.start is None
+              else self.coerce(self.gen_expr(e.start), e.start.ty, I64))
+        hi = (self.const(self.SLICE_OPEN) if e.end is None
+              else self.coerce(self.gen_expr(e.end), e.end.ty, I64))
+        if ot.kind == "str":
+            r = self.new_temp(STR)
+            self.emit("CALL", r, [Sym("fa_str_slice"), obj, lo, hi], ty=STR)
+            self.mark_owned(r, STR)
+            return r
+        et = ot.elem
+        # 装箱元素要把盒子大小传下去，运行时才知道该克隆多大一块。
+        box = max(et.size, 8) if et is not None and et.kind in ("struct", "enum") else 0
+        r = self.new_temp(ot)
+        self.emit("CALL", r,
+                  [Sym("fa_vec_slice"), obj, lo, hi, self.const(box)], ty=ot)
+        self.mark_owned(r, ot)
+        return r
+
+    def gen_subscript(self, e: Index):
+        """读 v[i] / m[k] / s[i]"""
+        ot = e.obj.ty
+        if ot.kind == "str":
+            obj = self.gen_expr(e.obj)
+            i = self.coerce(self.gen_expr(e.index), e.index.ty, I64)
+            # 字符串在运行时是 FaStr*：{ rc, len, data[] }，字节从偏移 16 开始。
+            # 直接 [obj + i] 读到的是引用计数和长度的字节（实测打印出 U+FFFD）。
+            n = self.new_temp(I64)
+            self.emit("LOAD", n, [obj], extra=8, ty=I64)
+            self.bounds_check(i, n, e)
+            data = self.new_temp(ptr_to(CHAR))
+            self.emit("LEA", data, [obj], extra=16)
+            r = self.new_temp(CHAR)
+            self.emit("LOAD", r, [data], extra=(i, 1), ty=CHAR)
+            return r
+        mc = MethodCall(obj=e.obj, name="get", args=[e.index])
+        mc.ty = e.ty
+        mc.line, mc.col = e.line, e.col
+        return self.gen_builtin_method(mc)
+
+    def gen_subscript_write(self, e: Index, value: Expr):
+        """写 v[i] = x / m[k] = v"""
+        mc = MethodCall(obj=e.obj, name="set", args=[e.index, value])
+        mc.ty = VOID
+        mc.line, mc.col = e.line, e.col
+        self.gen_builtin_method(mc)
 
     def gen_field(self, e: Field):
         # 枚举变体构造器：Color.Green -> 生成带 tag 的枚举值
         if getattr(e, "is_variant", False):
             ot = e.ty
             slot = self.emit_alloca(ot.size)
+            self.emit("ZERO", args=[slot], extra=ot.size)
             self.emit("STORE", args=[slot, self.const(e.variant_index)],
                       extra=0, ty=I64)
+            self.mark_agg_owned(slot, ot)
             return slot
         ot = e.obj.ty
-        if ot.kind in ("struct", "enum"):
+        if ot.kind in ("struct", "enum") or getattr(e, "auto_deref", False):
             ptr, off, ty = self.gen_addr(e)
             if is_agg(ty):
                 base = self.new_temp(ptr_to(ty))
@@ -1157,37 +2722,52 @@ class FnGen:
 
     def gen_arraylit(self, e: ArrayLit):
         ty = e.ty
+        if ty.kind == "vec":
+            # `let v: Vec<i64> = []` 等价于 `Vec<i64>()`；
+            # `let v: Vec<i64> = [1, 2]` 等价于 `Vec<i64>[1, 2]`
+            return self.gen_vec_from_elems(ty.elem, e.elems)
         slot = self.emit_alloca(max(ty.size, 1))
         for i, el in enumerate(e.elems):
             v = self.gen_expr(el)
             if is_agg(el.ty):
                 d = self.new_temp(ptr_to(el.ty))
                 self.emit("LEA", d, [slot], extra=i * max(el.ty.size, 1))
-                self.emit("MEMCPY", args=[d, v], extra=el.ty.size, ty=el.ty)
+                self.emit_init_agg(d, v, el.ty)
             else:
                 self.emit("STORE", args=[slot, self.coerce(v, el.ty, ty.elem)],
                           extra=i * max(ty.elem.size, 1), ty=ty.elem)
                 if T.t_is_refcounted(ty.elem):
                     self.emit_rcinc(v, ty.elem)
+        self.mark_agg_owned(slot, ty)
         return slot
 
     def gen_structlit(self, e: StructLit):
         st = e.resolved
         slot = self.emit_alloca(st.size)
+        if st.is_refcounted:
+            # 字段可能是「未提供」的，先清零，免得 retain/drop 读到栈上的垃圾指针
+            self.emit("ZERO", args=[slot], extra=st.size)
+        defaults = getattr(self.sema.struct_decls.get(st.name), "defaults", None) or {}
         for fname, fty, off in st.fields:
             expr = dict(e.fields).get(fname)
             if expr is None:
-                continue
+                # 字面量里省略的字段：用声明时写的默认值补上（每次构造都重新
+                # 求值一遍，所以 `items: Vec<i64> = []` 每个对象拿到的是各自的空表）
+                expr = defaults.get(fname)
+                if expr is None:
+                    continue                 # 语义阶段已经报过错；这里保持清零
+
             v = self.gen_expr(expr)
             if is_agg(fty):
                 d = self.new_temp(ptr_to(fty))
                 self.emit("LEA", d, [slot], extra=off)
-                self.emit("MEMCPY", args=[d, v], extra=fty.size, ty=fty)
+                self.emit_init_agg(d, v, fty)
             else:
                 self.emit("STORE", args=[slot, self.coerce(v, expr.ty, fty)],
                           extra=off, ty=fty)
                 if T.t_is_refcounted(fty):
                     self.emit_rcinc(v, expr.ty)
+        self.mark_agg_owned(slot, st)
         return slot
 
     def gen_new(self, e: NewExpr):
@@ -1198,45 +2778,60 @@ class FnGen:
         self.emit("CALL", p, [Sym("fa_alloc"), self.const(max(ty.size, 8))], ty=ptr_to(ty))
         if is_agg(ty):
             self.emit("MEMCPY", args=[p, v], extra=ty.size, ty=ty)
+            # 堆上这份拷贝必须自己拥有一份引用：结构体 / 枚举 / 数组里的
+            # str、Vec、Map 字段逐个 rc_inc（编译器为类型生成的 __fa_retain_<T>
+            # / fa_retain_arr）。以前只 memcpy 不 retain，`new P { name: "x" + "y" }`
+            # 里那个临时字符串在语句末尾就被释放，堆上的字段成了悬垂指针，
+            # 下一次读它是 heap-use-after-free（ASan 实测抓到）。
+            # 标量路径下面那支本来就 rc_inc 了，聚合路径漏了。
+            self.emit_rcinc(p, ty)
         else:
             self.emit("STORE", args=[p, v], extra=0, ty=ty)
             if T.t_is_refcounted(ty):
                 self.emit_rcinc(v, ty)
         return p
 
+    def gen_vec_from_elems(self, et: Type, elems) -> Temp:
+        """新建一个 Vec<et> 并把 elems 依次 push 进去。
+
+        `Vec<T>[...]`、`Vec<T>(...)` 与「有标注的 [] 字面量」
+        （`let v: Vec<i64> = [1, 2]`）三条路共用，免得引用计数/装箱规则走偏。
+        """
+        vty = vec_of(et)
+        v = self.new_temp(vty)
+        self.emit("CALL", v, [Sym("fa_vec_new"), self.const(elem_kind(et, self.sema)),
+                              self.const(vec_esz(et)),
+                              self.const(1 if (et.kind == "int" and et.is_signed) else 0),
+                              self.const(T.ty_code(et))], ty=vty)
+        self.mark_owned(v, vty)
+        for a in elems:
+            av = self.gen_expr(a)
+            if et.kind in ("struct", "enum"):
+                self.emit("CALL", None, [Sym("fa_vec_push"), v, self.box_agg(av, et)])
+            else:
+                # fa_vec_push 内部已按元素 kind 做 rc_inc
+                cv = self.coerce(av, a.ty, et)
+                if et.is_float:
+                    cv = self.bitcast(cv, I64)
+                self.emit("CALL", None, [Sym("fa_vec_push"), v, cv])
+        return v
+
     def gen_ctor(self, e: Ctor):
         """Vec<T>(...) / Map<K,V>() / Vec<T>[...]"""
         if e.name == "Vec":
-            et = self.sema.resolve_type(e.targs[0])
-            k = elem_kind(et, self.sema)
-            v = self.new_temp(vec_of(et))
-            self.emit("CALL", v, [Sym("fa_vec_new"), self.const(k),
-                                  self.const(vec_esz(et)),
-                                  self.const(1 if (et.kind == "int" and et.is_signed) else 0)],
-                      ty=vec_of(et))
-            self.mark_owned(v, vec_of(et))
-            for a in e.args:
-                av = self.gen_expr(a)
-                if et.size > 8 and et.kind == "struct":
-                    box = self.new_temp(ptr_to(et))
-                    self.emit("CALL", box, [Sym("fa_alloc"), self.const(et.size)], ty=ptr_to(et))
-                    self.emit("MEMCPY", args=[box, av], extra=et.size, ty=et)
-                    self.emit("CALL", None, [Sym("fa_vec_push"), v, box])
-                else:
-                    # fa_vec_push 内部已按元素 kind 做 rc_inc
-                    cv = self.coerce(av, a.ty, et if et.kind != "struct" else I64)
-                    if et.is_float:
-                        cv = self.bitcast(cv, I64)
-                    self.emit("CALL", None, [Sym("fa_vec_push"), v, cv])
-            return v
+            return self.gen_vec_from_elems(self.sema.resolve_type(e.targs[0]), e.args)
         if e.name == "Map":
             kt = self.sema.resolve_type(e.targs[0])
             vt = self.sema.resolve_type(e.targs[1])
             m = self.new_temp(map_of(kt, vt))
             self.emit("CALL", m, [Sym("fa_map_new"),
                                   self.const(elem_kind(kt, self.sema)),
-                                  self.const(elem_kind(vt, self.sema))], ty=map_of(kt, vt))
+                                  self.const(elem_kind(vt, self.sema)),
+                                  self.const(T.ty_code(kt)),
+                                  self.const(T.ty_code(vt))], ty=map_of(kt, vt))
             self.mark_owned(m, map_of(kt, vt))
+            for i in range(0, len(e.args), 2):      # Map<K,V>[k: v, ...] 的初值
+                self.emit_map_set(m, e.args[i], e.args[i + 1], kt, vt)
             return m
         self.err(f"未知构造器 '{e.name}'", e)
 
@@ -1244,10 +2839,25 @@ class FnGen:
     def gen_call(self, e: Call):
         callee = e.callee
         if isinstance(callee, NameRef):
-            if callee.name in BUILTIN_FNS:
+            # 只有 sema 也把这次调用解析成内建时才走内建路径。
+            # 以前这里只看名字：用户定义了 fn sign(n: i64) -> str，sema 已经
+            # 让用户的函数赢了，codegen 却又按名字拐进 gen_builtin("sign")，
+            # 实参/返回值全对不上（实测直接段错误）。
+            if callee.name in BUILTIN_FNS and getattr(e, "resolved", None) == "builtin":
                 return self.gen_builtin(callee.name, e)
-            fs = self.sema.fns.get(callee.name)
+            # 优先用 sema 解析出来的那个符号：嵌套函数被提升成了 `外层__内层`，
+            # 按名字在顶层函数表里是查不到的（会误报「未定义函数 'inner'」）。
+            fs = callee.resolved if isinstance(callee.resolved, FnSym) else None
             if fs is None:
+                fs = self.sema.fns.get(callee.name)
+            if fs is None:
+                # 函数指针：`let f: fn(i64) -> i64 = add1` 之后 `f(41)`。
+                # sema 已经把 f 定成 fn 类型了，codegen 却只会查函数表，
+                # 于是报一句莫名其妙的「未定义函数 'f'」。
+                loc = self.scope.lookup(callee.name)
+                if loc is not None and loc.ty is not None and loc.ty.kind == "fn":
+                    pv = loc.val if loc.kind == "temp" else self.load_ptr(loc.val, loc.ty, 0)
+                    return self.gen_call_ptr(pv, e, loc.ty)
                 self.err(f"未定义函数 '{callee.name}'", e)
             return self.gen_call_fs(fs, e)
         if isinstance(callee, Field):
@@ -1264,12 +2874,19 @@ class FnGen:
         ret = fs.ret
         if is_agg(ret):
             slot = self.emit_alloca(ret.size)
+            self.mark_agg_owned(slot, ret)
             args.append(slot)
         for i, a in enumerate(e.args):
             if i < len(fs.params):
                 pty = fs.params[i]
                 av = self.gen_expr(a)
-                args.append(av if is_agg(pty) else self.coerce(av, a.ty, pty))
+                if fs.extern and pty.kind == "str":
+                    # C 侧收的是 char*。FaStr 的头两个字段是 rc/len，
+                    # 直接把对象指针传过去，C 读到的是乱码（文档承诺的
+                    # 「str 自动转成 char*」以前只在可变参数那条路上做了）
+                    args.append(self.coerce(av, a.ty, ptr_to(U8)))
+                else:
+                    args.append(av if is_agg(pty) else self.coerce(av, a.ty, pty))
             else:
                 # 可变参数：按 C 的默认实参提升（float -> double，str -> char*）
                 av = self.gen_expr(a)
@@ -1280,11 +2897,19 @@ class FnGen:
                 args.append(av)
         if is_agg(ret):
             self.emit("CALL", None, [Sym(fs.symbol)] + args, extra=fs)
+            self.mark_agg_owned(slot, ret)
             return slot
         if ret.kind == "void":
             self.emit("CALL", None, [Sym(fs.symbol)] + args, extra=fs)
             return self.const(0, VOID)
         r = self.hint_or_new(hint, ret)
+        if fs.extern and ret.kind == "str":
+            # 对称地：C 返回的 char* 不是 FaStr，得拷一份成 FA 字符串
+            pr = self.new_temp(ptr_to(U8))
+            self.emit("CALL", pr, [Sym(fs.symbol)] + args, extra=fs, ty=ptr_to(U8))
+            self.emit("CALL", r, [Sym("fa_str_from_cstr"), pr], ty=STR)
+            self.mark_owned(r, STR)
+            return r
         self.emit("CALL", r, [Sym(fs.symbol)] + args, extra=fs, ty=ret)
         if T.t_is_refcounted(ret):
             self.mark_owned(r, ret)
@@ -1320,35 +2945,56 @@ class FnGen:
             if is_agg(fty):
                 d = self.new_temp(ptr_to(fty))
                 self.emit("LEA", d, [slot], extra=off)
-                self.emit("MEMCPY", args=[d, v], extra=fty.size, ty=fty)
+                self.emit_init_agg(d, v, fty)
             else:
                 self.emit("STORE", args=[slot, self.coerce(v, a.ty, fty)],
                           extra=off, ty=fty)
                 if T.t_is_refcounted(fty):
                     self.emit_rcinc(v, a.ty)
+        self.mark_agg_owned(slot, ety)
         return slot
 
     def gen_method(self, e: MethodCall):
         ot = e.obj.ty
+        # `m.keys()` / `m.values()`：方法形式转发给内建的全局实现
+        # （BUILTIN_FNS 里的 keys/values 收的就是「第 0 个实参是 Map」）
+        if ot.kind == "map" and e.name in ("keys", "values"):
+            return self.gen_builtin(e.name, Call(NameRef(e.name), [e.obj]))
         # 命名空间（py / java）
         if ot.kind == "ns":
             return self.gen_ns_method(ot.name, e)
+        # 枚举变体构造：Shape.Circle(2.0)（sema 标成 enum-ctor）
+        if ot.kind == "enum" and e.resolved == "enum-ctor":
+            return self.gen_enum_ctor(ot, e.name, e.args, e)
         fs = e.resolved
         if isinstance(fs, FnSym):
             args = []
-            objv = self.gen_expr(e.obj)
-            if is_agg(ot):
-                args.append(objv)
+            decl = getattr(fs, "decl", None)
+            has_self = bool(decl is not None and any(
+                getattr(p, "name", "") == "self" for p in (getattr(decl, "params", None) or [])))
+            if not has_self and isinstance(e.obj, NameRef) \
+                    and e.obj.name in (self.sema.structs or {}) | (self.sema.enums or {}):
+                # `P.create(1, 2)`：接收者是**类型名**，不是值 —— 没有 self 可传。
+                # 以前照样 gen_expr(e.obj)，去查一个叫 P 的变量，报
+                # 「代码生成错误：未定义变量 'P'」（sema 早就放行了）。
+                pass
             else:
+                objv = self.gen_expr(e.obj)
                 args.append(objv)
             for i, a in enumerate(e.args):
-                pty = fs.params[i + 1] if (i + 1) < len(fs.params) else ANY
+                # 方法的 FnSym.params **不含** self（sema.register_impl 过滤掉了），
+                # 所以第 i 个实参对应 fs.params[i]。以前写成 i+1：
+                # 单参数方法侥幸拿到 ANY（不做转换，看着是对的），
+                # 多参数方法就把实参按**错一位**的类型转换 ——
+                # `p.combine(1, 2.5, "tail")` 里的 1 被转成 f64、2.5 被转成 str。
+                pty = fs.params[i] if i < len(fs.params) else ANY
                 av = self.gen_expr(a)
                 args.append(av if is_agg(pty) else self.coerce(av, a.ty, pty))
             ret = fs.ret
             if is_agg(ret):
                 slot = self.emit_alloca(ret.size)
                 self.emit("CALL", None, [Sym(fs.symbol), slot] + args, extra=fs)
+                self.mark_agg_owned(slot, ret)
                 return slot
             if ret.kind == "void":
                 self.emit("CALL", None, [Sym(fs.symbol)] + args, extra=fs)
@@ -1362,18 +3008,44 @@ class FnGen:
             return self.gen_builtin_method(e)
         self.err(f"未解析的方法调用 .{e.name}", e)
 
-    def emit_bounds_check(self, bad: Temp):
-        """bad 为真时跳到运行时报错（下标越界）"""
+    def emit_bounds_check(self, bad: Temp, idx, limit):
+        """bad 为真时跳到运行时报错（下标越界），并把下标和长度一起报出来"""
         ok = self.new_label("bok")
         self.emit("BR", args=[bad], extra=(self.new_label("bbad"), ok))
         # 用一条 JMP 串联：BR 的真分支先落到报错调用
         lbl_bad = self.ir[-1].extra[0]
         self.emit("LABEL", extra=lbl_bad)
-        self.emit("CALL", None, [Sym("fa_bounds_error")])
+        self.emit("CALL", None, [Sym("fa_bounds_error"), idx, limit])
         self.emit("LABEL", extra=ok)
+
+    def emit_vec_bounds(self, obj, i: Temp):
+        """Vec 内联存取前的越界检查：**两头都要查**。
+
+        以前只查了上界（i >= len），于是 v[-1] 不报错，直接读到缓冲区前面
+        那 8 个字节（实测打出 81 这种垃圾值，ASan 下是 heap-buffer-underflow）。
+        """
+        n = self.new_temp(I64)
+        self.emit("LOAD", n, [obj], extra=8, ty=I64)
+        hi = self.new_temp(BOOL)
+        self.emit("CMP", hi, [i, n], extra=">=", ty=I64)
+        lo = self.new_temp(BOOL)
+        self.emit("CMP", lo, [i, self.const(0)], extra="<", ty=I64)
+        bad = self.new_temp(BOOL)
+        self.emit("BIN", bad, [lo, hi], extra="or", ty=BOOL)
+        self.emit_bounds_check(bad, i, n)
+        return n
 
     def bitcast(self, v, to_ty: Type):
         """同一 64 位数据的类型重解释（i64 <-> f64），用于容器这类按 uint64_t 存取的 ABI"""
+        if isinstance(v, Const):
+            # 常量必须在**这里**就重解释：否则优化器会把 BITCAST 折叠掉，
+            # 调用点看到的是一个 ty=f64 的常量，按浮点 ABI 放进 xmm0 ——
+            # 而 fa_vec_push / fa_map_set 收的是 uint64_t 位模式（应在 rsi）。
+            # 实测 `push(fv, 2.5)` 存进去的是垃圾位（读回 3.16e-322）。
+            if isinstance(v.val, float) and not to_ty.is_float:
+                return Const(struct.unpack("<q", struct.pack("<d", v.val))[0], to_ty)
+            if isinstance(v.val, int) and to_ty.is_float:
+                return Const(struct.unpack("<d", struct.pack("<q", v.val))[0], to_ty)
         r = self.new_temp(to_ty)
         self.emit("BITCAST", r, [v], ty=to_ty)
         return r
@@ -1404,12 +3076,20 @@ class FnGen:
                      "count": ("fa_str_count", I64),
                      "lines": ("fa_str_lines", vec_of(STR)),
                      "trim_start": ("fa_str_trim_start", STR),
-                     "trim_end": ("fa_str_trim_end", STR)}
-            if name in ("find", "contains", "starts_with", "ends_with", "eq", "replace"):
-                if name == "find":
+                     "trim_end": ("fa_str_trim_end", STR),
+                     # UTF-8 码点：char_len() / char_at(i) / codepoints() /
+                     # slice_chars(a, b)
+                     "char_len": ("fa_str_char_len", I64),
+                     "char_at": ("fa_str_char_at", I64),
+                     "codepoints": ("fa_str_codepoints", vec_of(I64)),
+                     "slice_chars": ("fa_str_slice_chars", STR)}
+            if name in ("find", "rfind", "contains", "starts_with", "ends_with",
+                        "eq", "replace"):
+                if name in ("find", "rfind"):
                     a = self.gen_expr(e.args[0])
                     r = self.new_temp(I64)
-                    self.emit("CALL", r, [Sym("fa_str_find"), obj,
+                    self.emit("CALL", r, [Sym("fa_str_rfind" if name == "rfind"
+                                              else "fa_str_find"), obj,
                                           self.gen_to_str(a, e.args[0].ty)], ty=I64)
                     return r
                 if name == "contains":
@@ -1456,12 +3136,12 @@ class FnGen:
             if name in fnmap:
                 fn, rt = fnmap[name]
                 args = [obj]
-                if name == "slice":
+                if name in ("slice", "slice_chars"):
                     args.append(self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64))
                     args.append(self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, I64))
                 if name == "split":
                     args.append(self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty))
-                if name == "at":
+                if name in ("at", "char_at"):
                     args.append(self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64))
                 r = self.new_temp(rt)
                 self.emit("CALL", r, [Sym(fn)] + args, ty=rt)
@@ -1485,11 +3165,10 @@ class FnGen:
                 return r
             if name == "push":
                 a = self.gen_expr(e.args[0])
-                if et.size > 8 and et.kind == "struct":
-                    box = self.new_temp(ptr_to(et))
-                    self.emit("CALL", box, [Sym("fa_alloc"), self.const(et.size)], ty=ptr_to(et))
-                    self.emit("MEMCPY", args=[box, a], extra=et.size, ty=et)
-                    self.emit("CALL", None, [Sym("fa_vec_push"), obj, box])
+                if et.kind in ("struct", "enum"):
+                    # 8 字节以内的结构体也要装箱：槽里存的必须是「指向副本的指针」，
+                    # 否则运行时按指针去 retain/release 时会把结构体的第一个字段当成头。
+                    self.emit("CALL", None, [Sym("fa_vec_push"), obj, self.box_agg(a, et)])
                 else:
                     # fa_vec_push 内部已按元素 kind 做 rc_inc
                     av = self.coerce(a, e.args[0].ty, et if et.kind != "struct" else I64)
@@ -1500,11 +3179,7 @@ class FnGen:
             if name == "get":
                 i = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
                 # 内联快速路径：越界检查 + 直接取元素（省掉一次函数调用）
-                n = self.new_temp(I64)
-                self.emit("LOAD", n, [obj], extra=8, ty=I64)
-                bad = self.new_temp(BOOL)
-                self.emit("CMP", bad, [i, n], extra=">=", ty=I64)
-                self.emit_bounds_check(bad)
+                self.emit_vec_bounds(obj, i)
                 data = self.new_temp(ptr_to(I64))
                 self.emit("LOAD", data, [obj], extra=32, ty=ptr_to(I64))
                 # extra=(下标, 比例) -> 直接用 x86 比例变址 [data + i*esz]，省掉一条 imul
@@ -1517,19 +3192,19 @@ class FnGen:
                 i = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
                 a = self.gen_expr(e.args[1])
                 # fa_vec_set 内部完成「新值 inc + 旧值 dec」
-                av = self.coerce(a, e.args[1].ty, et if et.kind != "struct" else I64)
+                if et.kind in ("struct", "enum"):
+                    self.emit("CALL", None, [Sym("fa_vec_set"), obj, i,
+                                             self.box_agg(a, et)])
+                    return self.const(0, VOID)
+                av = self.coerce(a, e.args[1].ty, et)
                 if et.is_float:
                     av = self.bitcast(av, I64)
-                if et.kind == "struct" or T.t_is_refcounted(et):
-                    # 结构体元素 / 需要维护引用计数的元素仍然走运行时
+                if T.t_is_refcounted(et):
+                    # 需要维护引用计数的元素仍然走运行时
                     self.emit("CALL", None, [Sym("fa_vec_set"), obj, i, av])
                     return self.const(0, VOID)
                 # 内联快速路径：越界检查 + 直接写元素
-                n = self.new_temp(I64)
-                self.emit("LOAD", n, [obj], extra=8, ty=I64)
-                bad = self.new_temp(BOOL)
-                self.emit("CMP", bad, [i, n], extra=">=", ty=I64)
-                self.emit_bounds_check(bad)
+                self.emit_vec_bounds(obj, i)
                 data = self.new_temp(ptr_to(I64))
                 self.emit("LOAD", data, [obj], extra=32, ty=ptr_to(I64))
                 ez = vec_esz(et)
@@ -1551,7 +3226,18 @@ class FnGen:
                 return r
             if name == "resize":
                 n = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
-                v = self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, et)
+                fill = e.args[1] if len(e.args) > 1 else None
+                if et.kind in ("str", "vec", "map", "struct", "enum"):
+                    # 标量那条路（把同一个值 push n 次）对引用计数/装箱元素全错，
+                    # 见 emit_vec_resize_ref 的说明
+                    self.emit_vec_resize_ref(obj, et, n, fill)
+                    return self.const(0, VOID)
+                if fill is not None:
+                    v = self.coerce(self.gen_expr(fill), fill.ty, et)
+                else:
+                    v = self.const_zero(et)      # v.resize(n)：新元素补零值
+                if et.is_float:
+                    v = self.bitcast(v, I64)     # 运行时按 uint64 收，浮点得按位转
                 self.emit("CALL", None, [Sym("fa_vec_resize"), obj, n, v])
                 return self.const(0, VOID)
             if name == "sort":
@@ -1559,11 +3245,26 @@ class FnGen:
                       "fa_vec_sort_str" if et == STR else "fa_vec_sort_i64")
                 self.emit("CALL", None, [Sym(fn), obj])
                 return self.const(0, VOID)
+            if name in self.VEC_CALLBACKS:
+                return self.gen_vec_callback(name, obj, et, e)
+            if name == "sort_by":
+                # 取键函数：函数名经 gen_nameref 出来是 LEA_SYM，就是一个代码地址，
+                # 运行时按 System V 调用约定直接调（§19.4 的 C 回调走的是同一条路）。
+                kf = self.gen_expr(e.args[0])
+                boxed = 1 if et.kind in ("struct", "enum") else 0
+                rt = e.args[0].ty.ret
+                kind = 2 if rt.kind == "str" else (1 if rt.is_float else 0)
+                self.emit("CALL", None,
+                          [Sym("fa_vec_sort_by"), obj, kf,
+                           self.const(boxed, I64), self.const(kind, I64)])
+                return self.const(0, VOID)
             if name == "reverse":
                 self.emit("CALL", None, [Sym("fa_vec_reverse"), obj])
                 return self.const(0, VOID)
             if name == "join":
                 sep = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+                if self._ty_has_agg(et):
+                    return self.gen_vec_join_agg(obj, et, sep)
                 r = self.call2("fa_vec_join", obj, sep, STR)
                 self.mark_owned(r, STR)
                 return r
@@ -1585,12 +3286,53 @@ class FnGen:
             if name == "clear":
                 self.emit("CALL", None, [Sym("fa_vec_clear"), obj])
                 return self.const(0, VOID)
+            if name == "copy":
+                # 装箱元素（struct / enum）要把盒子大小告诉运行时：盒子不带引用
+                # 计数，共享 = 释放两次。其余类型传 0。
+                box = max(et.size, 8) if et.kind in ("struct", "enum") else 0
+                r = self.new_temp(ot)
+                self.emit("CALL", r, [Sym("fa_vec_clone"), obj, self.const(box)], ty=ot)
+                self.mark_owned(r, ot)          # 新表归调用方，语句末尾别释放
+                return r
+            if name == "insert":
+                i = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
+                v = self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, et)
+                if et.is_float:
+                    v = self.bitcast(v, I64)    # 运行时按 uint64 收，浮点得按位转
+                self.emit("CALL", None, [Sym("fa_vec_insert"), obj, i, v])
+                return self.const(0, VOID)
+            if name == "remove":
+                i = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
+                self.emit("CALL", None, [Sym("fa_vec_remove"), obj, i])
+                return self.const(0, VOID)
+            if name in ("slice", "dedup"):
+                # 都返回**新表**，原表不动。装箱元素要把盒子大小传下去，
+                # 让运行时克隆盒子而不是共享（共享 = 释放两次）。
+                box = max(et.size, 8) if et.kind in ("struct", "enum") else 0
+                fn = "fa_vec_slice" if name == "slice" else "fa_vec_dedup"
+                args = [Sym(fn), obj]
+                if name == "slice":
+                    args.append(self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64))
+                    args.append(self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, I64))
+                args.append(self.const(box))
+                r = self.new_temp(ot)
+                self.emit("CALL", r, args, ty=ot)
+                self.mark_owned(r, ot)
+                return r
         # ---- map
         if ot.kind == "map":
             kt, vt = ot.key, ot.val
             if name == "len":
                 r = self.new_temp(I64)
                 self.emit("CALL", r, [Sym("fa_map_len"), obj], ty=I64)
+                return r
+            if name == "copy":
+                kbox = max(kt.size, 8) if kt.kind in ("struct", "enum") else 0
+                vbox = max(vt.size, 8) if vt.kind in ("struct", "enum") else 0
+                r = self.new_temp(ot)
+                self.emit("CALL", r, [Sym("fa_map_clone"), obj,
+                                      self.const(kbox), self.const(vbox)], ty=ot)
+                self.mark_owned(r, ot)
                 return r
             if name == "get":
                 k = self.gen_expr(e.args[0])
@@ -1599,70 +3341,31 @@ class FnGen:
                     kk = self.bitcast(kk, I64)
                 raw = self.new_temp(I64)
                 self.emit("CALL", raw, [Sym("fa_map_get"), obj, kk], ty=I64)
+                raw = self.map_miss_default(raw, vt, kk, kt, ot)
                 return self.bitcast(raw, vt) if vt.is_float else raw
             if name == "set":
-                k = self.gen_expr(e.args[0])
-                v = self.gen_expr(e.args[1])
-                # fa_map_set 内部完成「新键值 inc + 旧键值 dec」
-                kk = self.coerce(k, e.args[0].ty, kt)
-                vv = self.coerce(v, e.args[1].ty, vt)
-                if kt.is_float:
-                    kk = self.bitcast(kk, I64)
-                if vt.is_float:
-                    vv = self.bitcast(vv, I64)
-                self.emit("CALL", None, [Sym("fa_map_set"), obj, kk, vv])
+                self.emit_map_set(obj, e.args[0], e.args[1], kt, vt)
                 return self.const(0, VOID)
-            if name == "has":
+            if name in ("has", "contains"):
                 k = self.gen_expr(e.args[0])
+                kk = self.coerce(k, e.args[0].ty, kt)
+                if kt.is_float:
+                    # 浮点键在表里存的是**位模式**（fa_map_set 那边 bitcast 过），
+                    # 这里不转就把 f64 放在 xmm 里传过去、整数参数寄存器里是垃圾 ——
+                    # 实测 Map<f64, V>.has() 永远 false（而 get 是对的，它转了）。
+                    kk = self.bitcast(kk, I64)
                 r = self.new_temp(I64)
-                self.emit("CALL", r, [Sym("fa_map_has"), obj,
-                                      self.coerce(k, e.args[0].ty, kt)], ty=I64)
+                self.emit("CALL", r, [Sym("fa_map_has"), obj, kk], ty=I64)
                 c = self.new_temp(BOOL)
                 self.emit("CMP", c, [r, self.const(1)], extra="==", ty=I64)
                 return c
             if name == "del":
                 k = self.gen_expr(e.args[0])
-                self.emit("CALL", None, [Sym("fa_map_del"), obj,
-                                         self.coerce(k, e.args[0].ty, kt)])
+                kk = self.coerce(k, e.args[0].ty, kt)
+                if kt.is_float:
+                    kk = self.bitcast(kk, I64)      # 同 has：键是位模式
+                self.emit("CALL", None, [Sym("fa_map_del"), obj, kk])
                 return self.const(0, VOID)
-            if name == "contains":
-                v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, et)
-                r = self.new_temp(I64)
-                self.emit("CALL", r, [Sym("fa_vec_contains"), obj, v], ty=I64)
-                return r
-            if name == "resize":
-                n = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
-                v = self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, et)
-                self.emit("CALL", None, [Sym("fa_vec_resize"), obj, n, v])
-                return self.const(0, VOID)
-            if name == "sort":
-                fn = ("fa_vec_sort_f64" if et.is_float else
-                      "fa_vec_sort_str" if et == STR else "fa_vec_sort_i64")
-                self.emit("CALL", None, [Sym(fn), obj])
-                return self.const(0, VOID)
-            if name == "reverse":
-                self.emit("CALL", None, [Sym("fa_vec_reverse"), obj])
-                return self.const(0, VOID)
-            if name == "join":
-                sep = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
-                r = self.call2("fa_vec_join", obj, sep, STR)
-                self.mark_owned(r, STR)
-                return r
-            if name == "sum":
-                fn = "fa_vec_sum_f64" if et.is_float else "fa_vec_sum_i64"
-                rt = F64 if et.is_float else I64
-                return self.call1(fn, obj, rt)
-            if name in ("min", "max"):
-                if et.is_float:
-                    return self.call1(f"fa_vec_{name}_f64", obj, F64)
-                if et == STR:
-                    self.err("str 容器的 min/max 暂不支持（请先 sort）", e)
-                return self.call1(f"fa_vec_{name}_i64", obj, I64)
-            if name == "index_of":
-                a = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, et)
-                if et.is_float:
-                    a = self.bitcast(a, I64)
-                return self.call2("fa_vec_index_of", obj, a, I64)
             if name == "clear":
                 self.emit("CALL", None, [Sym("fa_map_clear"), obj])
                 return self.const(0, VOID)
@@ -1751,44 +3454,92 @@ class FnGen:
                 self.emit("CALL", r, [Sym(fn), self.coerce(obj, ot, F64 if ot.is_float else I64)],
                           ty=F64 if ot.is_float else I64)
                 return r
+            if name in ("to_f64", "to_i64"):
+                return self.coerce(obj, ot, F64 if name == "to_f64" else I64)
+            if name in ("ceil", "floor", "round", "trunc", "sqrt", "log", "log2",
+                        "log10", "exp", "exp2", "sin", "cos", "tan"):
+                return self.call1(name, self.coerce(obj, ot, F64), F64)
+        # 容器/结构体的 to_str()：复用 print 用的那条字符串化路径
+        if name == "to_str" and ot.kind in ("vec", "map", "arr", "struct",
+                                            "enum", "bool", "char", "ptr"):
+            return self.gen_to_str(obj, ot)
         if ot.kind == "arr" and name == "len":
             return self.const(ot.count)
         self.err(f"未实现的内建方法 .{name}（类型 {ot}）", e)
 
     # ------------------------------------------------------------ 内建函数
+    # 只对容器有意义的内建（写在 sema 的 BUILTIN_FNS 里，但 codegen 一直没实现）
+    CONTAINER_FNS = ("sum", "sort", "sort_by", "reverse", "join", "index_of",
+                     "map", "filter", "any", "all", "index_where", "for_each")
+    # 这些内建既有 v.push(x) 的方法写法，也有 push(v, x) 的全局写法
+    VEC_GLOBAL_FNS = ("push", "pop", "get", "set", "clear", "resize", "contains")
+    # 标量/容器两用的内建：实参是容器时走容器实现
+    DUAL_FNS = ("min", "max", "contains")
+
     def gen_builtin(self, name: str, e: Call):
+        # 容器版全局函数：sum(v) / sort(v) / join(v, sep) / contains(v, x) / min(v) ...
+        # 必须在标量分支之前判断，否则 min(v) 会掉进「二元 min」里越界取 args[1]。
+        t0 = e.args[0].ty if e.args else None
+        is_cont = t0 is not None and t0.kind in ("vec", "arr", "map", "str")
+        if name in self.CONTAINER_FNS or (name in self.DUAL_FNS and is_cont):
+            return self._builtin_on_container(name, e)
+        # push(v, x) / pop(v) / get(v, i) 这类「全局写法」以前在 gen_builtin 里
+        # 另写了一份，漏掉了方法版有的两件事：浮点要按位模式当整数传、
+        # 结构体元素要装箱。结果 `push(fv, 2.5)` 存进去的是垃圾位
+        # （读回 3.16e-322），而 `fv.push(2.5)` 是对的。统一转发到方法实现。
+        if name in self.VEC_GLOBAL_FNS and t0 is not None and t0.kind == "vec":
+            return self._builtin_on_container(name, e)
         if name in ("print", "println"):
-            for i, a in enumerate(e.args):
+            # 分两趟：先把每个实参求值成「要打印的东西」，再一个一个写出去。
+            #
+            # 以前是「求一个写一个」，两处会露馅：
+            # 1) print("返回", f()) 里 f() 自己要打印时，它的输出会插进外层 print
+            #    中间 —— 实测打出来是「返回 defer 跑了」换行「0」，看着像 print 坏了；
+            # 2) 容器/聚合值是在「写」的那一步才转字符串的，于是 print(v, v.pop())
+            #    打出的是 pop 之后的 v。
+            # 现在实参（含 to_str 转换）在第一趟全部算完，顺序和 C 的
+            # printf("%s %d", a, f()) 一致。
+            items = []
+            for a in e.args:
+                v = self.gen_expr(a)
+                t = a.ty
+                if t.kind in ("vec", "map", "pyobj", "jobj", "struct", "arr", "enum"):
+                    items.append(("str", self.gen_to_str(v, t)))
+                elif t == STR:
+                    items.append(("str", v))
+                elif t.kind == "float":
+                    items.append(("f64", self.coerce(v, t, F64)))
+                elif t.kind == "bool":
+                    items.append(("bool", v))
+                elif t == CHAR:
+                    items.append(("char", v))
+                elif t.kind == "ptr":
+                    if self._is_cstr_ptr(t):
+                        cs = self.new_temp(STR)
+                        self.emit("CALL", cs, [Sym("fa_str_from_cstr"), v], ty=STR)
+                        # fa_str_from_cstr 拷出一份新 FaStr，打完就得放：
+                        # 以前没登记，print 一个 C 的 char* 就漏一份拷贝。
+                        self.mark_owned(cs, STR)
+                        items.append(("str", cs))
+                    else:
+                        items.append(("ptr", v))
+                else:
+                    items.append(("i64", self.coerce(v, t, I64)))
+            for i, (kind, v) in enumerate(items):
                 if i:
                     sp = self.make_str(" ")
                     self.emit("CALL", None, [Sym("fa_print_str"), sp])
-                v = self.gen_expr(a)
-                if a.ty == STR:
-                    self.emit("CALL", None, [Sym("fa_print_str"), v])
-                elif a.ty.kind == "float":
-                    self.emit("CALL", None, [Sym("fa_print_f64"), self.coerce(v, a.ty, F64)])
-                elif a.ty.kind == "bool":
-                    self.emit("CALL", None, [Sym("fa_print_bool"), v])
-                elif a.ty == CHAR:
-                    self.emit("CALL", None, [Sym("fa_print_char"), v])
-                elif a.ty.kind == "ptr":
-                    self.emit("CALL", None, [Sym("fa_print_ptr"), v])
-                elif a.ty.kind in ("vec", "map", "pyobj", "jobj"):
-                    s = self.gen_to_str(v, a.ty)
-                    self.emit("CALL", None, [Sym("fa_print_str"), s])
-                elif a.ty.kind in ("struct", "arr", "enum"):
-                    s = self.gen_to_str(v, a.ty)
-                    self.emit("CALL", None, [Sym("fa_print_str"), s])
-                else:
-                    self.emit("CALL", None, [Sym("fa_print_i64"),
-                                             self.coerce(v, a.ty, I64)])
+                self.emit("CALL", None, [Sym("fa_print_" + kind), v])
             self.emit("CALL", None, [Sym("fa_print_nl")])
             return self.const(0, VOID)
         if name == "write":
+            # 同 print：实参（含 to_str 转换）全部算完再写出去
+            vals = []
             for a in e.args:
                 v = self.gen_expr(a)
-                s = v if a.ty == STR else self.gen_to_str(v, a.ty)
-                self.emit("CALL", None, [Sym("fa_print_str"), s])
+                vals.append(v if a.ty == STR else self.gen_to_str(v, a.ty))
+            for sv in vals:
+                self.emit("CALL", None, [Sym("fa_print_str"), sv])
             return self.const(0, VOID)
         if name == "len":
             a = self.gen_expr(e.args[0])
@@ -1836,6 +3587,12 @@ class FnGen:
             self.emit("LABEL", extra=l_ok)
             return self.const(0, VOID)
         if name == "exit":
+            # `exit()` 不写参数就是「正常结束」，退出码 0。
+            # 以前这里直接取 e.args[0]，参数一个没给就在代码生成阶段炸出一个
+            # Python IndexError（连栈回溯一起打到用户脸上）。
+            if not e.args:
+                self.emit("CALL", None, [Sym("fa_exit"), self.const(0, I64)])
+                return self.const(0, VOID)
             v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
             self.emit("CALL", None, [Sym("fa_exit"), v])
             return self.const(0, VOID)
@@ -1875,10 +3632,38 @@ class FnGen:
             return self.call2(fn, a, b, tt)
         if name == "random":
             return self.call0("fa_random", I64)
+        if name == "free":
+            # 释放 `new` 出来的（或 C 那边 malloc 的）指针。
+            # 指向的对象如果自己有引用（结构体字段里的 str / Vec / Map、
+            # 数组元素），先逐个还掉，再把这块内存还给 malloc —— 只调 libc 的
+            # free 会把字段漏掉。
+            v = self.gen_expr(e.args[0])
+            inner = e.args[0].ty.inner
+            if inner is not None and T.t_is_refcounted(inner):
+                if inner.kind in ("struct", "enum", "arr"):
+                    self.emit_rcdec_val(v, inner)      # 收「对象地址」
+                else:
+                    held = self.new_temp(inner)        # *str 这种：先取出指针
+                    self.emit("LOAD", held, [v], extra=0, ty=inner)
+                    self.emit_rcdec_val(held, inner)
+            self.emit("CALL", None, [Sym("fa_free"), v])
+            return self.const(0, VOID)
+        if name == "cstr":
+            # C 的 char*（以 \0 结尾）→ 拷一份成 FA 的 str。运行时那份
+            # fa_str_from_cstr 本来就在（extern 函数返回 char* 时走的就是它），
+            # 这里只是把它开放成一个能直接写的内建函数。
+            v = self.gen_expr(e.args[0])
+            r = self.call1("fa_str_from_cstr", v, STR)
+            self.mark_owned(r, STR)          # 新字符串归本语句所有，收尾要释放
+            return r
         if name == "chr":
             # 码点 -> UTF-8 字符串（1~4 字节）
             v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
-            return self.call1("fa_str_chr", v, STR)
+            r = self.call1("fa_str_chr", v, STR)
+            # 新字符串归本语句所有，收尾要释放。以前漏了这行，chr() 的结果
+            # 在 print / 拼接以外没人管 —— 每调一次漏一个 FaStr。
+            self.mark_owned(r, STR)
+            return r
         if name in ("hex", "oct", "bin"):
             v = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
             base = {"hex": 16, "oct": 8, "bin": 2}[name]
@@ -1928,32 +3713,17 @@ class FnGen:
             if mt.kind != "map":
                 self.err(f"{name}() 需要 Map", e)
             et = mt.key if name == "keys" else mt.val
-            k = elem_kind(et, self.sema)
+            # 一趟扫槽位建出来。以前在编译器里发一个 0..len 的循环、每轮调
+            # fa_map_key_at(m, i) 取「第 i 个占用槽」—— 那个函数每调一次都要从头扫，
+            # 于是 keys() 是 O(n·cap)：**五万个键实测 12.3 秒**（同一张表 sort 只要 6 毫秒）。
             v = self.new_temp(vec_of(et))
-            self.emit("CALL", v, [Sym("fa_vec_new"), self.const(k),
-                                  self.const(vec_esz(et)),
-                                  self.const(1 if (et.kind == "int" and et.is_signed) else 0)],
+            self.emit("CALL", v,
+                      [Sym("fa_map_keys_vec" if name == "keys" else "fa_map_vals_vec"),
+                       m, self.const(elem_kind(et, self.sema)), self.const(vec_esz(et)),
+                       self.const(1 if (et.kind == "int" and et.is_signed) else 0),
+                       self.const(T.ty_code(et))],
                       ty=vec_of(et))
             self.mark_owned(v, vec_of(et))
-            n = self.new_temp(I64)
-            self.emit("CALL", n, [Sym("fa_map_len"), m], ty=I64)
-            i = self.new_temp(I64)
-            self.emit("MOV", i, [self.const(0)], ty=I64)
-            top = self.new_label("keys")
-            body = self.new_label("kbody")
-            end = self.new_label("kend")
-            self.emit("LABEL", extra=top)
-            c = self.new_temp(BOOL)
-            self.emit("CMP", c, [i, n], extra="<", ty=I64)
-            self.emit("BR", args=[c], extra=(body, end))
-            self.emit("LABEL", extra=body)
-            raw = self.new_temp(I64)
-            fn = "fa_map_key_at" if name == "keys" else "fa_map_val_at"
-            self.emit("CALL", raw, [Sym(fn), m, i], ty=I64)
-            self.emit("CALL", None, [Sym("fa_vec_push"), v, raw])
-            self.emit("BIN", i, [i, self.const(1)], extra="+", ty=I64)
-            self.emit("JMP", extra=top)
-            self.emit("LABEL", extra=end)
             return v
         if name == "file_read":
             v = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
@@ -1980,26 +3750,40 @@ class FnGen:
             self.mark_owned(r, STR)
             return r
         if name == "concat":
-            v = self.gen_expr(e.args[0])
-            return self.gen_to_str(v, e.args[0].ty)
-        if name == "push":
-            obj = self.gen_expr(e.args[0])
-            a = self.gen_expr(e.args[1])
-            et = e.args[0].ty.elem
-            self.emit("CALL", None, [Sym("fa_vec_push"), obj,
-                                     self.coerce(a, e.args[1].ty, et)])
-            return self.const(0, VOID)
-        if name == "pop":
-            obj = self.gen_expr(e.args[0])
-            r = self.new_temp(e.args[0].ty.elem)
-            self.emit("CALL", r, [Sym("fa_vec_pop"), obj], ty=e.args[0].ty.elem)
-            self.mark_owned(r, e.args[0].ty.elem)
-            return r
+            # concat(a, b, ...) = 各参数转成字符串再依次拼起来。
+            # 以前这里只转**第一个**参数就 return，后面的全被静默丢掉：
+            # concat("甲", "乙") 打出「甲」，concat(v1, v2) 也只是 v1.to_str()。
+            # 拼法跟字符串插值走同一条路（fa_str_concat，返回值 +1 交给语句末尾统一释放；
+            # 两个输入是借来的，绝不能在这里登记释放）。
+            if not e.args:
+                self.err("concat() 至少要一个参数（要拼接的字符串或值）", e)
+            cur = self.gen_to_str(self.gen_expr(e.args[0]), e.args[0].ty)
+            for a in e.args[1:]:
+                s2 = self.gen_to_str(self.gen_expr(a), a.ty)
+                r = self.new_temp(STR)
+                self.emit("CALL", r, [Sym("fa_str_concat"), cur, s2], ty=STR)
+                self.mark_owned(r, STR)
+                cur = r
+            return cur
         if name == "gcd":
             a = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
             b = self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, I64)
             return self.call2("fa_gcd", a, b, I64)
         self.err(f"未实现的内建函数 '{name}'", e)
+
+    def _builtin_on_container(self, name: str, e: Call):
+        """把 `sum(v)` 这类全局写法转发到 `v.sum()` 的实现"""
+        if not e.args:
+            self.err(f"{name}() 需要一个容器实参", e)
+        a0 = e.args[0]
+        t0 = a0.ty
+        if t0 is not None and t0.kind not in ("vec", "arr", "map", "str"):
+            self.err(f"{name}() 需要 Vec/Map/str 实参，得到 {t0}", e)
+        mc = MethodCall(obj=a0, name=name, args=list(e.args[1:]),
+                        resolved="builtin-method")
+        mc.ty = e.ty
+        mc.line, mc.col = e.line, e.col
+        return self.gen_builtin_method(mc)
 
     def call0(self, fn, ty):
         r = self.new_temp(ty)
@@ -2178,6 +3962,13 @@ class FnGen:
 def generate(sema: Sema) -> IRModule:
     mod = IRModule()
     mod.descs = sema.descs
+    # 顶层 let 的存储：(汇编标签, 字节数)。asmgen 在 .bss 里逐个开槽。
+    mod.gvar_slots = []
+    for d in getattr(sema, "global_decls", []):
+        if d.sym is None:
+            continue                          # 语义阶段已经报过错
+        gt = d.sym.ty
+        mod.gvar_slots.append((d.sym.label, max(gt.size if is_agg(gt) else 8, 8)))
     for sym, body, params in getattr(sema, "fn_bodies_plain", []):
         pass
     for item in sema.fn_bodies:

@@ -5,14 +5,34 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* kind 编码（与 compiler/falang/types.py 保持一致） */
+/* kind 编码（与 compiler/falang/types.py 保持一致）—— 决定「怎么释放」 */
 #define FA_K_NONE 0
 #define FA_K_STR  1
 #define FA_K_VEC  2
 #define FA_K_MAP  3
 #define FA_K_PY   4
 #define FA_K_JOBJ 5
-#define FA_K_BOX  6
+#define FA_K_BOX  6                   /* 装箱的纯数据结构体：释放时直接 free */
+#define FA_K_STRUCT_DESC_BASE   1000  /* +desc_id：内联/嵌套结构体，释放字段但不 free */
+#define FA_K_BOXED_STRUCT       2000  /* +desc_id：容器里装箱的结构体，释放字段 + free */
+
+/* 元素类型编码（与 compiler/falang/types.py 的 ty_code() 一致）—— 决定「怎么显示」
+   kind 只够用来做引用计数，分不清 i64 / u64 / f64 / bool / char，
+   所以容器额外记一个类型码，to_str / join / print 才能格式化正确。 */
+#define FA_TY_INT    0   /* 宽度看 esz，符号看 sgn */
+#define FA_TY_FLOAT  1   /* 一律按 double 解释（f32 在表达式里已提升为 f64） */
+#define FA_TY_BOOL   2
+#define FA_TY_CHAR   3
+#define FA_TY_STR    4
+#define FA_TY_VEC    5
+#define FA_TY_MAP    6
+#define FA_TY_STRUCT 7
+#define FA_TY_PYOBJ  8
+#define FA_TY_JOBJ   9
+#define FA_TY_PTR    10
+#define FA_TY_ENUM   11
+#define FA_TY_ARR    12
+#define FA_TY_ANY    13
 
 typedef struct FaStr {
     int64_t  rc;
@@ -28,6 +48,7 @@ typedef struct FaVec {
     uint64_t *data;     /* 必须保持在偏移 32：codegen 内联的 get/set/len 直接用这个偏移 */
     int64_t  esz;       /* 元素存储宽度：1/2/4/8 字节 */
     int64_t  sgn;       /* 窄元素是否有符号（决定零扩展还是符号扩展） */
+    int64_t  ety;       /* 元素类型码 FA_TY_*（显示用；偏移 56，绝不可挪到 data 之前） */
 } FaVec;
 
 typedef struct FaMapEntry {
@@ -43,6 +64,8 @@ typedef struct FaMap {
     int64_t     kkind;
     int64_t     vkind;
     FaMapEntry *entries;
+    int64_t     kty;    /* 键类型码 FA_TY_*（显示用） */
+    int64_t     vty;    /* 值类型码 FA_TY_*（显示用） */
 } FaMap;
 
 /* 桥接模块的引用释放钩子 */
@@ -55,6 +78,12 @@ void  fa_free(void *p);
 void  fa_rc_inc(void *p);
 void  fa_rc_dec(void *p, int64_t kind);
 void  fa_register_desc(int64_t id, int64_t *desc);
+void  fa_register_retain(int64_t id, void (*fn)(void *));
+void  fa_register_drop(int64_t id, void (*fn)(void *));
+
+/* 定长数组的批量增减引用（fn != NULL 时元素是内联结构体） */
+void  fa_drop_arr(void *base, int64_t count, int64_t esz, int64_t kind, void (*fn)(void *));
+void  fa_retain_arr(void *base, int64_t count, int64_t esz, int64_t kind, void (*fn)(void *));
 
 /* --- 字符串 --- */
 FaStr *fa_str_new(const char *s, int64_t len);
@@ -72,9 +101,15 @@ FaStr *fa_str_of_ptr(void *v);
 int64_t fa_str_byte(FaStr *s, int64_t i);
 FaStr  *fa_str_chr(int64_t cp);
 int64_t fa_str_find(FaStr *s, FaStr *sub);
+int64_t fa_str_rfind(FaStr *s, FaStr *sub);
 FaStr *fa_str_trim(FaStr *s);
 FaStr *fa_str_upper(FaStr *s);
 FaStr *fa_str_lower(FaStr *s);
+/* UTF-8 码点（char 是一个字节，码点用 int64_t） */
+int64_t fa_str_char_len(FaStr *s);
+int64_t fa_str_char_at(FaStr *s, int64_t idx);
+FaVec  *fa_str_codepoints(FaStr *s);
+FaStr  *fa_str_slice_chars(FaStr *s, int64_t a, int64_t b);
 FaStr *fa_str_replace(FaStr *s, FaStr *a, FaStr *b);
 FaVec *fa_str_split(FaStr *s, FaStr *sep);
 FaVec *fa_str_chars(FaStr *s);
@@ -100,6 +135,9 @@ void fa_flush(void);
 void    fa_vec_sort_i64(FaVec *v);
 void    fa_vec_sort_f64(FaVec *v);
 void    fa_vec_sort_str(FaVec *v);
+/* 按取键函数排：boxed = 元素是装箱指针（结构体/枚举），kind = 0 i64 / 1 f64 / 2 str */
+void   *fa_vec_elem_addr(FaVec *v, int64_t i, int64_t boxed);
+void    fa_vec_sort_by(FaVec *v, void *keyfn, int64_t boxed, int64_t kind);
 void    fa_vec_reverse(FaVec *v);
 FaStr  *fa_vec_join(FaVec *v, FaStr *sep);
 int64_t fa_vec_sum_i64(FaVec *v);
@@ -109,6 +147,12 @@ int64_t fa_vec_max_i64(FaVec *v);
 double  fa_vec_min_f64(FaVec *v);
 double  fa_vec_max_f64(FaVec *v);
 int64_t fa_vec_index_of(FaVec *v, uint64_t val);
+void    fa_vec_insert(FaVec *v, int64_t idx, uint64_t val);
+void    fa_vec_remove(FaVec *v, int64_t idx);
+/* box_size > 0 表示元素是装箱的聚合（结构体/枚举），切片和去重都得克隆盒子：
+   盒子不带引用计数，两个表共享同一个盒子 = 释放两次。其余类型传 0。 */
+FaVec  *fa_vec_slice(FaVec *v, int64_t a, int64_t b, int64_t box_size);
+FaVec  *fa_vec_dedup(FaVec *v, int64_t box_size);
 
 /* --- 字符串增强 --- */
 FaStr  *fa_str_repeat(FaStr *s, int64_t n);
@@ -128,19 +172,31 @@ void    fa_set_args(int64_t argc, char **argv);
 FaVec  *fa_args(void);
 
 /* --- 容器 --- */
-FaVec *fa_vec_new(int64_t kind, int64_t esz, int64_t sgn);
+FaVec *fa_vec_new(int64_t kind, int64_t esz, int64_t sgn, int64_t ety);
+FaVec *fa_vec_clone(FaVec *v, int64_t box_size);   /* v.copy()；box_size>0 表示元素是装箱的聚合 */
 int64_t fa_vec_len(FaVec *v);
 void    fa_vec_push(FaVec *v, uint64_t val);
 uint64_t fa_vec_get(FaVec *v, int64_t i);
 void    fa_vec_set(FaVec *v, int64_t i, uint64_t val);
 uint64_t fa_vec_pop(FaVec *v);
 void    fa_vec_clear(FaVec *v);
-void    fa_bounds_error(void);
+void    fa_bounds_error(int64_t idx, int64_t len);
 int64_t fa_vec_contains(FaVec *v, uint64_t val);
 void    fa_vec_resize(FaVec *v, int64_t n, uint64_t val);
 
-FaMap *fa_map_new(int64_t kkind, int64_t vkind);
+FaMap *fa_map_new(int64_t kkind, int64_t vkind, int64_t kty, int64_t vty);
+FaMap *fa_map_clone(FaMap *m, int64_t kbox, int64_t vbox);   /* m.copy() */
 int64_t fa_map_len(FaMap *m);
+/* 按**槽位**遍历：fa_map_key_at/val_at 那种「第 idx 个占用槽」每调一次都要从头扫，
+   整个 keys() / for k in m 就是 O(n·cap) —— 五万个键实测 12 秒。下面这组是 O(1) 一次，
+   调用方自己扫 0..fa_map_cap 并跳过未占用的槽（空槽与墓碑），一趟 O(cap)。 */
+int64_t fa_map_cap(FaMap *m);
+int64_t fa_map_slot_used(FaMap *m, int64_t i);
+uint64_t fa_map_slot_key(FaMap *m, int64_t i);
+uint64_t fa_map_slot_val(FaMap *m, int64_t i);
+/* 一趟建出所有键 / 值的 Vec（构造参数与 fa_vec_new 一致） */
+FaVec *fa_map_keys_vec(FaMap *m, int64_t kind, int64_t esz, int64_t sgn, int64_t ety);
+FaVec *fa_map_vals_vec(FaMap *m, int64_t kind, int64_t esz, int64_t sgn, int64_t ety);
 uint64_t fa_map_get(FaMap *m, uint64_t key);
 void    fa_map_set(FaMap *m, uint64_t key, uint64_t val);
 int64_t fa_map_has(FaMap *m, uint64_t key);
@@ -166,8 +222,6 @@ int64_t fa_imax(int64_t a, int64_t b);
 int64_t fa_gcd(int64_t a, int64_t b);
 
 /* --- 动态库懒绑定 --- */
-void *fa_dl_open(const char *path);
-int64_t fa_dl_bind(void *handle, void **slot, const char *name);
 
 /* --- 手写汇编热路径 --- */
 int64_t fa_sys_write(int64_t fd, const char *buf, int64_t count);

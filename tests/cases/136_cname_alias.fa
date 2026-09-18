@@ -1,0 +1,50 @@
+# `fn 本地名(...) -> T = "C 里的符号名"`：声明一个外部符号，同时在 FA 侧换个名字。
+#
+# 为什么要有这个写法：C 库里一大堆名字和 FA 的内建函数撞车 ——
+# free / exit / pow / sqrt / abs / min / max / log / exp / floor / ceil /
+# random / env / cmd / len / str / sum / sort / join / keys / values ...
+# 直接 `fn free(p: *void)` 会把内建的 free 悄悄顶掉：写的人以为在用内建的，
+# 编译器也不吭声。显式改名，两边都还在。
+#
+# 这一例同时钉住：链接期导入（use c）和运行时 dlopen（use lib）都认这个写法。
+
+use c "stdlib.h" lib "c":
+    fn c_free(p: *void) -> void = "free"
+    fn c_abs(x: i32) -> i32 = "abs"
+    fn malloc(n: usize) -> *void
+
+use c "math.h" lib "m":
+    fn c_sqrt(x: f64) -> f64 = "sqrt"
+    fn c_pow(a: f64, b: f64) -> f64 = "pow"
+    fn c_floor(x: f64) -> f64 = "floor"
+
+use lib "libm.so.6":
+    fn dl_sqrt(x: f64) -> f64 = "sqrt"
+    fn dl_fabs(x: f64) -> f64 = "fabs"
+
+fn main() -> i64:
+    # 改过名的 C 函数
+    print("c_abs(-7)    =", c_abs(-7))
+    print("c_sqrt(2.0)  =", c_sqrt(2.0))
+    print("c_pow(2,10)  =", c_pow(2.0, 10.0))
+    print("c_floor(3.9) =", c_floor(3.9))
+
+    # 内建的同名函数还在，没被顶掉
+    print("abs(-3)      =", abs(-3))
+    print("sqrt(9.0)    =", sqrt(9.0))
+    print("pow(2,8)     =", pow(2.0, 8.0))
+    print("floor(3.9)   =", floor(3.9))
+    print("min/max      =", min(3, 7), max(3, 7))
+
+    # 运行时 dlopen 的那份也认符号名
+    print("dl_sqrt(16)  =", dl_sqrt(16.0))
+    print("dl_fabs(-2.5)=", dl_fabs(-2.5))
+
+    # malloc / c_free：手动管理一块内存
+    let p = malloc(32)
+    print("malloc 非空  =", p != nil)
+    *(p as *i64) = 12345
+    print("写进去再读   =", *(p as *i64))
+    c_free(p)
+    print("c_free 没崩")
+    return 0

@@ -1,0 +1,41 @@
+# 容器里放结构体：元素一律装箱，读写都不能损坏数据
+struct Inner2:
+    a: i64
+    b: i64
+
+struct Item:
+    id: i64
+    price: f64
+    name: str
+
+fn total(items: Vec<Item>) -> f64:
+    let s = 0.0
+    let i = 0
+    while i < items.len():
+        s = s + items.get(i).price
+        i = i + 1
+    return s
+
+fn main() -> i64:
+    let v = Vec<Item>()
+    let i = 0
+    while i < 4:
+        v.push(Item { id: i, price: 1.5, name: "n{i}" })
+        i = i + 1
+    print(v.len(), total(v))
+
+    let it = v.get(2)            # 取出来是一份独立副本
+    print(it.id, it.name, it.price)
+    print(v.get(0).id, v.get(3).name)   # 直接链式访问
+
+    v.set(0, Item { id: 100, price: 2.0, name: "replaced" })
+    print(v.get(0).id, v.get(0).name)
+
+    let lit = Vec<Item>[Item { id: 7, price: 0.5, name: "lit" }]
+    print(lit.len(), lit.get(0).id, lit.get(0).name)
+
+    # 纯数据结构体（无引用字段）同样要正确
+    let nums = Vec<Inner2>()
+    nums.push(Inner2 { a: 5, b: 6 })
+    print(nums.get(0).a, nums.get(0).b)
+    return 0

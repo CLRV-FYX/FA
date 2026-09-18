@@ -1,0 +1,9 @@
+行数: 3
+ERROR 行数: 1
+第一行的日期: 2026-09-13
+JSON: {"when":"2026-09-13T06:03:22Z","size":76,"levels":["INFO","ERROR"],"errors":1}
+再解析回来: ERROR
+时间对得上: true
+位置参数个数: 0
+要帮助吗: false
+删干净: true

@@ -1,0 +1,8 @@
+# expect-compile-error: 只能写在 for 的遍历位置
+# FA 的 range 不是一等值：`print(0..3)` / `let r = 0..10` 以前会一路走到
+# asmgen 的二元运算符表才 KeyError: '..'，甩一条 Python traceback。
+# 现在 sema 在非 for 位置直接拦下来，并说明该怎么写。
+fn main() -> i64:
+    let r = 0..10
+    print(r)
+    return 0
