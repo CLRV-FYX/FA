@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # FA (FYX-all) 编译器启动器（本地开发用；全局安装请运行 install.sh）
+# 真正的入口是 bin/fa_cli.py —— bash 脚本在 Windows 上跑不了，
+# VSCode 扩展、deb 里的 /usr/bin/fa、打包的 .exe 都直接调那个 py，
+# 这样四个地方行为一模一样，不会出现「命令行能跑、编辑器里跑不了」。
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="$HERE/compiler:${PYTHONPATH}"
 export FA_HOME="$HERE"
-exec python3 -c "
-import sys, os
-sys.path.insert(0, '$HERE/compiler')
-from falang.cli import main
-sys.exit(main())
-" "$@"
+PY="${FA_PYTHON:-python3}"
+exec "$PY" "$HERE/bin/fa_cli.py" "$@"

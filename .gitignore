@@ -36,3 +36,10 @@ __pycache__/
 # ---- 由测试运行器按需从 mathlib.cpp 构建，不入库 ----
 tests/cases/cpp/*.so
 examples/cpp/*.so.tmp
+
+# ---- 打包产物（packaging/*.py 生成，不入库）----
+dist/
+*.deb
+*.vsix
+*.pdb
+/fa-*.zip

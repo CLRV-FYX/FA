@@ -1,0 +1,263 @@
+name: 测试与打包
+
+# 这套流水线的原则和本仓库其它测试一样：**不接受「应该能跑」**。
+# 打包作业打完会自己解包验证（真跑 fa version/check/run，和仓库里跑的输出逐字节比），
+# Windows 作业会把打出来的 fa.exe 放到真的 windows-latest 上跑一遍 —— 因为在 Linux 上
+# 「交叉编译成功」只能证明 PE 头是对的，证明不了它找得到 Python、转得动参数。
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ------------------------------------------------------------------ 测试
+  test:
+    name: 测试（Linux）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 环境
+        run: |
+          python3 --version; node --version; gcc --version | head -1
+          which dpkg-deb || echo "没有 dpkg-deb"
+
+      - name: 编译器自测（词法/语法/语义/代码生成）
+        run: ./bin/fa selftest
+
+      - name: 语言用例（155 个 .fa 逐个真跑真比）
+        run: python3 tests/run_tests.py
+
+      - name: 语言服务内核
+        run: python3 lsp/test_fa_lang.py
+
+      - name: LSP 协议自检
+        run: python3 lsp/fa_lsp.py --selftest
+
+      - name: IDE 后端自检
+        run: python3 ide/server.py --selftest
+
+      - name: IDE 前端自检
+        run: node ide/test_frontend.js
+
+      - name: VSCode 扩展自检
+        run: node editors/vscode-fa/test/extension.test.js
+
+      - name: bindgen（读真 C 头文件出 FA 声明）
+        run: python3 tests/run_bindgen.py
+
+      - name: 文档里的示例都得能过 fa check
+        run: python3 tests/check_docs.py
+
+      - name: 语法高亮词表和编译器一致（漏跑 gen_grammar.py 就挂）
+        run: python3 editors/vscode-fa/gen_grammar.py --check
+
+  # ------------------------------------------------------------------ 打包
+  package:
+    name: 打包（deb / vsix / windows zip）
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 装 zig（交叉编译 Windows exe 用，不需要 Windows 机器）
+        run: python3 -m pip install --upgrade pip ziglang
+
+      - name: 一次打完三种交付物（每个都会自验）
+        run: bash packaging/build_all.sh --skip-tests
+
+      - name: 列出产物
+        run: ls -l dist/ && sha256sum dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fa-packages
+          path: |
+            dist/*.deb
+            dist/*.zip
+            dist/*.vsix
+            dist/fa.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------- 在真的 Windows 上跑一遍 exe
+  windows-smoke:
+    name: Windows 上实跑 fa.exe
+    runs-on: windows-latest
+    needs: package
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fa-packages
+          path: dist
+
+      - name: Python 版本（fa.exe 要自己找到它）
+        run: |
+          python --version
+          py -3 --version
+
+      - name: 解压
+        shell: bash
+        run: |
+          zip=$(ls dist/fa-*-windows-amd64.zip)
+          echo "包：$zip"
+          unzip -q "$zip" -d win
+          ls win
+          ls win/*/fa.exe
+
+      - name: fa.exe version
+        shell: cmd
+        run: |
+          cd win\fa-*\
+          fa.exe version
+
+      - name: fa.exe check（前端在 Windows 上完全可用）
+        shell: bash
+        run: |
+          exe=$(ls win/fa-*/fa.exe)
+          printf 'fn main() -> i64:\n    let v = Vec<i64>[3, 1, 2]\n    v.sort()\n    print("排序 ", v.to_str())\n    return 0\n' > a.fa
+          "$exe" check a.fa
+          printf 'fn main() -> i64:\n    let x: str = 1\n    return 0\n' > bad.fa
+          if "$exe" check bad.fa; then echo "类型错误居然没报出来" >&2; exit 1; fi
+          echo "✓ 类型错误照报"
+
+      - name: fa.exe lsp --selftest（VSCode 用的就是这个）
+        shell: bash
+        run: |
+          exe=$(ls win/fa-*/fa.exe)
+          "$exe" lsp --selftest
+
+      - name: fa.exe ide --selftest（网页 IDE，Windows 上照常开）
+        shell: bash
+        run: |
+          exe=$(ls win/fa-*/fa.exe)
+          "$exe" ide --selftest
+
+      - name: 后端守卫：build/run 必须拦下来并说清原因（退出码 3）
+        shell: bash
+        run: |
+          exe=$(ls win/fa-*/fa.exe)
+          set +e
+          "$exe" run a.fa > out.txt 2>&1
+          rc=$?
+          set -e
+          cat out.txt
+          if [ "$rc" != 3 ]; then echo "退出码应该是 3，实际 $rc" >&2; exit 1; fi
+          grep -qi "Linux\|WSL" out.txt || { echo "报错里没提到 Linux/WSL" >&2; exit 1; }
+          echo "✓ 拦得干净，话也说清楚了"
+
+      - name: 退出码透传（fa.exe 不能把子进程的码吃掉）
+        shell: bash
+        run: |
+          exe=$(ls win/fa-*/fa.exe)
+          printf 'fn main() -> i64:\n    return 0\n' > ok.fa
+          "$exe" check ok.fa > /dev/null
+          echo "✓ check 退出码 0"
+          set +e; "$exe" check bad.fa > /dev/null 2>&1; rc=$?; set -e
+          [ "$rc" != 0 ] || { echo "check 该失败却返回 0" >&2; exit 1; }
+          echo "✓ check 失败时退出码非 0（$rc）"
+
+      - name: 找不到安装目录时给人话
+        shell: bash
+        run: |
+          exe=$(ls win/fa-*/fa.exe)
+          mkdir -p lonely && cp "$exe" lonely/
+          set +e; (cd lonely && ./fa.exe version) > nf.txt 2>&1; rc=$?; set -e
+          cat nf.txt
+          [ "$rc" = 3 ] || { echo "退出码应为 3，实际 $rc" >&2; exit 1; }
+          grep -q "FA_HOME" nf.txt || { echo "没提示 FA_HOME" >&2; exit 1; }
+          echo "✓ 报错是给人看的"
+
+  # ------------------------------------------------------------------ 发布
+  release:
+    name: 发 Release
+    runs-on: ubuntu-latest
+    needs: [package, windows-smoke]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fa-packages
+          path: dist
+
+      - name: 校验和
+        run: |
+          cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: 写发布说明
+        shell: bash
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          # 用引号版 heredoc：里面全是反引号和 $，绝不能让 shell 去展开
+          cat > notes.md <<'NOTES'
+          ## 装法
+
+          **Linux / Debian / Ubuntu / WSL**
+
+              sudo apt install ./fa_VER_amd64.deb
+              fa version && fa ide
+
+          **Windows**（解压即用，需先装 Python）
+
+              winget install Python.Python.3.12
+              解压 fa-VER-windows-amd64.zip，然后 fa.exe version
+
+          Windows 上 check / ide / lsp / bind 全部可用；build / run 需要 Linux（用 WSL）。
+          这两条命令在 Windows 上会把原因直接说清楚并返回退出码 3，
+          不会给你一个跑不起来的产物。
+
+          **VSCode 扩展**
+
+              code --install-extension fa-vscode-VER.vsix
+
+          语法高亮、代码补全、实时错误波浪线、悬停文档、大纲、跳转定义。
+          扩展零第三方依赖，语法词表和代码片段都是从编译器里生成出来的。
+
+          ## 这些包是怎么验的
+
+          不是「打出来了就算数」。每个打包脚本打完都会自己验一遍：
+
+          - deb：解包到临时前缀，跑 `fa version / check / run / asm`、
+            `fa lsp --selftest`、`fa ide --selftest`，并和仓库里直接跑的输出逐字节比对。
+          - windows zip：先用本机 C 编译器把**同一份启动器源码**编出来真跑一遍
+            （三种安装布局、真编译真运行、退出码透传、找不到目录时的报错），
+            再交叉编译出 exe 并校验 PE32+ 头；zip 里那份载荷也用同布局的启动器实跑过。
+          - vsix：解包检查 manifest、逐个 JSON 解析、contributes 声明的文件是否都在包里、
+            语法词表是否覆盖了编译器的全部关键字与内建类型。
+          - 另外 windows-smoke 这个作业把 fa.exe 放到**真的 windows-latest** 上跑了一遍。
+          NOTES
+          sed -i "s/VER/$ver/g" notes.md
+
+      - name: 建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.deb dist/*.zip dist/*.vsix dist/SHA256SUMS.txt \
+            --title "FA ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            --notes-file notes.md

@@ -1,0 +1,172 @@
+{
+  "name": "fa-lang",
+  "displayName": "FA 语言支持（FYX-all）",
+  "description": "FA 语言的语法高亮、代码补全、错误波浪线、悬停文档、签名提示、大纲、跳定义，以及一键编译运行。语言智能来自 fa lsp（和网页版 IDE 同一套内核）。",
+  "version": "0.2.0",
+  "publisher": "fayx",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Snippets"
+  ],
+  "keywords": [
+    "fa",
+    "fayx",
+    "fyx-all",
+    "compiler",
+    "中文"
+  ],
+  "activationEvents": [
+    "onLanguage:fa",
+    "workspaceContains:**/*.fa"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "fa",
+        "aliases": [
+          "FA",
+          "fa",
+          "FYX-all"
+        ],
+        "extensions": [
+          ".fa"
+        ],
+        "configuration": "./language-configuration.json",
+        "firstLine": "^#!.*\\bfa\\b"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "fa",
+        "scopeName": "source.fa",
+        "path": "./syntaxes/fa.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "fa",
+        "path": "./snippets/fa.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "fa.runFile",
+        "title": "FA: 编译并运行当前文件",
+        "icon": "$(play)"
+      },
+      {
+        "command": "fa.checkFile",
+        "title": "FA: 只检查当前文件（fa check）"
+      },
+      {
+        "command": "fa.buildFile",
+        "title": "FA: 编译成可执行文件（fa build）"
+      },
+      {
+        "command": "fa.showAsm",
+        "title": "FA: 看看生成的 x86-64 汇编（fa asm）"
+      },
+      {
+        "command": "fa.openWebIDE",
+        "title": "FA: 打开网页版 IDE（fa ide）"
+      },
+      {
+        "command": "fa.restartServer",
+        "title": "FA: 重启语言服务器"
+      },
+      {
+        "command": "fa.showServerLog",
+        "title": "FA: 显示语言服务器日志"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "fa.runFile",
+        "key": "f5",
+        "mac": "f5",
+        "when": "editorLangId == fa && !inDebugMode"
+      },
+      {
+        "command": "fa.checkFile",
+        "key": "ctrl+alt+c",
+        "mac": "cmd+alt+c",
+        "when": "editorLangId == fa"
+      }
+    ],
+    "menus": {
+      "editor/title/run": [
+        {
+          "command": "fa.runFile",
+          "when": "editorLangId == fa",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "fa.runFile",
+          "when": "editorLangId == fa",
+          "group": "navigation@1"
+        },
+        {
+          "command": "fa.checkFile",
+          "when": "editorLangId == fa",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "FA",
+      "properties": {
+        "fa.compilerPath": {
+          "type": "string",
+          "default": "",
+          "description": "fa 可执行文件的路径（留空则自动找：先 PATH 上的 fa，再插件自带的，再工作区里的 bin/fa）"
+        },
+        "fa.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "跑语言服务器用的 python（留空则用 python3）。Windows 上如果 python3 不在 PATH 里，在这里填全路径。"
+        },
+        "fa.lintEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "打开 IDE 级别的额外检查：块头少冒号、缩进里的 Tab、代码区的全角标点、&& / || / :=、match 里写 case"
+        },
+        "fa.analyzeDelayMs": {
+          "type": "number",
+          "default": 300,
+          "minimum": 0,
+          "maximum": 3000,
+          "description": "停止输入多久之后重新检查（毫秒）。实测 200 行文件全程 23ms，300 足够跟手"
+        },
+        "fa.runTimeoutSec": {
+          "type": "number",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 600,
+          "description": "「运行」的超时秒数，跑满就杀掉（防死循环卡住编辑器）"
+        },
+        "fa.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "把和语言服务器之间的 JSON-RPC 打到输出面板（排查用）"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node test/extension.test.js",
+    "package": "npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository"
+  }
+}

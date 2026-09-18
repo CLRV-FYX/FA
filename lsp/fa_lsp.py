@@ -34,7 +34,12 @@ for _p in (os.path.join(ROOT, "compiler"), HERE):
 
 import fa_lang as F                                       # noqa: E402
 
-LSP_VERSION = "1.0.0"
+# 服务端版本号。以前自己写了一份 1.0.0，和 fa version 报的 0.2.0 对不上；
+# 现在跟着编译器走（拿不到就退回 fa_lang 的版本，实在没有才用 0）。
+try:
+    from falang import __version__ as LSP_VERSION
+except Exception:                                    # pragma: no cover
+    LSP_VERSION = getattr(F, "VERSION", "0")
 
 # ---------------------------------------------------------------- 协议常量
 # FA 的三档 -> LSP 的 DiagnosticSeverity（1=Error 2=Warning 3=Info 4=Hint）

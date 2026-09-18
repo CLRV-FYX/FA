@@ -1,0 +1,43 @@
+{
+  "comments": {
+    "lineComment": "#"
+  },
+  "brackets": [
+    ["{", "}"],
+    ["[", "]"],
+    ["(", ")"]
+  ],
+  "autoClosingPairs": [
+    { "open": "{", "close": "}" },
+    { "open": "[", "close": "]" },
+    { "open": "(", "close": ")" },
+    { "open": "\"", "close": "\"", "notIn": ["string"] },
+    { "open": "\"\"\"", "close": "\"\"\"", "notIn": ["string"] },
+    { "open": "'", "close": "'", "notIn": ["string"] }
+  ],
+  "surroundingPairs": [
+    ["{", "}"], ["[", "]"], ["(", ")"], ["\"", "\""], ["'", "'"]
+  ],
+  "indentationRules": {
+    "increaseIndentPattern": "^.*[:{]\\s*$",
+    "decreaseIndentPattern": "^\\s*[}\\])].*$"
+  },
+  "onEnterRules": [
+    {
+      "beforeText": "^.*[:{]\\s*$",
+      "action": { "indent": "indent" }
+    },
+    {
+      "beforeText": "^\\s*#",
+      "afterText": "^\\s*#",
+      "action": { "indent": "none", "appendText": "# " }
+    }
+  ],
+  "wordPattern": "(-?\\d*\\.\\d\\w*)|([A-Za-z_]\\w*)",
+  "folding": {
+    "markers": {
+      "start": "^\\s*(fn|struct|enum|impl|if|for|while|loop|match)\\b.*[:{]\\s*$",
+      "end": "^\\s*(}|\\))"
+    }
+  }
+}
