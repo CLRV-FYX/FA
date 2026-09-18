@@ -1486,7 +1486,13 @@ class FnGen:
             self.emit("BR", args=[c], extra=(body, end))
         self.emit("LABEL", extra=body)
         sc = self.push_scope()
-        vty = s.sym.ty
+        # 两个循环变量时先给定位、再给内容，而下面这套「取元素」的代码要的
+        # 永远是内容那一个：Vec/数组/str 是 var2，Map 的键才是 var（值另绑）。
+        two = s.var2 is not None
+        if two and ity.kind != "map":
+            vty = s.sym2.ty
+        else:
+            vty = s.sym.ty
         vt = None
         vloc = None
         if isinstance(it, Range) or ity.kind == "range":
@@ -1563,7 +1569,16 @@ class FnGen:
                 self.emit("LOAD", vt, [ptr], extra=t2, ty=vty)
         if vloc is None:
             vloc = VarLoc("temp", vt, vty)
-        sc.vars[s.var] = vloc
+        if not two:
+            sc.vars[s.var] = vloc
+        elif ity.kind == "map":
+            # for k, v in m：上面绑好的就是键，值另取一次
+            sc.vars[s.var] = vloc
+            sc.vars[s.var2] = self.bind_map_slot_val(obj, idx, ity.val)
+        else:
+            # for i, x in v / s / a：idx 就是下标，元素是上面绑好的那个
+            sc.vars[s.var] = VarLoc("temp", idx, I64)
+            sc.vars[s.var2] = vloc
         # continue 必须跳到「自增之前」，不能跳到循环头：下标自增是在循环体
         # 之后发的，跳到 top 就等于永远不自增 —— `for k in 0..5 { if k == 2 {
         # continue } }` 会**死循环挂住**（while / C 风格 for / loop 各自都对，
@@ -1581,6 +1596,32 @@ class FnGen:
         if held:
             # 循环之后释放一次（break 也跳到 end，所以每条路径都覆盖到）
             self.emit_rcdec_val(obj, ity)
+
+    def bind_map_slot_val(self, obj, idx, vty):
+        """`for k, v in m` 里的 v：取当前槽的值。
+
+        照着取键那段写，包括浮点那个坑 —— fa_map_slot_* 返回的是 uint64 位模式
+        （在 rax 里），把 CALL 的目标类型直接标成 f64 的话 asmgen 会去读 xmm0，
+        拿到的是垃圾。装箱元素（结构体/枚举）返回的是盒子地址，
+        按「指向该元素的指针」绑，和 Vec 那条路一致。
+        """
+        if vty is None:
+            self.err("Map 的值类型未知，绑不了第二个循环变量", idx)
+        if vty.kind in ("struct", "enum", "arr"):
+            r = self.new_temp(ptr_to(vty))
+            self.emit("CALL", r, [Sym("fa_map_slot_val"), obj, idx], ty=ptr_to(vty))
+            return VarLoc("temp", r, vty, borrowed=True, is_ptr=True)
+        vt = self.new_temp(vty)
+        if vty.is_float:
+            raw = self.new_temp(I64)
+            self.emit("CALL", raw, [Sym("fa_map_slot_val"), obj, idx], ty=I64)
+            self.emit("MOV", vt, [self.bitcast(raw, vty)], ty=vty)
+        else:
+            r = self.new_temp(vty)
+            self.emit("CALL", r, [Sym("fa_map_slot_val"), obj, idx], ty=vty)
+            self.emit("MOV", vt, [self.coerce(r, vty, vty)], ty=vty)
+        # 借用引用（运行时没有 inc），和取键那条路一样不登记为 owned
+        return VarLoc("temp", vt, vty, borrowed=True)
 
     def bind_variant_payload(self, subj, pat):
         """把当前变体的载荷绑定成局部变量（每个绑定都拥有自己的一份引用）"""

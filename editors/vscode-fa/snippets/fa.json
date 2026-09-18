@@ -59,6 +59,37 @@
     ],
     "description": "按下标走（0..n 不含 n）"
   },
+  "forrange": {
+    "prefix": "forrange",
+    "body": [
+      "for ${1:i} in range(${2:0}, ${3:n}, ${4:2}):",
+      "    ${5}"
+    ],
+    "description": "带步长地走（步长可以是负的；0 不行）"
+  },
+  "fortwo": {
+    "prefix": "fortwo",
+    "body": [
+      "for ${1:i}, ${2:x} in ${3:v}:",
+      "    ${4}"
+    ],
+    "description": "同时拿下标和元素（Vec / 数组 / str）"
+  },
+  "forkv": {
+    "prefix": "forkv",
+    "body": [
+      "for ${1:k}, ${2:v} in ${3:m}:",
+      "    ${4}"
+    ],
+    "description": "同时拿键和值（Map）"
+  },
+  "slice": {
+    "prefix": "slice",
+    "body": [
+      "${1:v}[${2:1}:${3:3}]"
+    ],
+    "description": "切片：str 和 Vec 都认，返回新值；省掉一头就写 v[1:] / v[:3] / v[:]"
+  },
   "while": {
     "prefix": "while",
     "body": [

@@ -1161,24 +1161,40 @@ class Sema:
             if rn is not None:
                 s.iter = rn
                 it = rn.ty
+            # 两个循环变量：先给定位，再给内容。
+            #   Vec / 数组 / str → 下标 (i64) + 元素 / 字符
+            #   Map              → 键 + 值
+            # 单变量时的语义一个字都不改（还是元素 / 字符 / 键），
+            # 所以老代码不会因为这条新增而改变行为。
+            two = s.var2 is not None
+            if two and (it.kind == "range" or isinstance(s.iter, Range)):
+                self.error("range 只有一个循环变量：`for i in 起..止` 给的就是当前值，"
+                           "没有第二个可绑的东西。要下标就直接用 i", s)
             vty = None
+            vty2 = None
             if it.kind == "arr":
-                vty = it.elem
+                vty, vty2 = (TYPES["i64"], it.elem) if two else (it.elem, None)
             elif it.kind == "vec":
-                vty = it.elem
+                vty, vty2 = (TYPES["i64"], it.elem) if two else (it.elem, None)
             elif it.kind == "str":
-                vty = CHAR
+                vty, vty2 = (TYPES["i64"], CHAR) if two else (CHAR, None)
             elif it.kind == "map":
-                vty = it.key
+                vty, vty2 = (it.key, it.val) if two else (it.key, None)
             elif it.kind == "range" or isinstance(s.iter, Range):
                 vty = TYPES["i64"]
             else:
                 self.error(f"无法遍历类型 {it}", s)
+            if two and vty2 is None and it.elem is None:
+                self.error(f"遍历 {it} 拿不到元素类型，绑不了第二个循环变量", s)
             self.loop_depth += 1
             sc = self.enter(self.cur_fn)
             sym = VarSym(s.var, vty)
             sc.declare(s.var, sym)
             s.sym = sym
+            if two:
+                sym2 = VarSym(s.var2, vty2)
+                sc.declare(s.var2, sym2)
+                s.sym2 = sym2
             self.stmt(s.body)
             self.leave()
             self.loop_depth -= 1

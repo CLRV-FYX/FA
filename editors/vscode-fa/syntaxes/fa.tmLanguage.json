@@ -232,7 +232,7 @@
       "patterns": [
         {
           "name": "support.function.builtin.fa",
-          "match": "(?<![\\w.])(abs|all|any|args|assert|bin|ceil|chr|clamp|cmd|concat|contains|cos|cstr|env|exit|exp|exp2|f64|file_read|file_write|filter|floor|for_each|free|gcd|hex|hypot|i64|index_where|join|keys|len|log|log10|log2|map|max|min|now|oct|panic|pop|pow|print|println|push|random|read_line|reverse|round|sign|sin|sleep|sort|sort_by|sqrt|str|sum|tan|trunc|values|write)(?![\\w])"
+          "match": "(?<![\\w.])(abs|all|any|args|assert|bin|ceil|chr|clamp|cmd|concat|contains|cos|cstr|env|exit|exp|exp2|f64|file_read|file_write|filter|floor|for_each|free|gcd|hex|hypot|i64|index_where|join|keys|len|log|log10|log2|map|max|min|now|oct|panic|pop|pow|print|println|push|random|range|read_line|reverse|round|sign|sin|sleep|sort|sort_by|sqrt|str|sum|tan|trunc|values|write)(?![\\w])"
         }
       ]
     },

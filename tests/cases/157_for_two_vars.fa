@@ -1,0 +1,82 @@
+# 两个循环变量：for i, x in v / for k, v in m
+#
+# 以前想同时拿下标和元素，只能自己维护一个计数器：
+#
+#     let i = 0
+#     for x in v:
+#         print(i, x)
+#         i += 1
+#
+# 想同时拿 Map 的键和值更别扭：`for k in m` 只给键，值要再 m.get(k) 取一次
+# （多一次哈希查找，而且 get 不到时给的是零值，分不清「值就是零」和「没这个键」）。
+#
+# 规矩是**先给定位，再给内容**：
+#
+#     Vec / 数组 / str  →  var = 下标 (i64)，var2 = 元素 / 字符
+#     Map               →  var = 键，      var2 = 值
+#
+# 单变量时的语义一个字都没改（还是元素 / 字符 / 键），所以老代码不受影响 ——
+# 这一例最后一段就是拿它当回归钉住的。
+#
+# 这一例还钉住三个容易踩的实现细节：
+#   1. Map 的值是浮点时，fa_map_slot_val 返回的是 uint64 位模式（在 rax 里）。
+#      把 CALL 的目标类型直接标成 f64，asmgen 就会去读 xmm0，拿到垃圾
+#      （取键那条路上早就踩过同一个坑，实测 4.94e-324）。
+#   2. Map 的值是装箱结构体时，返回的是盒子地址，得按「指向该元素的指针」绑，
+#      绑成值类型的话 `v.name` 打出来是地址。
+#   3. 槽里取出来的键和值都是**借用**引用（运行时没有 inc），
+#      不能登记为 owned，否则作用域退出时多减一次引用计数 —— 第二轮就用到已释放的内存。
+#      这一例在 ASan 底下跑过，干净。
+
+struct P { name: str, n: i64 }
+
+fn main() -> i64:
+    # 装箱元素：Vec<结构体>
+    let vp = Vec<P>[P{name: "甲", n: 1}, P{name: "乙", n: 2}]
+    for i, p in vp:
+        print(i, " ", p.name, " ", p.n)
+
+    # 定长数组
+    let a: [i64; 3] = [10, 20, 30]
+    for i, x in a:
+        print("arr ", i, " ", x)
+
+    # Map 的值是引用计数类型（str）
+    let ms = Map<str,str>["k1": "v1", "k2": "v2"]
+    for k, v in ms:
+        print("map-str ", k, "=", v)
+
+    # Map 的值是浮点（位模式的坑）
+    let mf = Map<str,f64>["pi": 3.5]
+    for k, v in mf:
+        print("map-f64 ", k, "=", v)
+
+    # Map 的值是装箱结构体
+    let mp = Map<str,P>["one": P{name: "一", n: 11}]
+    for k, v in mp:
+        print("map-struct ", k, "=", v.name, " ", v.n)
+
+    # Map 的键是整数
+    let mi = Map<i64,str>[7: "七"]
+    for k, v in mi:
+        print("map-int ", k, "=", v)
+
+    # 嵌套 + break / continue
+    for i, x in Vec<i64>[1, 2, 3, 4]:
+        if x == 2:
+            continue
+        if x == 4:
+            break
+        for j, y in Vec<str>["a", "b"]:
+            write(i, ":", x, " ", j, ":", y, "  ")
+    print()
+
+    # 单变量的老写法一个都不能变
+    for x in Vec<i64>[5, 6]:
+        write(x, " ")
+    for c in "hi":
+        write(c, " ")
+    for k in Map<str,i64>["z": 1]:
+        write(k, " ")
+    print("<- 单变量回归")
+    return 0

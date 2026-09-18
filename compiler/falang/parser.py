@@ -783,10 +783,24 @@ class Parser:
             body = self.parse_block()
             return ForC(init=init, cond=cond, step=step, body=body)
         var = self.expect(NAME).value
+        var2 = None
+        if self.at(P, ","):
+            # for i, x in v / for k, v in m —— 第二个变量是可选的，
+            # 只有逗号后面再跟一个名字才算，别的照旧报错。
+            self.next()
+            var2 = self.expect(NAME).value
+            if var2 == var:
+                self.err(f"两个循环变量重名了（都叫 '{var}'），后一个会盖掉前一个")
+            if self.at(P, ","):
+                # 不说这句的话，报出来的是「期望 'in'，实际得到 ','」——
+                # 用户看不出真正的限制是「最多两个」。
+                self.err("for 最多两个循环变量（定位 + 内容）："
+                         "`for i, x in v` 是下标和元素，`for k, v in m` 是键和值。"
+                         "要更多就自己在循环体里取")
         self.expect_kw("in")
         it = self.parse_head_expr()
         body = self.parse_block()
-        return For(var=var, iter=it, body=body)
+        return For(var=var, iter=it, body=body, var2=var2)
 
     def parse_match(self) -> Match:
         self.expect_kw("match")

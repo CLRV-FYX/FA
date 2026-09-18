@@ -258,6 +258,13 @@ class For(Stmt):
     iter: Expr
     body: Block
     sym: Any = None
+    # 第二个循环变量：`for i, x in v` / `for k, v in m`。
+    # 规矩是**先给定位，再给内容**：
+    #   Vec / 数组 / str  →  var = 下标 (i64)，var2 = 元素 / 字符
+    #   Map               →  var = 键，      var2 = 值
+    # range 只有一个变量（它给的就是当前值，没有第二个可绑的东西）。
+    var2: Optional[str] = None
+    sym2: Any = None
 
 
 @dataclass
