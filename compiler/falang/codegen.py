@@ -1385,6 +1385,12 @@ class FnGen:
         step = self.new_label("fstep")
         idx = self.new_temp(I64)
         limit = self.new_temp(I64)
+        # 每轮走多少。遍历 Vec / str / Map / 数组永远是 1（idx 是元素下标）；
+        # 只有 range(起, 止, 步长) 会改它。
+        stepv = self.const(1)
+        # 比较方向：True = idx < limit（正着走），False = idx > limit（倒着走），
+        # None = 步长是运行时才算出来的，方向得在循环头现判。
+        step_fwd = True
         vloc = None
         # 可迭代对象只求值**一次**，并在整个循环期间持有它。
         # 以前循环体里会再 gen_expr 一遍：对变量只是浪费，对**函数调用**
@@ -1407,6 +1413,31 @@ class FnGen:
                 self.emit("BIN", one, [self.coerce(stop, I64, I64), self.const(1)],
                           extra="+", ty=I64)
                 stop = one
+            st = getattr(it, "step", None)
+            if st is not None:
+                sv = self.gen_expr(st)
+                stepv = self.coerce(sv, getattr(st, "ty", None) or I64, I64)
+                lit = getattr(it, "step_literal", None)
+                if lit is None and isinstance(st, NumLit):
+                    lit = st.value          # a..b 那条路没有 step_literal，兜一下
+                if lit is not None:
+                    # 字面量步长（含 -2 这种 Unary 形式，sema 已经算好了）：
+                    # 方向编译期就知道，循环头不多花一条指令。
+                    # 步长 0 sema 已经拦了，这里再兜一道，绝不允许发出一条死循环。
+                    step_fwd = lit > 0
+                else:
+                    step_fwd = None
+                    # 运行时才知道步长：0 就是死循环，进循环之前 panic 一句人话，
+                    # 别让用户对着一个挂住的终端猜。
+                    z = self.new_temp(BOOL)
+                    self.emit("CMP", z, [stepv, self.const(0)], extra="==", ty=I64)
+                    bad = self.new_label("stepzero")
+                    okstep = self.new_label("stepok")
+                    self.emit("BR", args=[z], extra=(bad, okstep))
+                    self.emit("LABEL", extra=bad)
+                    self.emit("CALL", None, [Sym("fa_panic"), self.make_str(
+                        "range() 的步长是 0：循环变量永远走不到终点，这是个死循环")])
+                    self.emit("LABEL", extra=okstep)
             self.emit("MOV", idx, [self.coerce(start, I64, I64)], ty=I64)
             self.emit("MOV", limit, [self.coerce(stop, I64, I64)], ty=I64)
         else:
@@ -1432,9 +1463,27 @@ class FnGen:
             self.emit("MOV", idx, [self.const(0)], ty=I64)
             self.emit("MOV", limit, [n], ty=I64)
         self.emit("LABEL", extra=top)
-        c = self.new_temp(BOOL)
-        self.emit("CMP", c, [idx, limit], extra="<", ty=I64)
-        self.emit("BR", args=[c], extra=(body, end))
+        if step_fwd is None:
+            # 步长是运行时值：正着走比 <，倒着走比 >。两条都发，用步长的符号选一条。
+            # 多花三条比较，换来 range(0, n, k) 这种 k 只有运行时才知道的写法能用。
+            sgn = self.new_temp(BOOL)
+            self.emit("CMP", sgn, [stepv, self.const(0)], extra=">", ty=I64)
+            pos_lbl = self.new_label("rfwd")
+            neg_lbl = self.new_label("rbwd")
+            self.emit("BR", args=[sgn], extra=(pos_lbl, neg_lbl))
+            self.emit("LABEL", extra=pos_lbl)
+            c = self.new_temp(BOOL)
+            self.emit("CMP", c, [idx, limit], extra="<", ty=I64)
+            self.emit("BR", args=[c], extra=(body, end))
+            self.emit("LABEL", extra=neg_lbl)
+            c2 = self.new_temp(BOOL)
+            self.emit("CMP", c2, [idx, limit], extra=">", ty=I64)
+            self.emit("BR", args=[c2], extra=(body, end))
+        else:
+            c = self.new_temp(BOOL)
+            self.emit("CMP", c, [idx, limit],
+                      extra=("<" if step_fwd else ">"), ty=I64)
+            self.emit("BR", args=[c], extra=(body, end))
         self.emit("LABEL", extra=body)
         sc = self.push_scope()
         vty = s.sym.ty
@@ -1526,7 +1575,7 @@ class FnGen:
         self.loop_stack.pop()
         self.emit("LABEL", extra=step)
         self.pop_scope()
-        self.emit("BIN", idx, [idx, self.const(1)], extra="+", ty=I64)
+        self.emit("BIN", idx, [idx, stepv], extra="+", ty=I64)
         self.emit("JMP", extra=top)
         self.emit("LABEL", extra=end)
         if held:

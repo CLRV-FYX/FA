@@ -176,6 +176,10 @@ class Range(Expr):
     start: Optional[Expr]
     end: Optional[Expr]
     inclusive: bool
+    # 步长。`a..b` 语法没有步长（None 就是 1），只有 range(a, b, s) 会填。
+    # 可以是负数（倒着走），不能是 0（循环永远不结束 —— 字面量 0 编译期就拦，
+    # 运行时才算出来的 0 在进循环前 panic 一句人话）。
+    step: Optional[Expr] = None
 
 
 @dataclass

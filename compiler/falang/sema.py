@@ -35,6 +35,7 @@ BUILTIN_FNS = {
     "hypot", "clamp", "sign", "sum", "sort", "sort_by", "reverse", "join", "chr", "cstr",
     "map", "filter", "any", "all", "index_where", "for_each",
     "free",          # 释放 new / C 那边拿来的指针（引用计数类型不需要它）
+    "range",         # range(止) / range(起,止) / range(起,止,步长)：只能写在 for 的遍历位置
 }
 
 # str / Vec / Map / pyobj / jobj 的内建方法
@@ -1154,6 +1155,12 @@ class Sema:
                 it = self.expr(s.iter)
             finally:
                 self.in_range -= 1
+            # range(a, b, s) 在 expr_range_call 里变成了一个 Range 节点，
+            # 这里把 s.iter 换掉：codegen 认的是 Range，不是 Call。
+            rn = getattr(s.iter, "range_node", None)
+            if rn is not None:
+                s.iter = rn
+                it = rn.ty
             vty = None
             if it.kind == "arr":
                 vty = it.elem
@@ -1457,6 +1464,13 @@ class Sema:
                 self.expr(e.start)
             if e.end is not None:
                 self.expr(e.end)
+            if e.step is not None:
+                st = self.expr(e.step)
+                if st.kind not in ("int", "char"):
+                    self.error(f"range 的步长必须是整数，得到 {st}", e.step)
+                if self.literal_int(e.step) == 0:
+                    self.error("range 的步长不能是 0：循环变量永远走不到终点，"
+                               "这是个死循环", e.step)
             e.ty = TYPES["i64"]
             return e.ty
         if isinstance(e, Ctor):
@@ -1685,9 +1699,8 @@ class Sema:
                 # `0..10..2` 被解析成 (0..10)..2。FA 的 range 只有「起..止」，
                 # 没有步进 —— 以前这里照样给个 range 类型，一路走到 asmgen 的
                 # 二元运算符表才 KeyError: '..'，把 Python 异常糊在用户脸上。
-                self.error("范围运算符不能连用：FA 的 range 只有 `起..止` / `起..=止`，"
-                           "没有步进写法。要跳着走请用 while，"
-                           "或 `for i in 0..n { let j = i * 2 }`", e)
+                self.error("范围运算符不能连用：`起..止` 只有两个端点，"
+                           "要步长请写 range(起, 止, 步长)", e)
             for side, t in (("左", lt), ("右", rt)):
                 if t.kind not in ("int", "bool", "char"):
                     self.error(f"range 的{side}端点必须是整数（或 char），得到 {t}", e)
@@ -1791,7 +1804,72 @@ class Sema:
             return lt
         self.error(f"运算符 '{e.op}' 不支持 {lt} 与 {rt}", e)
 
+    @staticmethod
+    def literal_int(x):
+        """表达式是不是一个编译期就知道值的整数？是就返回那个值，不是就返回 None。
+
+        负数字面量在 AST 里不是一个节点，是 Unary('-', NumLit) —— 不认它的话，
+        `range(10, 0, -2)` 这种最常见的倒着走会被当成「运行时才知道步长」，
+        循环头白白多三条比较。
+        """
+        if isinstance(x, NumLit):
+            return x.value
+        if isinstance(x, Unary) and x.op == "-" and isinstance(x.operand, NumLit):
+            return -x.operand.value
+        return None
+
+    def expr_range_call(self, e: Call) -> Type:
+        """range() 的三个写法：range(止) = 0..止，range(起, 止)，range(起, 止, 步长)。
+
+        步长可以是负的（倒着走）。0 不行：字面量 0 在这里就拦掉，
+        运行时才算出来的 0 由 codegen 在进循环前 panic。
+        """
+        n = len(e.args)
+        if not 1 <= n <= 3:
+            self.error(f"range() 需要 1~3 个参数（止 / 起止 / 起止步长），"
+                       f"这里给了 {n} 个", e)
+        ats = [self.expr(a) for a in e.args]
+        for i, (a, t) in enumerate(zip(e.args, ats)):
+            if t.kind not in ("int", "char"):
+                self.error(f"range() 的第 {i + 1} 个参数必须是整数，得到 {t}", a)
+        if n == 1:
+            start, end, step = None, e.args[0], None
+        elif n == 2:
+            start, end, step = e.args[0], e.args[1], None
+        else:
+            start, end, step = e.args[0], e.args[1], e.args[2]
+        lit = self.literal_int(step) if step is not None else None
+        if lit == 0:
+            self.error("range() 的步长不能是 0：循环变量永远走不到终点，"
+                       "这是个死循环", step)
+        if self.in_range == 0:
+            # 和 `起..止` 同一条规矩：range 不是一等值。以前 `print(0..3)` 会一路
+            # 走到 asmgen 的运算符表 KeyError，甩一条 Python traceback；
+            # range() 是新写法，不能把同一个坑再挖一遍。
+            self.error("range() 只能写在 for 的遍历位置（FA 的 range 不是一等值："
+                       "不能存进变量、当参数传、也不能 print）。"
+                       "要一个整数序列请用 Vec<i64>", e)
+        r = Range(start=start, end=end, inclusive=False, step=step)
+        r.step_literal = lit                   # None = 运行时才知道
+        r.line, r.col = e.line, e.col          # 位置带过去，报错才指得到行
+        r.file = getattr(e, "file", None)
+        r.ty = Type("range", "range", 16, 8)
+        e.resolved = "builtin"
+        e.ty = r.ty
+        e.range_node = r                       # for 语句会把 s.iter 换成它
+        return e.ty
+
     def expr_call(self, e: Call) -> Type:
+        # range(止) / range(起, 止) / range(起, 止, 步长)
+        #
+        # 它跟别的内建不一样：产出的不是一个值，而是一个 **Range 节点**（和
+        # `起..止` 解析出来的是同一个东西）。这样才能复用 for 循环里早就写好的
+        # 那套代码生成，也才能守住「range 不是一等值」这条既有规矩。
+        # 用户自己定义了 fn range(...) 的话让用户赢（和下面的内建同一条规矩）。
+        if isinstance(e.callee, NameRef) and e.callee.name == "range" \
+                and e.callee.name not in self.fns \
+                and not any(e.callee.name in t for t in self.local_fns):
+            return self.expr_range_call(e)
         # 内建多态函数。用户自己定义了同名函数时**让用户赢**：
         # 内建分支以前排在最前面，于是 `fn sign(n: i64) -> str` 定义得好好的，
         # 调用却被悄悄换成内建的 sign（返回 -1/0/1 的 i64）—— 不报错、

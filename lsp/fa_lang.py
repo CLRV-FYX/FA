@@ -494,6 +494,11 @@ BUILTIN_DOC = {
     "println": "println(...)　同 print",
     "write": "write(...)　打印但**不换行**",
     "len": "len(x) -> i64　str 的字节数 / Vec、Map 的元素个数",
+    "range": ("range(止) / range(起, 止) / range(起, 止, 步长)\n\n"
+              "只能写在 for 的遍历位置：`for i in range(0, 10, 2)`。\n"
+              "步长可以是负的（倒着走），不能是 0。\n"
+              "range 不是一等值 —— 不能存进变量、当参数传、也不能 print；\n"
+              "要一个整数序列请用 Vec<i64>。等价写法：`for i in 起..止`（无步长）。"),
     "str": "str(x) -> str　任何值转字符串（等价于 x.to_str()）",
     "i64": "i64(x) -> i64", "f64": "f64(x) -> f64",
     "chr": "chr(码点) -> str　码点转字符串（要字面花括号就 chr(123)）",
