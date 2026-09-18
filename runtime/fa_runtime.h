@@ -147,6 +147,12 @@ int64_t fa_vec_max_i64(FaVec *v);
 double  fa_vec_min_f64(FaVec *v);
 double  fa_vec_max_f64(FaVec *v);
 int64_t fa_vec_index_of(FaVec *v, uint64_t val);
+void    fa_vec_insert(FaVec *v, int64_t idx, uint64_t val);
+void    fa_vec_remove(FaVec *v, int64_t idx);
+/* box_size > 0 表示元素是装箱的聚合（结构体/枚举），切片和去重都得克隆盒子：
+   盒子不带引用计数，两个表共享同一个盒子 = 释放两次。其余类型传 0。 */
+FaVec  *fa_vec_slice(FaVec *v, int64_t a, int64_t b, int64_t box_size);
+FaVec  *fa_vec_dedup(FaVec *v, int64_t box_size);
 
 /* --- 字符串增强 --- */
 FaStr  *fa_str_repeat(FaStr *s, int64_t n);

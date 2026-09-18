@@ -3,7 +3,7 @@
 from __future__ import annotations
 from typing import List, Optional
 from .lexer import tokenize, Token, split_interpolation, FaSyntaxError
-from .ast import *
+from .ast import *          # Slice 也在里面（星号导入，别再单独列，列了是语法错误）
 from .ast import stamp_positions, Node
 
 KW = "KW"
@@ -1013,9 +1013,18 @@ class Parser:
                 e = Call(callee=e, args=args)
             elif self.at(P, "["):
                 self.next()
-                idx = self.parse_expr()
-                self.expect(P, "]")
-                e = Index(obj=e, index=idx)
+                # a[lo:hi] / a[lo:] / a[:hi] / a[:] 是切片，a[i] 是下标。
+                # 冒号在 FA 里到处都是（块头、Map 字面量、类型标注），所以这里
+                # 只认「[ 之后、] 之前」的那一个，parse_expr 不会把 : 吃进去。
+                lo = None if self.at(P, ":") else self.parse_expr()
+                if self.at(P, ":"):
+                    self.next()
+                    hi = None if self.at(P, "]") else self.parse_expr()
+                    self.expect(P, "]")
+                    e = Slice(obj=e, start=lo, end=hi)
+                else:
+                    self.expect(P, "]")
+                    e = Index(obj=e, index=lo)
             elif self.at(P, "."):
                 self.next()
                 t = self.cur()

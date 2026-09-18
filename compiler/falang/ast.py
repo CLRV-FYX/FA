@@ -116,6 +116,20 @@ class Index(Expr):
 
 
 @dataclass
+class Slice(Expr):
+    """a[lo:hi] —— str 和 Vec 的切片。
+
+    lo / hi 都可以省（a[1:] / a[:3] / a[:]），省掉的那头由运行时按长度夹边，
+    和 str.slice(a, b) 是同一套规矩：负的夹到 0、超过长度的夹到长度、
+    反了给空结果。返回**新的** str / Vec，原来那个不动（str 本来就不可变，
+    Vec 也只有一份数据，共享会让引用计数算不清）。
+    """
+    obj: Expr
+    start: Optional[Expr] = None
+    end: Optional[Expr] = None
+
+
+@dataclass
 class Field(Expr):
     obj: Expr
     name: str

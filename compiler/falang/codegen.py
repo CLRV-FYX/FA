@@ -1145,6 +1145,9 @@ class FnGen:
                 self.emit("STORE", args=[loc.val, v], extra=0, ty=loc.ty)
             return
         # 复合左值：字段 / 下标 / 解引用
+        if isinstance(tgt, Slice):
+            self.err("切片不能当赋值目标：a[1:3] 给的是一份新值，不是原表的一段视图。"
+                     "要改原表就逐个下标赋值，或者整段替换掉", s)
         if isinstance(tgt, Index) and tgt.obj.ty is not None \
                 and tgt.obj.ty.kind in ("vec", "map"):
             # v[i] = x / m[k] = v：走运行时（要维护引用计数），不能当普通内存写
@@ -1653,6 +1656,8 @@ class FnGen:
             return self.gen_method(e)
         if isinstance(e, Index):
             return self.gen_index(e)
+        if isinstance(e, Slice):
+            return self.gen_slice(e)
         if isinstance(e, Field):
             return self.gen_field(e)
         if isinstance(e, ArrayLit):
@@ -2541,6 +2546,8 @@ class FnGen:
                     fo += 8
                 return base, self.add_off(off0, fo), ot.fields[e.index][1]
             self.err(f"类型 {ot} 不支持字段取址", e)
+        if isinstance(e, Slice):
+            self.err("切片没有地址可取（它是新值，不是原数据的一段视图）", e)
         if isinstance(e, Index):
             ot = e.obj.ty
             if ot.kind == "arr":
@@ -2627,6 +2634,33 @@ class FnGen:
             return self.gen_subscript(e)
         ptr, off, ty = self.gen_addr(e)
         return self.load_ptr(ptr, ty, off)
+
+    # 开放端（a[1:] / a[:hi] / a[:]）用 INT64_MAX 当上界：fa_str_slice 和
+    # fa_vec_slice 都会把越界的边界夹回长度，所以不用在这里再取一次 len，
+    # 也就不会有「为了拿长度把 obj 求值两遍」的问题。
+    SLICE_OPEN = 0x7fffffffffffffff
+
+    def gen_slice(self, e: Slice):
+        """a[lo:hi] —— str 走 fa_str_slice，Vec 走 fa_vec_slice，都返回新值。"""
+        ot = e.obj.ty
+        obj = self.gen_expr(e.obj)          # 只求值一次：f()[1:] 不能把 f 调两遍
+        lo = (self.const(0) if e.start is None
+              else self.coerce(self.gen_expr(e.start), e.start.ty, I64))
+        hi = (self.const(self.SLICE_OPEN) if e.end is None
+              else self.coerce(self.gen_expr(e.end), e.end.ty, I64))
+        if ot.kind == "str":
+            r = self.new_temp(STR)
+            self.emit("CALL", r, [Sym("fa_str_slice"), obj, lo, hi], ty=STR)
+            self.mark_owned(r, STR)
+            return r
+        et = ot.elem
+        # 装箱元素要把盒子大小传下去，运行时才知道该克隆多大一块。
+        box = max(et.size, 8) if et is not None and et.kind in ("struct", "enum") else 0
+        r = self.new_temp(ot)
+        self.emit("CALL", r,
+                  [Sym("fa_vec_slice"), obj, lo, hi, self.const(box)], ty=ot)
+        self.mark_owned(r, ot)
+        return r
 
     def gen_subscript(self, e: Index):
         """读 v[i] / m[k] / s[i]"""
@@ -3259,6 +3293,31 @@ class FnGen:
                 r = self.new_temp(ot)
                 self.emit("CALL", r, [Sym("fa_vec_clone"), obj, self.const(box)], ty=ot)
                 self.mark_owned(r, ot)          # 新表归调用方，语句末尾别释放
+                return r
+            if name == "insert":
+                i = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
+                v = self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, et)
+                if et.is_float:
+                    v = self.bitcast(v, I64)    # 运行时按 uint64 收，浮点得按位转
+                self.emit("CALL", None, [Sym("fa_vec_insert"), obj, i, v])
+                return self.const(0, VOID)
+            if name == "remove":
+                i = self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64)
+                self.emit("CALL", None, [Sym("fa_vec_remove"), obj, i])
+                return self.const(0, VOID)
+            if name in ("slice", "dedup"):
+                # 都返回**新表**，原表不动。装箱元素要把盒子大小传下去，
+                # 让运行时克隆盒子而不是共享（共享 = 释放两次）。
+                box = max(et.size, 8) if et.kind in ("struct", "enum") else 0
+                fn = "fa_vec_slice" if name == "slice" else "fa_vec_dedup"
+                args = [Sym(fn), obj]
+                if name == "slice":
+                    args.append(self.coerce(self.gen_expr(e.args[0]), e.args[0].ty, I64))
+                    args.append(self.coerce(self.gen_expr(e.args[1]), e.args[1].ty, I64))
+                args.append(self.const(box))
+                r = self.new_temp(ot)
+                self.emit("CALL", r, args, ty=ot)
+                self.mark_owned(r, ot)
                 return r
         # ---- map
         if ot.kind == "map":

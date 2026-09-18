@@ -47,7 +47,7 @@ BUILTIN_METHODS = {
             "char_len", "char_at", "codepoints", "slice_chars"},
     "vec": {"len", "push", "get", "set", "pop", "clear", "contains", "to_str",
             "resize", "sort", "sort_by", "reverse", "join", "sum", "min", "max",
-            "index_of", "copy",
+            "index_of", "copy", "insert", "remove", "slice", "dedup",
             # 回调式（高阶）方法：回调一律是 fn(*元素) -> R，写函数名不加括号
             "map", "filter", "any", "all", "index_where", "for_each"},
     # contains 是 has 的别名。以前 Map 只有全局写法 contains(m, k) 编得过
@@ -90,7 +90,8 @@ METHOD_ARITY = {
             "map": (1, 1), "filter": (1, 1), "any": (1, 1), "all": (1, 1),
             "index_where": (1, 1), "for_each": (1, 1),
             "sum": (0, 0), "min": (0, 0), "max": (0, 0), "index_of": (1, 1),
-            "copy": (0, 0)},
+            "copy": (0, 0), "insert": (2, 2), "remove": (1, 1),
+            "slice": (2, 2), "dedup": (0, 0)},
     "map": {"len": (0, 0), "get": (1, 1), "set": (2, 2), "has": (1, 1),
             "contains": (1, 1), "del": (1, 1), "clear": (0, 0), "to_str": (0, 0),
             "keys": (0, 0), "values": (0, 0), "copy": (0, 0)},
@@ -288,6 +289,15 @@ class Sema:
                 # 真要变长而元素是装箱类型，codegen 会在循环里 panic 一句人话
             elif name in ("contains", "index_of") and len(ats) == 1 and et is not None:
                 self.check_assignable(et, ats[0], args[0], f"{name}() 的实参")
+            elif name == "insert" and len(ats) == 2:
+                self.check_index_arg(ats[0], args[0], "插入位置")
+                if et is not None:
+                    self.check_assignable(et, ats[1], args[1], "Vec 元素")
+            elif name == "remove" and len(ats) == 1:
+                self.check_index_arg(ats[0], args[0], "要删的下标")
+            elif name == "slice" and len(ats) == 2:
+                self.check_index_arg(ats[0], args[0], "切片起点")
+                self.check_index_arg(ats[1], args[1], "切片终点")
         elif ot.kind == "map":
             kt, vt = ot.key, ot.val
             if name == "set" and len(ats) == 2:
@@ -308,7 +318,7 @@ class Sema:
     #   sum()             —— 把指针加起来，实测打出 8454172 这种垃圾数
     #   min()/max()       —— 返回一个 i64 地址，当结构体用才在别处炸
     # 静默的错答案比崩溃更难查，所以一律在编译期拦住。
-    VEC_CONTENT_OPS = ("sort", "min", "max", "contains", "index_of", "sum")
+    VEC_CONTENT_OPS = ("sort", "min", "max", "contains", "index_of", "sum", "dedup")
     VEC_BOXED = ("struct", "enum", "vec", "map", "arr")
 
     def check_sort_by(self, vt, arg, node):
@@ -439,7 +449,12 @@ class Sema:
                 "min": "返回的是一个地址，当不成这个类型用",
                 "max": "返回的是一个地址，当不成这个类型用",
                 "sum": "把地址加起来，得到一个垃圾数",
-            }[op]
+                "dedup": "比的是地址，内容相同的两个值也去不掉重",
+                # 这两张表按操作名取话术。**用 .get 兜底**：往 VEC_CONTENT_OPS 里
+                # 加一个名字却忘了加话术，以前是 KeyError 连着 Python 栈回溯糊到
+                # 用户脸上（dedup 刚加进来时实测就是这个）。兜底话术宁可笼统，
+                # 也不能是 traceback。
+            }.get(op, "这个操作要按内容比较元素，而装箱元素比不了内容")
             hint = {
                 "sort": ("想按结构体的某个字段排，用 v.sort_by(取键函数)："
                          "给一个 fn(*元素) -> i64 / f64 / str，运行时先把键取出来再排"
@@ -449,7 +464,9 @@ class Sema:
                 "min": "想取最小就自己遍历比较字段",
                 "max": "想取最大就自己遍历比较字段",
                 "sum": "想累加就自己遍历：`for x in v { total += x.字段 }`",
-            }[op]
+                "dedup": ("想去重就自己遍历建新表，用你认的那个「相等」判断："
+                          "`for x in v { if 新表里没有和它一样的 { 新表.push(x) } }`"),
+            }.get(op, "只能自己遍历，按你认的相等规则处理")
             self.error(
                 f"Vec<{et}> 的元素不能 {op}()：{et} 在表里存的是装箱指针，{why}"
                 f"（不报错，但结果是错的）。能这样用的是 str / 整数 / 浮点 / bool / char / 指针。{hint}",
@@ -1284,6 +1301,22 @@ class Sema:
                 e.ty = ot.inner
             else:
                 self.error(f"类型 {ot} 不支持下标访问", e)
+            return e.ty
+        if isinstance(e, Slice):
+            # a[lo:hi]：str 给 str，Vec<T> 给一份新的 Vec<T>。
+            # 定长数组 arr 不在这儿支持 —— 它在栈上，切出来要另起一份堆上的表，
+            # 和 Vec 的语义混在一起只会让人猜；要就先 v.copy() 或者手写循环。
+            ot = self.expr(e.obj)
+            for part, what in ((e.start, "切片起点"), (e.end, "切片终点")):
+                if part is not None:
+                    self.check_index_arg(self.expr(part), part, what)
+            if ot.kind == "str":
+                e.ty = STR
+            elif ot.kind == "vec":
+                e.ty = ot
+            else:
+                self.error(f"类型 {ot} 不支持切片：str 和 Vec 可以，"
+                           f"定长数组请先 copy 成 Vec", e)
             return e.ty
         if isinstance(e, Field):
             ot = self.expr(e.obj)
@@ -2148,10 +2181,16 @@ class Sema:
                 # 以前标成 STR，于是 `let p = s.cstr()` 会对这个 char* 调 rc_inc，
                 # 把字符串数据当成对象头去写 —— 实测直接段错误。
                 e.ty = ptr_to(TYPES["u8"])
-            elif e.name in ("to_str", "slice", "trim", "upper", "lower",
+            elif e.name in ("to_str", "trim", "upper", "lower",
                             "replace", "to_str_deep",
                             "repeat", "trim_start", "trim_end", "join",
-                            "slice_chars"):
+                            "slice_chars") or (e.name == "slice" and ot.kind != "vec"):
+                # slice 是**按接收者分岔**的，不能光看名字：s.slice(a,b) 给 str，
+                # v.slice(a,b) 给一份新的 Vec<T>。以前这里无条件写 STR，于是
+                # v.slice(1,3) 被当成字符串 —— 长度对（str 也有 len），元素全错
+                # （s[0] 打出一个字节而不是一个元素），to_str() 直接把表的原始字节
+                # 当字符串打出来（实测 "\x08\x00"）。名字相同、类型不同的内建，
+                # 一律要带上接收者类型判断。
                 e.ty = STR
             elif e.name in ("split", "chars", "keys", "values", "lines"):
                 # Map 的 keys()/values() 元素类型跟着 K / V 走（不是 str）
@@ -2172,8 +2211,9 @@ class Sema:
                     # 求和/极值一律按 64 位整数返回：bool、i8、u16 这些窄类型
                     # 累加起来很容易溢出元素本身的宽度（运行时也是按 i64 累加的）
                     e.ty = TYPES["i64"]
-            elif e.name == "copy":
-                # v.copy() / m.copy()：另起一份容器，类型和接收者完全一样
+            elif e.name in ("copy", "slice", "dedup"):
+                # v.copy() / m.copy() / v[a:b] / v.dedup()：另起一份容器，
+                # 类型和接收者完全一样（元素类型不会变）
                 e.ty = ot
             elif e.name in ("sort", "sort_by", "reverse", "resize", "for_each"):
                 e.ty = VOID
@@ -2194,7 +2234,7 @@ class Sema:
                 e.ty = ot.val if ot.kind == "map" else ot.elem
             elif e.name == "pop":
                 e.ty = ot.elem
-            elif e.name in ("push", "set", "clear", "del"):
+            elif e.name in ("push", "set", "clear", "del", "insert", "remove"):
                 e.ty = VOID
             elif e.name == "jcall_i64":
                 e.ty = TYPES["i64"]

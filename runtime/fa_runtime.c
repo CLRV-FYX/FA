@@ -1201,6 +1201,91 @@ void fa_vec_resize(FaVec *v, int64_t n, uint64_t val) {
     while (v->len < n) fa_vec_push(v, val);
 }
 
+/* v.insert(i, x)：在 i 处插入，i == len 就等于 push。
+   越界报的和 a[i] 是同一套话（长度和下标都打出来），不另造一种错。
+   注意先 vec_grow 再挪元素：grow 会 realloc，data 指针会变。 */
+void fa_vec_insert(FaVec *v, int64_t idx, uint64_t val) {
+    if (!v) return;
+    if (idx < 0 || idx > v->len) fa_bounds_error(idx, v->len);
+    if (v->len == v->cap) vec_grow(v);
+    for (int64_t i = v->len; i > idx; i--) vec_store(v, i, vec_load(v, i - 1));
+    fa_agg_inc((void *)(uintptr_t)val, v->kind);
+    vec_store(v, idx, val);
+    v->len++;
+}
+
+/* v.remove(i)：原地删掉第 i 个，后面的整体前移。
+   不返回被删的值 —— 装箱元素（struct/enum/str/Vec）的引用计数在这里就减掉了，
+   交出去就是个悬空的盒子。要「取出来再删」，先 let x = v[i] 拿走。
+   减引用必须挪完之后做：挪的过程中那个值还在表里。 */
+void fa_vec_remove(FaVec *v, int64_t idx) {
+    if (!v || idx < 0 || idx >= v->len) fa_bounds_error(idx, v ? v->len : 0);
+    uint64_t gone = vec_load(v, idx);
+    for (int64_t i = idx; i + 1 < v->len; i++) vec_store(v, i, vec_load(v, i + 1));
+    v->len--;
+    if (v->kind) fa_rc_dec((void *)(uintptr_t)gone, v->kind);
+}
+
+/* v[a:b] / v.slice(a, b)：返回**新表**，原表不动。
+   夹边规则跟 fa_str_slice 一模一样（负的夹到 0、超过长度的夹到长度、
+   反了给空表），str 和 Vec 用同一套心智模型，不用记两遍。
+   装箱元素要克隆：盒子不带引用计数，两个表共享同一个盒子 = 释放两次。 */
+FaVec *fa_vec_slice(FaVec *v, int64_t a, int64_t b, int64_t box_size) {
+    if (!v) return fa_vec_new(0, 8, 0, FA_TY_INT);
+    if (a < 0) a = 0;
+    if (b > v->len) b = v->len;
+    if (b < a) b = a;
+    FaVec *r = fa_vec_new(v->kind, v->esz, v->sgn, v->ety);
+    for (int64_t i = a; i < b; i++) {
+        uint64_t val = vec_load(v, i);
+        if (r->len == r->cap) vec_grow(r);
+        if (box_size > 0) val = fa_clone_boxed(val, box_size, v->kind);
+        else              fa_agg_inc((void *)(uintptr_t)val, v->kind);
+        vec_store(r, r->len++, val);
+    }
+    return r;
+}
+
+/* 两个元素算不算「同一个」。按**内容**比，不按地址 ——
+   contains/index_of 当年就是比地址，两张内容相同的 Vec<i64> 判 false / -1。
+   窄元素（i8/u16…）vec_load 已经按 esz/sgn 扩展过，直接比就行。 */
+static int vec_same_elem(const FaVec *v, uint64_t x, uint64_t y) {
+    if (v->ety == FA_TY_STR) {
+        FaStr *a = (FaStr *)(uintptr_t)x, *b = (FaStr *)(uintptr_t)y;
+        if (a == b) return 1;
+        if (!a || !b) return 0;
+        return a->len == b->len && memcmp(a->data, b->data, (size_t)a->len) == 0;
+    }
+    if (v->ety == FA_TY_FLOAT) {
+        /* NaN != NaN，所以两个 NaN 各留一份（和 == 的行为一致，别自造规矩） */
+        double dx, dy;
+        memcpy(&dx, &x, 8); memcpy(&dy, &y, 8);
+        return dx == dy;
+    }
+    return x == y;
+}
+
+/* v.dedup()：去掉重复项，**保留第一次出现的那个，顺序不变**（不是排序去重）。
+   返回新表，原表不动。装箱元素（struct/enum）不在这里比内容 —— 结构体怎么算
+   「相等」得看字段，编译期就会拦下来并说清原因，不会走到这个函数。 */
+FaVec *fa_vec_dedup(FaVec *v, int64_t box_size) {
+    if (!v) return fa_vec_new(0, 8, 0, FA_TY_INT);
+    FaVec *r = fa_vec_new(v->kind, v->esz, v->sgn, v->ety);
+    for (int64_t i = 0; i < v->len; i++) {
+        uint64_t val = vec_load(v, i);
+        int dup = 0;
+        for (int64_t j = 0; j < r->len; j++) {
+            if (vec_same_elem(v, vec_load(r, j), val)) { dup = 1; break; }
+        }
+        if (dup) continue;
+        if (r->len == r->cap) vec_grow(r);
+        if (box_size > 0) val = fa_clone_boxed(val, box_size, v->kind);
+        else              fa_agg_inc((void *)(uintptr_t)val, v->kind);
+        vec_store(r, r->len++, val);
+    }
+    return r;
+}
+
 FaMap *fa_map_new(int64_t kkind, int64_t vkind, int64_t kty, int64_t vty) {
     FaMap *m = (FaMap *)fa_alloc((int64_t)sizeof(FaMap));
     m->rc = 1; m->len = 0; m->cap = 16; m->kkind = kkind; m->vkind = vkind;

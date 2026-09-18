@@ -290,6 +290,19 @@ def dump_ast(mod) -> str:
             node(depth + 1, n.obj)
             node(depth + 1, n.index)
             put(depth + 1, ")")
+        elif isinstance(n, A.Slice):
+            # 省掉的那一头打印成 _ ，fa ast 看得到「这是开放端」而不是「这是 0」
+            put(depth, "(Slice")
+            node(depth + 1, n.obj)
+            if n.start is None:
+                put(depth + 1, "_")
+            else:
+                node(depth + 1, n.start)
+            if n.end is None:
+                put(depth + 1, "_")
+            else:
+                node(depth + 1, n.end)
+            put(depth + 1, ")")
         elif isinstance(n, A.Field):
             put(depth, f'(Field "{n.name}"')
             node(depth + 1, n.obj)
