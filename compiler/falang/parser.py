@@ -1193,4 +1193,9 @@ def parse(src: str, filename: str = "<input>") -> Module:
     p = Parser(src, filename)
     mod = p.parse_module()
     stamp_positions(mod)          # 兜底：任何还没位置的节点继承父节点的位置
+    # 每条顶层声明记住自己来自哪个文件。Sema 会把 stdlib 和 `use "x.fa"` 的声明
+    # 摊平进 mod.decls（sema.py:640），摊平之后就再也分不出谁是谁的了 ——
+    # IDE 的「文档符号」「你自己定义的函数」都靠这个标记来筛（lsp/fa_lang.py）。
+    for d in mod.decls:
+        d.file = filename
     return mod
